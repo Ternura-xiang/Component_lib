@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "component-library"
+version = "0.8.8"
+description = "本地优先的电子元件库存与袋贴文字识别工具"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "PySide6>=6.8,<7",
+  "fastapi==0.115.12",
+  "starlette==0.46.2",
+  "uvicorn==0.34.3",
+  "pydantic>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "opencv-python-headless>=4.10,<5",
+  "zxing-cpp>=2.3,<3",
+  "rapidocr>=3.4,<4",
+  "onnxruntime>=1.20,<2",
+  "numpy>=2.0,<3",
+  "openpyxl>=3.1,<4",
+  "rapidfuzz>=3.10,<4",
+  "httpx==0.28.1",
+  "anyio==4.9.0",
+  "beautifulsoup4>=4.12,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-qt>=4.4,<5",
+  "ruff>=0.9,<1",
+  "mypy>=1.14,<2",
+  "pyinstaller>=6.11,<7",
+  "uv>=0.8,<1",
+]
+
+[project.scripts]
+component-library = "component_library.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/component_library"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["component_library"]
+ignore_missing_imports = true
