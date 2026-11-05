@@ -27,6 +27,9 @@ def test_readme_version_matches_project_metadata() -> None:
     version = metadata["project"]["version"]
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert f"当前版本为 **{version}**" in readme
+    release_notes = ROOT / "docs" / "releases" / f"v{version}.md"
+    assert release_notes.is_file()
+    assert release_notes.read_text(encoding="utf-8").startswith(f"# 元件库 v{version} 发行说明\n")
 
 
 def test_project_declares_mit_license() -> None:

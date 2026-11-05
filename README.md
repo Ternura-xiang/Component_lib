@@ -2,7 +2,7 @@
 
 元件库是一个面向个人和小型实验室的本地电子元件库存管理程序。它把“元件资料”、“实际存放位置”和“每一次库存变动”分开记录，适合管理抽屉、料盒、零件柜中的散装元件。
 
-当前版本为 **0.8.8**，主要目标平台是 Windows 10/11 和 Ubuntu 24.04+。项目业务代码使用 Python 3.12，桌面界面使用 PySide6，数据保存在 SQLite；不使用 Rust、Tauri、React 或 Node.js。
+当前版本为 **0.8.8**，详见 [v0.8.8 发行说明](docs/releases/v0.8.8.md)。主要目标平台是 Windows 10/11 和 Ubuntu 24.04+。项目业务代码使用 Python 3.12，桌面界面使用 PySide6，数据保存在 SQLite；不使用 Rust、Tauri、React 或 Node.js。
 
 ## 项目说明
 
