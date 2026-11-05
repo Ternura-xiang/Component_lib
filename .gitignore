@@ -12,6 +12,11 @@ ENV/
 # 构建、打包与发布产物
 build/
 dist/
+packaging/windows/Output/
+release/**/*.zip
+release/**/*.tar.gz
+release/**/*.whl
+release/**/*.exe
 *.egg-info/
 *.egg
 *.whl
@@ -70,3 +75,8 @@ tools/ocr_training/evaluation*.jsonl
 *.bak
 *.swp
 *~
+
+# 手工下载的本机工具；开发依赖由 uv.lock 和 .venv 管理
+/uv.exe
+/uvw.exe
+/uvx.exe

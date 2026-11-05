@@ -36,3 +36,9 @@ uv run python tools/build.py
 ```
 
 产物默认位于 `dist/component-library/`。构建目标是**当前宿主平台**的 onedir 产物，不能假定在 Linux 一次构建就得到 Windows 安装程序。发布前检查 OCR 模型、Qt Multimedia/WebEngine、`component_library/assets` 静态资源、启动与退出流程，并在目标系统实际执行一次扫码/导入/备份冒烟测试。
+
+Windows 构建完成后运行 `uv run python tools/smoke_windows.py`，检查真实无控制台 exe 的启动、认证 API 和离线模型校验。脚本使用临时 APPDATA 与 offscreen Qt 平台，结束后回收进程；运行前须关闭占用 17635 端口的实例。此测试不覆盖摄像头及 WebEngine 交互。
+
+桌面 API 使用应用统一配置的文件日志（Uvicorn 的 `log_config=None`）。不要恢复默认控制台日志配置：Windows `console=False` 产物的 `sys.stdout` / `sys.stderr` 为 `None`，默认 formatter 会使程序启动失败。
+
+Windows spec 排除 `icuuc.dll`，由 Windows 10/11 系统提供 Qt 所需 ICU。构建环境 PATH 中 Poppler 等工具的同名 DLL 可能使用不同符号版本，误收集会导致 `QtCore` 报 DLL 找不到指定程序。

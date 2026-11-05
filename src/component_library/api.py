@@ -465,7 +465,16 @@ class ApiServer(threading.Thread):
             self._socket.close()
             raise
         self._server = uvicorn.Server(
-            uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+            # 桌面程序共用 app.configure_logging 的文件日志；Windows windowed
+            # 产物的 stdout/stderr 为 None，不能使用 Uvicorn 的控制台 formatter。
+            uvicorn.Config(
+                app,
+                host=host,
+                port=port,
+                log_level="warning",
+                access_log=False,
+                log_config=None,
+            )
         )
 
     def run(self) -> None:

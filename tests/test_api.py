@@ -1,13 +1,35 @@
 """本机 API 认证、契约与幂等测试。"""
 
 import asyncio
+import sys
 from pathlib import Path
 
 import httpx
+import pytest
+from fastapi import FastAPI
 
-from component_library.api import ApiContext, create_api
+from component_library.api import ApiContext, ApiServer, create_api
 from component_library.database import Database
 from component_library.recognition import RecognitionEngine
+
+
+def test_api_server_without_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows windowed 产物没有标准流，API 仍须能启动并响应请求。"""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stdout", None)
+        patch.setattr(sys, "stderr", None)
+        server = ApiServer(FastAPI(), port=0)
+    server.start()
+    try:
+        port = server._socket.getsockname()[1]
+        with httpx.Client(transport=httpx.HTTPTransport(retries=5)) as client:
+            response = client.get(f"http://127.0.0.1:{port}/openapi.json")
+        assert response.status_code == 200
+    finally:
+        server.stop()
+        server.join(timeout=10)
+    assert not server.is_alive()
 
 
 def application(tmp_path: Path) -> object:

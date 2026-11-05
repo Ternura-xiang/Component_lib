@@ -94,6 +94,8 @@ uv run python tools/build.py
 
 构建结果位于 `dist/component-library/`。Windows 安装器定义在 `packaging/windows/component-library.iss`；Linux 与 Windows 必须分别在目标系统构建和验收。
 
+发布目录 `release/<版本号>/` 仅保留 `win-<版本号>.zip` 和 `linux-<版本号>.tar.gz`。当前 Windows 包已通过启动、API 认证及离线模型校验；当前 Linux 包为历史源码归档，尚未完成 Linux 构建与验收。
+
 详细模块边界、事务不变量和扩展步骤见 [开发者指南](docs/developer/README.md)。
 
 ## 开源协议
