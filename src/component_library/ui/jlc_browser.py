@@ -60,6 +60,12 @@ class SafeJlcPage(QWebEnginePage):
         navigation_type: QWebEnginePage.NavigationType,
         is_main_frame: bool,
     ) -> bool:
+        """允许公开商城导航，并在主框架请求被拒绝时通知界面。
+
+        ``navigation_type`` 由 Qt API 要求但当前策略不区分点击、重定向或脚本导航；
+        所有类型都经过相同的域名和敏感路径检查。
+        """
+
         raw = url.toString() if isinstance(url, QUrl) else url
         if raw == "about:blank":
             return True
@@ -73,10 +79,12 @@ class JlcBrowserDialog(QDialog):
     """由用户手动浏览并明确确认当前商品，不持久化任何浏览状态。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        """创建一次性匿名浏览器并连接导航、加载和确认回调。"""
+
         super().__init__(parent)
         self.draft: JlcProductDraft | None = None
         self._closed = False
-        self.setWindowTitle("从立创商城选择商品（匿名临时浏览器）")
+        self.setWindowTitle("从立创商城选择商品")
         self.resize(1180, 820)
         layout = QVBoxLayout(self)
         toolbar = QHBoxLayout()
@@ -134,14 +142,20 @@ class JlcBrowserDialog(QDialog):
         download.cancel()
 
     def _show_blocked_navigation(self, _url: str) -> None:
+        """在状态栏提示导航已被安全策略拦截；不展示可能含敏感信息的 URL。"""
+
         self.status.setText("已阻止登录、账户、购物车、订单或站外页面")
 
     def _url_changed(self, url: QUrl) -> None:
+        """同步只读地址栏，并仅在商品详情页启用确认按钮。"""
+
         raw = url.toString()
         self.address.setText(raw)
         self.use_current.setEnabled(is_jlc_product_url(raw))
 
     def _load_finished(self, ok: bool) -> None:
+        """根据加载结果和页面类型更新下一步操作提示。"""
+
         if not ok:
             self.status.setText("页面加载失败；可取消并使用剪贴板导入")
         elif self.use_current.isEnabled():
@@ -150,18 +164,33 @@ class JlcBrowserDialog(QDialog):
             self.status.setText("请搜索并打开一个商品详情页")
 
     def capture_current_product(self) -> None:
-        """异步读取当前渲染 HTML；HTML 只传给一次解析回调。"""
+        """异步读取并解析用户当前打开的商品详情页。
 
+        :return: 无返回值；解析成功后设置 ``draft`` 并接受对话框
+
+        注意：只有公开商品详情页能够触发读取；HTML 仅传给一次回调，不写临时文件，
+        读取期间确认按钮会禁用以避免重复提交。
+        """
+
+        ### 确认当前 URL 是商品详情页 ###
         url = self.view.url().toString()
         if not is_jlc_product_url(url):
             QMessageBox.warning(self, "尚未选择商品", "请先打开一个立创商品详情页")
             return
         self.use_current.setEnabled(False)
         self.status.setText("正在读取并解析当前商品页……")
+        ### 异步读取渲染后的页面内容 ###
         self.page.toHtml(lambda html, source=url: self._parse_current_html(source, html))
 
     def _parse_current_html(self, url: str, html: str) -> None:
-        """解析完成后不保存 HTML，只保留结构化草稿。"""
+        """解析浏览器返回的 HTML，并只保留结构化商品草稿。
+
+        :param url: 发起读取时固定的页面 URL，避免回调期间导航造成错配
+        :param html: Qt WebEngine 返回的渲染后 HTML
+        :return: 无返回值
+
+        对话框已关闭时直接忽略迟到回调；无论成功或失败都解除本地 HTML 引用。
+        """
 
         if self._closed:
             return
@@ -207,6 +236,12 @@ class JlcMergeDialog(QDialog):
         current_parameters: list[dict[str, str]],
         parent: QWidget | None = None,
     ) -> None:
+        """构建逐字段合并界面。
+
+        ``draft`` 是网页解析结果；``current_fields`` 和 ``current_parameters`` 是现有
+        表单快照。对话框只生成合并结果，不直接写数据库或修改调用方控件。
+        """
+
         super().__init__(parent)
         self.draft = draft
         self.current_fields = current_fields
@@ -245,6 +280,8 @@ class JlcMergeDialog(QDialog):
 
     @staticmethod
     def _make_table(headers: list[str]) -> QTableWidget:
+        """创建统一样式的空表格；调用方随后设置行数和单元格控件。"""
+
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.horizontalHeader().setStretchLastSection(True)
@@ -252,6 +289,8 @@ class JlcMergeDialog(QDialog):
         return table
 
     def _draft_fields(self) -> dict[str, str]:
+        """把强类型商城草稿转换为表格所需的字符串字段映射。"""
+
         return {
             "name": self.draft.name,
             "lcsc_part_number": self.draft.lcsc_part_number,
@@ -265,6 +304,8 @@ class JlcMergeDialog(QDialog):
         }
 
     def _fill_fields(self) -> None:
+        """填充非空基础字段，并用底色标出商城值与现有值的冲突。"""
+
         values = self._draft_fields()
         available = [(key, label, values[key]) for key, label in self.FIELD_LABELS if values[key]]
         self.fields_table.setRowCount(len(available))
@@ -288,6 +329,8 @@ class JlcMergeDialog(QDialog):
             self.field_rows[key] = (check, final)
 
     def _fill_parameters(self) -> None:
+        """按商城分组顺序填充动态参数；所有商城参数默认勾选应用。"""
+
         existing = {item["parameter_key"]: item for item in self.current_parameters}
         parameters = [
             (group.name, parameter)

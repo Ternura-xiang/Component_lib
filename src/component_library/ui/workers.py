@@ -20,6 +20,12 @@ class Worker(QRunnable):
     """在线程池执行一个无参数函数，并把异常转换为界面错误信号。"""
 
     def __init__(self, function: Callable[[], Any]) -> None:
+        """保存待执行的无参数函数，并为本次任务创建独立信号对象。
+
+        ``function`` 会在线程池线程运行，因此它不能读取或修改 QWidget；结果应
+        通过 ``succeeded`` 信号回到主线程处理。
+        """
+
         super().__init__()
         self.function = function
         self.signals = WorkerSignals()

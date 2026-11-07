@@ -59,3 +59,9 @@ def test_conflicting_ocr_and_barcode_never_silently_merge() -> None:
 def test_text_only_parser() -> None:
     draft = parse_label_text("C7380001\nSOD-323\nMS2A40LWS\nQTY:20个")
     assert draft.fields["quantity"].normalized_value == "20"
+
+
+def test_custom_batch_qr_text() -> None:
+    draft = parse_label_text("cl0000000042")
+    assert draft.fields["batch_code"].normalized_value == "CL0000000042"
+    assert draft.raw_barcode == "cl0000000042"

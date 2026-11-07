@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,28 @@ def total(database: Database, component_id: str) -> float:
     )
 
 
+def test_v9_migration_adds_batch_column_before_index(tmp_path: Path) -> None:
+    """旧库没有 batch_id 时，迁移不能在加列之前创建索引。"""
+
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE stock_lots(
+        id TEXT PRIMARY KEY,component_id TEXT NOT NULL,location_id TEXT NOT NULL,
+        initial_quantity INTEGER NOT NULL,remaining_quantity INTEGER NOT NULL,
+        source TEXT,unit_price REAL,supplier_part_id TEXT,notes TEXT,
+        received_at TEXT NOT NULL,purchase_date TEXT)"""
+    )
+    connection.close()
+
+    database = Database(path)
+    with database.read() as migrated:
+        columns = {row["name"] for row in migrated.execute("PRAGMA table_info(stock_lots)")}
+        indexes = {row["name"] for row in migrated.execute("PRAGMA index_list(stock_lots)")}
+    assert "batch_id" in columns
+    assert "idx_lots_batch" in indexes
+
+
 def test_receive_and_prevent_negative_stock(inventory: tuple[Database, dict, dict, dict]) -> None:
     database, component, _, location = inventory
     database.receive(
@@ -52,6 +75,105 @@ def test_receive_and_prevent_negative_stock(inventory: tuple[Database, dict, dic
     with pytest.raises(DomainError, match="库存不足"):
         database.issue(IssueRequest(component_id=component["id"], quantity=11))
     assert total(database, component["id"]) == 10
+
+
+def test_custom_batch_scan_issues_only_bound_lot(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, component, _, location = inventory
+    first = database.receive(
+        ReceiveRequest(
+            component_id=component["id"],
+            location_id=location["id"],
+            quantity=8,
+            batch_code="CL0000000001",
+        )
+    )
+    database.receive(
+        ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=20)
+    )
+    batch = database.resolve_batch_code("cl0000000001")
+    assert batch["id"] == first["batch_id"]
+    assert batch["remaining_quantity"] == 8
+    database.issue(
+        IssueRequest(component_id=component["id"], quantity=5, batch_id=batch["id"])
+    )
+    assert database.get_batch(batch["id"])["remaining_quantity"] == 3
+    assert total(database, component["id"]) == 23
+
+
+def test_transfer_preserves_batch_identity(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, component, warehouse, source = inventory
+    target = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="A02"))
+    received = database.receive(
+        ReceiveRequest(
+            component_id=component["id"], location_id=source["id"], quantity=6,
+            batch_code="CL0000000003",
+        )
+    )
+    database.transfer(
+        TransferRequest(
+            component_id=component["id"], from_location_id=source["id"],
+            to_location_id=target["id"], quantity=2,
+        )
+    )
+    batch = database.get_batch(received["batch_id"])
+    assert batch["initial_quantity"] == 6
+    assert batch["remaining_quantity"] == 6
+    assert {item["location_name"] for item in batch["locations"]} == {"A01", "A02"}
+
+
+def test_batch_code_validation_and_component_conflict(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, component, _, location = inventory
+    with pytest.raises(DomainError, match="CL 加十位数字"):
+        database.receive(
+            ReceiveRequest(
+                component_id=component["id"], location_id=location["id"], quantity=1,
+                batch_code="CL123",
+            )
+        )
+    database.receive(
+        ReceiveRequest(
+            component_id=component["id"], location_id=location["id"], quantity=1,
+            batch_code="CL0000000002",
+        )
+    )
+    with pytest.raises(DomainError, match="不能重复入库"):
+        database.receive(
+            ReceiveRequest(
+                component_id=component["id"], location_id=location["id"], quantity=1,
+                batch_code="CL0000000002",
+            )
+        )
+    second = database.create_component(ComponentCreate(name="第二个元件"))
+    with pytest.raises(DomainError, match="其他元件"):
+        database.receive(
+            ReceiveRequest(
+                component_id=second["id"], location_id=location["id"], quantity=1,
+                batch_code="CL0000000002",
+            )
+        )
+
+
+def test_jlc_batch_resolves_from_order_and_part(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, component, _, location = inventory
+    database.receive(
+        ReceiveRequest(
+            component_id=component["id"], location_id=location["id"], quantity=10,
+            order_number="SO26090420076",
+        )
+    )
+    batch = database.resolve_batch_code(
+        "{on:SO26090420076,pc:C25804,pm:TEST,qty:10,pdi:123}"
+    )
+    assert batch["component_id"] == component["id"]
+    assert batch["order_number"] == "SO26090420076"
 
 
 def test_transfer_preserves_total(inventory: tuple[Database, dict, dict, dict]) -> None:

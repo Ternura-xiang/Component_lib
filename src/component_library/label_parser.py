@@ -24,6 +24,7 @@ PACKAGE_PATTERN = re.compile(
 # 中文紧跟在单位字母后时，Unicode ``\b`` 不一定形成词边界，因此不能在这里使用。
 VOLTAGE_PATTERN = re.compile(r"(?:电压\s*[:：]?\s*)?(\d+(?:\.\d+)?\s*[mMkK]?V)")
 CURRENT_PATTERN = re.compile(r"(?:电流\s*[:：]?\s*)?(\d+(?:\.\d+)?\s*[mM]?A)")
+CUSTOM_BATCH_PATTERN = re.compile(r"^CL\d{10}$", re.IGNORECASE)
 
 
 def normalize_token(value: str) -> str:
@@ -33,8 +34,15 @@ def normalize_token(value: str) -> str:
 
 
 def parse_qr_payload(payload: str) -> dict[str, ParsedField]:
-    """解析嘉立创袋贴的 ``{key:value,...}`` 二维码文本。"""
+    """解析嘉立创袋贴的 ``{key:value,...}`` 二维码文本。
 
+    :param payload: 扫码器返回的原始文本
+    :return: 内部字段名到 ``ParsedField`` 的映射；格式不匹配时返回空字典
+
+    注意：只接受已知键并保留原始值，不对未知字段作推断。
+    """
+
+    ### 校验外层格式并拆分键值对 ###
     text = payload.strip()
     if not (text.startswith("{") and text.endswith("}")):
         return {}
@@ -45,6 +53,7 @@ def parse_qr_payload(payload: str) -> dict[str, ParsedField]:
         key, value = item.split(":", 1)
         if value.strip():
             pairs[key.strip().lower()] = value.strip()
+    ### 将商城字段名映射为内部稳定字段名 ###
     mapping = {
         "on": "order_number",
         "pc": "lcsc_part_number",
@@ -81,10 +90,14 @@ def _field(value: str, confidence: float, line: OcrLine, *, validated: bool = Tr
 def parse_ocr_lines(lines: Iterable[OcrLine]) -> dict[str, ParsedField]:
     """按页面坐标排序 OCR 行并提取袋贴字段。
 
-    制造商料号没有全球统一格式，因此只在封装下一行或具有明显字母数字组合时生成
-    候选，并把 ``validated`` 设为假，要求用户确认。
+    :param lines: OCR 引擎返回的文字行，可为任意可迭代对象
+    :return: 识别到的内部字段映射；同名字段默认保留阅读顺序中的首个结果
+
+    注意：制造商料号没有全球统一格式，因此只在封装相邻行且具有明显字母数字组合
+    时生成候选，并把 ``validated`` 设为假，要求用户确认。
     """
 
+    ### 按页面阅读顺序整理文字行 ###
     ordered = sorted(
         lines,
         key=lambda line: (min(point[1] for point in line.box), min(point[0] for point in line.box)),
@@ -120,6 +133,7 @@ def parse_ocr_lines(lines: Iterable[OcrLine]) -> dict[str, ParsedField]:
         if "ROHS" in compact.upper():
             result.setdefault("compliance", _field("RoHS", line.confidence, line))
 
+    ### 在封装相邻行中保守推断制造商料号 ###
     if package_index is not None:
         # 不同旋转方向下 OCR 的阅读顺序可能把型号放在封装前或后，因此检查相邻两侧。
         # 含冒号或电气单位的行不是型号，必须排除，避免把“电压:40V”误填为 MPN。
@@ -142,6 +156,7 @@ def parse_ocr_lines(lines: Iterable[OcrLine]) -> dict[str, ParsedField]:
                 )
                 break
 
+    ### 提取可能的商品描述 ###
     descriptions = [
         line
         for line in ordered
@@ -156,7 +171,15 @@ def parse_ocr_lines(lines: Iterable[OcrLine]) -> dict[str, ParsedField]:
 def merge_fields(
     ocr_fields: dict[str, ParsedField], barcode_fields: dict[str, ParsedField]
 ) -> tuple[dict[str, ParsedField], list[str]]:
-    """合并 OCR 与条码结果；冲突时保留 OCR 候选并给出显式警告。"""
+    """合并 OCR 与条码字段，并显式标记两种来源之间的冲突。
+
+    :param ocr_fields: 从印刷文字提取的候选字段
+    :param barcode_fields: 从二维码提取的高可信字段
+    :return: ``(合并字段, 警告列表)``
+
+    两个来源一致时提升置信度；不一致时保留带坐标的 OCR 候选，但将其标记为未验证，
+    由用户在入库前确认。
+    """
 
     merged = dict(ocr_fields)
     warnings: list[str] = []
@@ -183,11 +206,35 @@ def merge_fields(
 
 
 def parse_label_text(text: str) -> LabelDraft:
-    """解析外部扫描器或手工粘贴的二维码/OCR 文本。"""
+    """解析外部扫描器或用户手工粘贴的二维码/OCR 文本。
 
+    :param text: 二维码原文、内部批次码或多行 OCR 文本
+    :return: 不包含图像副作用的 ``LabelDraft`` 草稿
+
+    解析顺序固定为嘉立创结构化二维码、内部 ``CL`` 批次码、普通多行文字，避免
+    已知编码被宽松的 OCR 规则误判。
+    """
+
+    ### 优先解析结构化二维码和内部批次码 ###
     barcode = parse_qr_payload(text)
     if barcode:
         return LabelDraft(fields=barcode, raw_barcode=text, model_version="text-only")
+    if CUSTOM_BATCH_PATTERN.fullmatch(text.strip()):
+        value = text.strip().upper()
+        return LabelDraft(
+            fields={
+                "batch_code": ParsedField(
+                    raw_value=value,
+                    normalized_value=value,
+                    confidence=1.0,
+                    source="barcode",
+                    validated=True,
+                )
+            },
+            raw_barcode=text,
+            model_version="text-only",
+        )
+    ### 将普通多行文字转换为无图像坐标的 OCR 行 ###
     lines = [
         OcrLine(
             text=line.strip(),

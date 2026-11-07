@@ -96,6 +96,60 @@ def test_ocr_status_models_are_local_and_valid(tmp_path: Path) -> None:
     assert response.json()["available"] is True
 
 
+def test_batch_resolve_api_is_read_only(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = application(tmp_path)
+        auth = {"Authorization": "Bearer test-token"}
+        transport = httpx.ASGITransport(app=app)  # type: ignore[arg-type]
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            warehouse = (
+                await api.post(
+                    "/api/v1/warehouses",
+                    headers={**auth, "Idempotency-Key": "batch-warehouse"},
+                    json={"name": "主柜"},
+                )
+            ).json()
+            location = (
+                await api.post(
+                    "/api/v1/locations",
+                    headers={**auth, "Idempotency-Key": "batch-location"},
+                    json={"warehouse_id": warehouse["id"], "name": "A01"},
+                )
+            ).json()
+            component = (
+                await api.post(
+                    "/api/v1/components",
+                    headers={**auth, "Idempotency-Key": "batch-component"},
+                    json={"name": "测试物料"},
+                )
+            ).json()
+            await api.post(
+                "/api/v1/inventory/receive",
+                headers={**auth, "Idempotency-Key": "batch-receive"},
+                json={
+                    "component_id": component["id"],
+                    "location_id": location["id"],
+                    "quantity": 4,
+                    "batch_code": "CL0000000123",
+                },
+            )
+            resolved = await api.post(
+                "/api/v1/inventory/batches/resolve",
+                headers=auth,
+                json={"raw_text": "CL0000000123"},
+            )
+            assert resolved.status_code == 200
+            assert resolved.json()["remaining_quantity"] == 4
+            again = await api.post(
+                "/api/v1/inventory/batches/resolve",
+                headers=auth,
+                json={"raw_text": "CL0000000123"},
+            )
+            assert again.json()["remaining_quantity"] == 4
+
+    asyncio.run(scenario())
+
+
 def test_storage_priority_api_round_trip(tmp_path: Path) -> None:
     """优先级写接口应持久保存并由读取接口返回。"""
 

@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtWidgets import QDialog, QLineEdit
+from PySide6.QtWidgets import QDialog, QLabel, QLineEdit, QPushButton
 from test_jlc_product import PRODUCT_HTML
 
 from component_library.database import Database
@@ -19,7 +19,7 @@ from component_library.models import (
 )
 from component_library.recognition import RecognitionEngine
 from component_library.ui.jlc_browser import JlcMergeDialog
-from component_library.ui.main_window import InlineEditor, MainWindow
+from component_library.ui.main_window import BatchCodeScanDialog, InlineEditor, MainWindow
 
 
 def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
@@ -33,16 +33,14 @@ def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
     assert "QGroupBox::indicator" in window.styleSheet()
     assert "border: 2px solid #111111" in window.styleSheet()
     assert "checkmark.svg" in window.styleSheet()
-    assert window.stack.count() == 10
+    assert window.stack.count() == 9
     assert [window.navigation.item(index).text() for index in range(window.navigation.count())] == [
         "元件库存",
         "入库",
         "出库",
         "位置与仓库",
-        "扫描入库",
         "库存流水",
-        "OCR 样本",
-        "设置与备份",
+        "设置",
     ]
     window._show_main_page(1)
     window.receive_page.open_order_import.emit()
@@ -50,12 +48,54 @@ def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
     assert window.navigation.currentRow() == 1
     window.order_page.back_requested.emit()
     assert window.stack.currentWidget() is window.receive_page
+    window.receive_page.open_scan.emit()
+    assert window.stack.currentWidget() is window.scan_page
+    assert window.navigation.currentRow() == 1
+    window.scan_page.back_requested.emit()
+    assert window.stack.currentWidget() is window.receive_page
     window._show_main_page(2)
     window.issue_page.open_bom.emit()
     assert window.stack.currentWidget() is window.bom_page
     assert window.navigation.currentRow() == 2
     window.bom_page.back_requested.emit()
     assert window.stack.currentWidget() is window.issue_page
+
+
+def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
+    """入库页只保留商城选择和扫描入口，设置包含备份与关于。"""
+
+    window = MainWindow(Database(tmp_path / "inventory.db"), RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    button_texts = {button.text() for button in window.receive_page.findChildren(QPushButton)}
+    assert "从立创商城选择" in button_texts
+    assert "摄像头扫码" in button_texts
+    assert "扫描 / 图片识别入库" in button_texts
+    assert not any("匿名临时浏览器" in text for text in button_texts)
+    assert not any("剪贴板" in text for text in button_texts)
+    assert [
+        window.settings_page.tabs.tabText(index)
+        for index in range(window.settings_page.tabs.count())
+    ] == ["连接信息", "备份与恢复", "关于"]
+    about_labels = {
+        label.text() for label in window.settings_page.tabs.widget(2).findChildren(QLabel)
+    }
+    assert "Ternura_xiang" in about_labels
+    assert "0.8.8" in about_labels
+
+
+def test_batch_code_scan_dialog_accepts_only_custom_code(qtbot: Any) -> None:
+    """自定义批次扫码对话框只接受 CL 加十位数字。"""
+
+    parent = QDialog()
+    qtbot.addWidget(parent)
+    dialog = BatchCodeScanDialog(RecognitionEngine(), parent)
+    qtbot.addWidget(dialog)
+    dialog._decoded("{on:SO123,pc:C123,qty:1}")
+    assert dialog.code is None
+    assert "不是 CL 批次码" in dialog.status.text()
+    dialog._decoded("cl0000000042")
+    assert dialog.code == "CL0000000042"
+    assert dialog.result() == QDialog.DialogCode.Accepted
 
 
 def test_issue_search_generates_stock_locations(qtbot: Any, tmp_path: Path) -> None:
@@ -79,6 +119,122 @@ def test_issue_search_generates_stock_locations(qtbot: Any, tmp_path: Path) -> N
     assert issue_page.component.currentData() == component["id"]
     assert issue_page.location.currentText() == ""
     assert issue_page.location.itemText(1) == "主柜 / B04（20）"
+
+
+def test_issue_scan_prefills_batch_without_immediate_mutation(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="扫码二极管"))
+    warehouse = database.create_warehouse(WarehouseCreate(name="主柜"))
+    location = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="B04"))
+    database.receive(
+        ReceiveRequest(
+            component_id=component["id"], location_id=location["id"], quantity=7,
+            batch_code="CL0000000099",
+        )
+    )
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+    assert issue.resolve_scan("CL0000000099")
+    assert not issue.scan_result.isHidden()
+    assert issue.scan_quantity.value() == 7
+    assert "识别成功" in issue.scan_status.text()
+    assert "主柜 / B04：7" in issue.scan_stock_info.text()
+    assert database.resolve_batch_code("CL0000000099")["remaining_quantity"] == 7
+    issue.scan_quantity.setValue(3)
+    issue.submit_scan()
+    assert database.get_batch(issue.database.resolve_batch_code("CL0000000099")["id"])[
+        "remaining_quantity"
+    ] == 4
+    assert "本次 3" in issue.scan_status.text()
+    assert "批次剩余 4" in issue.scan_status.text()
+
+
+def test_issue_scan_missing_batch_stays_visible_without_mutating_stock(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    """二维码可识别但批次未入库时，应明确区分于识别失败。"""
+
+    database = Database(tmp_path / "inventory.db")
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+    assert not issue.resolve_scan("CL0000009999")
+    assert not issue.scan_result.isHidden()
+    assert "二维码识别成功" in issue.scan_status.text()
+    assert "没有找到" in issue.scan_status.text()
+    assert "CL0000009999" in issue.scan_code_info.text()
+    assert not issue.scan_confirm.isEnabled()
+    assert not issue.scan_quantity.isEnabled()
+
+
+def test_jlc_qr_details_are_shown_when_batch_is_missing(qtbot: Any, tmp_path: Path) -> None:
+    """实际袋贴二维码解码成功后，即使未入库也展示扫描字段。"""
+
+    database = Database(tmp_path / "inventory.db")
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+    payload = (
+        "{on:SO26090420180,pc:C22356447,pm:RCA03120KFLF,"
+        "qty:100,mc:,cc:1,pdi:234896327,hp:11}"
+    )
+
+    assert not issue.resolve_scan(payload)
+    assert "二维码识别成功" in issue.scan_status.text()
+    assert "订单号：SO26090420180" in issue.scan_code_info.text()
+    assert "立创编号：C22356447" in issue.scan_component_info.text()
+    assert "型号：RCA03120KFLF" in issue.scan_component_info.text()
+    assert "标签数量：100" in issue.scan_batch_info.text()
+    assert "请先完成该批次入库" in issue.scan_stock_info.text()
+
+
+def test_manual_scan_empty_input_is_not_reported_as_invalid_qr(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    """未粘贴任何内容时只给出操作提示，不误报二维码无效。"""
+
+    database = Database(tmp_path / "inventory.db")
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+
+    issue.scan_text.clear()
+    issue.resolve_manual_scan()
+
+    assert "请先粘贴" in issue.scan_status.text()
+    assert "二维码不是有效" not in issue.scan_status.text()
+    assert not issue.scan_confirm.isEnabled()
+
+
+def test_camera_scan_only_triggers_once_for_same_qr(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """摄像头连续帧识别到同一二维码时只解析一次。"""
+
+    database = Database(tmp_path / "inventory.db")
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+    parsed: list[str] = []
+    stopped: list[bool] = []
+
+    def record_scan(code: str) -> bool:
+        parsed.append(code)
+        return False
+
+    monkeypatch.setattr(issue, "resolve_scan", record_scan)
+    monkeypatch.setattr(issue, "stop_camera", lambda: stopped.append(True))
+
+    issue._barcode_decoded(" CL0000000001 ")
+    issue._barcode_decoded("CL0000000001")
+    issue._barcode_decoded("CL0000000002")
+
+    assert parsed == ["CL0000000001", "CL0000000002"]
+    assert stopped == [True, True]
+    assert issue.scan_text.text() == "CL0000000002"
 
 
 def test_receive_name_matching_and_category_group(qtbot: Any, tmp_path: Path) -> None:

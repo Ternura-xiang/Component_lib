@@ -35,11 +35,22 @@ class PublicWebEnricher:
     """带持久化访问策略的产品页读取器。"""
 
     def __init__(self, database: Database) -> None:
+        """绑定用于限速状态和页面缓存的数据库；构造时不会发起网络请求。"""
+
         self.database = database
 
     def preview(self, raw_url: str) -> dict[str, Any]:
-        """读取一个公开产品页并提取 JSON-LD/HTML 元数据。"""
+        """读取一个用户明确指定的公开产品页并提取元数据。
 
+        :param raw_url: 用户粘贴的完整公开 HTTPS URL
+        :return: 标题、型号、品牌、描述、缓存状态和警告组成的字典
+        :raises DomainError: URL、DNS、限速、robots 或 HTTP 响应不符合策略时抛出
+
+        注意：请求不使用系统代理、不跟随重定向，响应体限制为 2 MB；原始 HTML
+        不会落盘，仅保存解析后的元数据缓存。
+        """
+
+        ### 校验 URL、缓存和域名访问配额 ###
         url = self._validate_url(raw_url)
         host = urlparse(url).hostname or ""
         cached = self._cached(url)
@@ -49,6 +60,7 @@ class PublicWebEnricher:
         self._validate_dns(host)
         self._reserve(host)
 
+        ### 检查 robots 并获取单个页面 ###
         import httpx
 
         with httpx.Client(
@@ -65,6 +77,7 @@ class PublicWebEnricher:
             raise DomainError("WEB_ERROR", f"页面返回 HTTP {response.status_code}，不会自动重试")
         if len(response.content) > MAX_BYTES:
             raise DomainError("WEB_TOO_LARGE", "页面超过 2 MB 安全上限")
+        ### 解析并缓存结构化元数据 ###
         result = self._parse(url, response.text)
         self._save_cache(url, result)
         return result

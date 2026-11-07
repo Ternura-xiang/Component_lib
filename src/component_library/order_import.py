@@ -129,11 +129,21 @@ def _category_details(
 
 
 def parse_saved_orders(path: Path) -> list[OrderImportLine]:
-    """解析静态订单页面并返回去重后的商品行。"""
+    """解析用户保存的静态订单页面并返回去重后的商品行。
 
+    :param path: 本地 ZIP、HTML 或 MHTML 订单文件路径
+    :return: 可供用户预览和确认的订单商品行列表
+    :raises DomainError: 文件不安全、格式损坏或没有可识别商品时抛出
+
+    注意：解析过程不执行脚本、不访问网络；订单号仅用于去重和幂等导入，联系人、
+    物流信息及 URL 查询参数不会进入返回结果。
+    """
+
+    ### 安全读取并构建静态 DOM ###
     soup = BeautifulSoup(_read_html(path), "html.parser")
     output: list[OrderImportLine] = []
     seen: set[tuple[str, str]] = set()
+    ### 定位订单容器并提取商品行 ###
     for label in soup.find_all(string=lambda value: value and value.strip() == "订单编号："):
         header = label.parent.find_parent("section") if label.parent else None
         order_container = header.find_parent("li") if header else None
@@ -159,7 +169,7 @@ def parse_saved_orders(path: Path) -> list[OrderImportLine]:
                 continue
             lcsc = number.group(0).upper()
             key = (order_number, lcsc)
-            if key in seen:
+            if key in seen:  # 同一订单的重复展示区域只保留一份商品。
                 continue
             seen.add(key)
             title = re.sub(r"\s+(?:编带|袋装|托盘|盒装)$", "", items[0]).strip()
@@ -193,6 +203,7 @@ def parse_saved_orders(path: Path) -> list[OrderImportLine]:
                     mosfet=mosfet,
                 )
             )
+    ### 确认至少得到一条可导入记录 ###
     if not output:
         raise DomainError("VALIDATION_ERROR", "页面中没有找到可导入的订单商品")
     return output

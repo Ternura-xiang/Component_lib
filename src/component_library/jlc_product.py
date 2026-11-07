@@ -78,11 +78,15 @@ def is_jlc_product_url(url: str) -> bool:
 
 
 def _clean(value: Any) -> str | None:
+    """压缩页面文本的空白并去除标签分隔冒号；空结果统一返回 ``None``。"""
+
     text = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n:：")
     return text or None
 
 
 def _find_product_json(value: Any) -> dict[str, Any] | None:
+    """递归搜索 JSON-LD 数组或 ``@graph``，返回首个 Product 对象。"""
+
     if isinstance(value, list):
         return next((found for item in value if (found := _find_product_json(item))), None)
     if not isinstance(value, dict):
@@ -94,6 +98,8 @@ def _find_product_json(value: Any) -> dict[str, Any] | None:
 
 
 def _json_product(soup: BeautifulSoup) -> dict[str, Any]:
+    """解析页面内 JSON-LD；忽略损坏脚本，找不到商品时返回空字典。"""
+
     for node in soup.select("script[type='application/ld+json']"):
         try:
             value = json.loads(node.string or node.get_text())
@@ -105,6 +111,8 @@ def _json_product(soup: BeautifulSoup) -> dict[str, Any]:
 
 
 def _brand(product: dict[str, Any]) -> str | None:
+    """兼容 schema.org 中字符串和 ``{name: ...}`` 两种品牌表示。"""
+
     raw = product.get("brand")
     if isinstance(raw, str):
         return _clean(raw)
@@ -112,6 +120,8 @@ def _brand(product: dict[str, Any]) -> str | None:
 
 
 def _meta(soup: BeautifulSoup, *names: str) -> str | None:
+    """按 ``name`` 或 ``property`` 查找首个非空 meta 内容，名称不区分大小写。"""
+
     lowered = {name.casefold() for name in names}
     for node in soup.find_all("meta"):
         key = str(node.get("name") or node.get("property") or "").casefold()
@@ -121,6 +131,12 @@ def _meta(soup: BeautifulSoup, *names: str) -> str | None:
 
 
 def _parameter_key(group: str, label: str, used: set[str]) -> str:
+    """为动态参数生成稳定且唯一的内部键。
+
+    已知标签使用可读键，未知标签基于分组和原标签生成摘要；``used`` 会被原地
+    更新，并用数字后缀解决同页重复键。
+    """
+
     normalized = re.sub(r"[\s:：()（）/_-]+", "", label).casefold()
     base = KNOWN_PARAMETER_KEYS.get(normalized)
     if not base:
@@ -211,6 +227,8 @@ def _html_parameter_pairs(soup: BeautifulSoup) -> Iterable[tuple[str, str, str]]
 
 
 def _parameter_groups(soup: BeautifulSoup) -> list[JlcParameterGroup]:
+    """清洗、去重参数对，并按网页出现顺序组装参数分组。"""
+
     raw = list(_html_parameter_pairs(soup))
     groups: dict[str, list[JlcParameter]] = {}
     seen_pairs: set[tuple[str, str]] = set()
@@ -227,6 +245,8 @@ def _parameter_groups(soup: BeautifulSoup) -> list[JlcParameterGroup]:
 
 
 def _find_parameter(groups: list[JlcParameterGroup], *labels: str) -> str | None:
+    """按候选中文标签在分组参数中查找首个值，忽略标签内空白和大小写。"""
+
     candidates = {re.sub(r"\s+", "", label).casefold() for label in labels}
     for group in groups:
         for parameter in group.parameters:
@@ -246,6 +266,8 @@ def _page_label_value(soup: BeautifulSoup, *labels: str) -> str | None:
     expected = {re.sub(r"\s+", "", label).casefold() for label in labels}
 
     def is_label(value: str | None) -> bool:
+        """判断清洗后的节点文本是否为调用方指定的字段标签。"""
+
         return bool(value and re.sub(r"\s+", "", value).casefold() in expected)
 
     for row in soup.find_all("tr"):
@@ -300,6 +322,8 @@ def _without_parameters(groups: list[JlcParameterGroup], *labels: str) -> list[J
 
 
 def _datasheet_url(soup: BeautifulSoup, base_url: str) -> str | None:
+    """解析首个 HTTPS 数据手册链接；相对地址以商品页 URL 为基准补全。"""
+
     for anchor in soup.find_all("a", href=True):
         href = urljoin(base_url, str(anchor["href"]))
         text = anchor.get_text(" ", strip=True).casefold()
@@ -312,12 +336,23 @@ def _datasheet_url(soup: BeautifulSoup, base_url: str) -> str | None:
 
 
 def parse_jlc_product_page(url: str, html: str) -> JlcProductDraft:
-    """解析当前商品详情页；输入只存在于调用期间，不写文件也不访问网络。"""
+    """解析当前立创商品详情页并生成可编辑的元件草稿。
 
+    :param url: 内嵌浏览器当前页面的完整 HTTPS URL
+    :param html: 浏览器渲染完成后取得的页面 HTML
+    :return: 主字段、动态参数分组、数据手册链接及警告组成的 ``JlcProductDraft``
+    :raises DomainError: URL 不是商品详情页、页面为空或缺少立创编号时抛出
+
+    注意：本函数不发起网络请求，也不保存原始 HTML；不明确的制造商型号不会被
+    强行猜测，而是写入警告并交由用户确认。
+    """
+
+    ### 校验页面来源和必要内容 ###
     if not is_jlc_product_url(url):
         raise DomainError("JLC_NOT_PRODUCT", "当前页面不是可确认的立创商品详情页")
     if not html.strip():
         raise DomainError("JLC_EMPTY_PAGE", "当前商品页没有可解析内容")
+    ### 解析结构化数据和立创编号 ###
     soup = BeautifulSoup(html, "html.parser")
     product = _json_product(soup)
     page_text = soup.get_text(" ", strip=True)
@@ -337,6 +372,7 @@ def parse_jlc_product_page(url: str, html: str) -> JlcProductDraft:
     if not lcsc_match:
         raise DomainError("JLC_MISSING_NUMBER", "商品页中没有找到可确认的立创编号")
     lcsc = lcsc_match.group(0).upper()
+    ### 提取主字段及动态参数 ###
     groups = _parameter_groups(soup)
     mpn = (
         _clean(product.get("mpn"))
@@ -360,6 +396,7 @@ def parse_jlc_product_page(url: str, html: str) -> JlcProductDraft:
         category = _clean(breadcrumb[-1].get_text(" ", strip=True)) if breadcrumb else None
     description = _clean(product.get("description")) or _meta(soup, "description")
     raw_name = mpn or _clean(product.get("name")) or lcsc
+    ### 记录需要用户确认的缺失信息 ###
     warnings: list[str] = []
     if not mpn:
         warnings.append("页面未提供明确的制造商型号，名称已回退到商品名称或立创编号")

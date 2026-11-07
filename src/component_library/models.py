@@ -55,6 +55,13 @@ class ReceiveRequest(BaseModel):
     unit_price: float | None = Field(default=None, ge=0)
     purchase_date: str | None = None
     supplier_part_id: str | None = None
+    batch_code: str | None = Field(
+        default=None, description="非立创批次二维码，格式为 CL 加十位数字"
+    )
+    order_number: str | None = Field(
+        default=None, description="立创袋贴中的订单号；与元件立创编号共同定位批次"
+    )
+    batch_metadata: dict[str, Any] = Field(default_factory=dict)
     notes: str | None = None
 
 
@@ -64,6 +71,7 @@ class IssueRequest(BaseModel):
     component_id: str
     quantity: int = Field(gt=0)
     location_id: str | None = None
+    batch_id: str | None = Field(default=None, description="指定后仅从该批次扣减")
     source: str | None = None
     notes: str | None = None
 
@@ -92,11 +100,17 @@ class BomInputRow(BaseModel):
 
     row_number: int = Field(ge=1)
     name: str | None = None
-    quantity: int = Field(gt=0)
+    quantity: int = Field(ge=0)
     lcsc_part_number: str | None = None
     manufacturer_part_number: str | None = None
     custom_part_number: str | None = None
     specification: str | None = None
+    designators: str | None = None
+    footprint: str | None = None
+    manufacturer: str | None = None
+    supplier: str | None = None
+    raw_fields: dict[str, str | None] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
 
 
 class BomCommitLine(BaseModel):
@@ -106,6 +120,10 @@ class BomCommitLine(BaseModel):
     component_id: str
     quantity: int = Field(gt=0)
     location_id: str | None = None
+    raw_input: dict[str, Any] = Field(default_factory=dict)
+    mapping_key: str | None = None
+    match_reason: str | None = None
+    remember_mapping: bool = False
 
 
 class BomCommitRequest(BaseModel):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -33,12 +34,19 @@ from .models import (
 )
 
 EPSILON = 1e-9
+CUSTOM_BATCH_CODE = re.compile(r"^CL\d{10}$")
 
 
 class DomainError(RuntimeError):
     """可安全展示给用户的业务错误。"""
 
     def __init__(self, code: str, message: str) -> None:
+        """创建可跨 UI/API 边界传递的领域错误。
+
+        ``code`` 供程序稳定判断错误类型，``message`` 面向用户显示；调用方不应
+        解析自然语言文本来决定控制流。
+        """
+
         super().__init__(message)
         self.code = code
         self.message = message
@@ -111,6 +119,12 @@ class Database:
     """
 
     def __init__(self, path: Path) -> None:
+        """记录数据库路径并创建父目录。
+
+        构造函数不执行迁移；应用启动流程必须显式调用 ``migrate``，便于测试在
+        迁移前配置数据库文件。每次读写都会创建独立 SQLite 连接。
+        """
+
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
@@ -164,6 +178,7 @@ class Database:
             self._migrate_v3(connection)
             self._migrate_v6(connection)
             self._migrate_v8(connection)
+            self._migrate_v9(connection)
 
     @staticmethod
     def _migrate_v3(connection: sqlite3.Connection) -> None:
@@ -220,6 +235,57 @@ class Database:
                 "ADD COLUMN group_name TEXT NOT NULL DEFAULT '类别参数'"
             )
         connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(8,datetime('now'))")
+
+    @staticmethod
+    def _migrate_v9(connection: sqlite3.Connection) -> None:
+        """增加可跨仓库追踪的采购批次，并回填可唯一定位的立创订单库存。"""
+
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS inventory_batches(
+            id TEXT PRIMARY KEY,component_id TEXT NOT NULL REFERENCES components(id),
+            source_type TEXT NOT NULL CHECK(source_type IN ('JLC','CUSTOM')),
+            external_key TEXT NOT NULL UNIQUE,order_number TEXT,lcsc_part_number TEXT,
+            custom_code TEXT UNIQUE,metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)"""
+        )
+        lot_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(stock_lots)").fetchall()
+        }
+        if "batch_id" not in lot_columns:
+            connection.execute(
+                "ALTER TABLE stock_lots ADD COLUMN batch_id TEXT REFERENCES inventory_batches(id)"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lots_batch ON stock_lots(batch_id,received_at)"
+        )
+        rows = connection.execute(
+            """SELECT oi.order_number,oi.lcsc_part_number,oi.component_id,
+            oi.transaction_group_id FROM order_import_items oi"""
+        ).fetchall()
+        for row in rows:
+            external_key = f"JLC:{row['order_number'].upper()}:{row['lcsc_part_number'].upper()}"
+            batch_id = str(uuid.uuid5(uuid.NAMESPACE_URL, external_key))
+            connection.execute(
+                """INSERT OR IGNORE INTO inventory_batches(
+                id,component_id,source_type,external_key,order_number,lcsc_part_number,
+                metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    batch_id,
+                    row["component_id"],
+                    "JLC",
+                    external_key,
+                    row["order_number"].upper(),
+                    row["lcsc_part_number"].upper(),
+                    "{}",
+                    utc_now(),
+                ),
+            )
+            connection.execute(
+                """UPDATE stock_lots SET batch_id=? WHERE batch_id IS NULL AND id IN (
+                SELECT lot_id FROM inventory_transactions
+                WHERE group_id=? AND component_id=? AND quantity_delta>0)""",
+                (batch_id, row["transaction_group_id"], row["component_id"]),
+            )
+        connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(9,datetime('now'))")
 
     def integrity_check(self) -> None:
         """验证数据库物理完整性，不通过时抛出业务错误。"""
@@ -784,6 +850,137 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    @staticmethod
+    def _get_or_create_batch(
+        connection: sqlite3.Connection,
+        component_id: str,
+        *,
+        batch_code: str | None = None,
+        order_number: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
+        """建立或复用批次；二维码和立创订单键在整个数据库中保持唯一。"""
+
+        code = clean(batch_code)
+        order = clean(order_number)
+        if code and order:
+            raise DomainError("VALIDATION_ERROR", "自定义批次码和立创订单号不能同时填写")
+        component = connection.execute(
+            "SELECT lcsc_part_number FROM components WHERE id=?", (component_id,)
+        ).fetchone()
+        if component is None:
+            raise DomainError("NOT_FOUND", "元件不存在")
+        if code:
+            code = code.upper()
+            if not CUSTOM_BATCH_CODE.fullmatch(code):
+                raise DomainError("VALIDATION_ERROR", "批次二维码必须为 CL 加十位数字")
+            source_type = "CUSTOM"
+            external_key = f"CUSTOM:{code}"
+            lcsc = None
+        elif order:
+            lcsc = clean(component["lcsc_part_number"])
+            if not lcsc:
+                raise DomainError("VALIDATION_ERROR", "立创批次必须绑定带立创编号的元件")
+            order = order.upper()
+            lcsc = lcsc.upper()
+            source_type = "JLC"
+            external_key = f"JLC:{order}:{lcsc}"
+            code = None
+        else:
+            return None
+        existing = connection.execute(
+            "SELECT id,component_id FROM inventory_batches WHERE external_key=?", (external_key,)
+        ).fetchone()
+        if existing:
+            if existing["component_id"] != component_id:
+                raise DomainError("CONFLICT", "该批次二维码已绑定到其他元件")
+            if source_type == "CUSTOM":
+                raise DomainError("CONFLICT", "该批次二维码已经绑定，不能重复入库")
+            return str(existing["id"])
+        batch_id = str(uuid.uuid4())
+        connection.execute(
+            """INSERT INTO inventory_batches(
+            id,component_id,source_type,external_key,order_number,lcsc_part_number,
+            custom_code,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                batch_id,
+                component_id,
+                source_type,
+                external_key,
+                order,
+                lcsc,
+                code,
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                utc_now(),
+            ),
+        )
+        return batch_id
+
+    def get_batch(self, batch_id: str) -> dict[str, Any]:
+        """返回批次主数据及各仓库余量。"""
+
+        with self.read() as connection:
+            batch = connection.execute(
+                """SELECT b.*,c.name component_name FROM inventory_batches b
+                JOIN components c ON c.id=b.component_id WHERE b.id=?""",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise DomainError("NOT_FOUND", "批次不存在")
+            locations = connection.execute(
+                """SELECT l.id location_id,l.name location_name,w.id warehouse_id,
+                w.name warehouse_name,SUM(s.remaining_quantity) remaining_quantity
+                FROM stock_lots s JOIN locations l ON l.id=s.location_id
+                JOIN warehouses w ON w.id=l.warehouse_id
+                WHERE s.batch_id=? GROUP BY l.id ORDER BY w.name,l.name""",
+                (batch_id,),
+            ).fetchall()
+            initial = connection.execute(
+                """SELECT COALESCE(SUM(t.quantity_delta),0)
+                FROM inventory_transactions t JOIN stock_lots s ON s.id=t.lot_id
+                WHERE s.batch_id=? AND t.kind='RECEIVE' AND t.quantity_delta>0""",
+                (batch_id,),
+            ).fetchone()[0]
+        result = dict(batch)
+        result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+        result["locations"] = [dict(row) for row in locations]
+        result["initial_quantity"] = int(initial or 0)
+        result["remaining_quantity"] = sum(
+            int(row["remaining_quantity"] or 0) for row in locations
+        )
+        return result
+
+    def resolve_batch_code(self, raw_text: str) -> dict[str, Any]:
+        """把立创袋贴或自定义二维码解析成唯一且仍有库存的批次。"""
+
+        text = raw_text.strip()
+        with self.read() as connection:
+            if CUSTOM_BATCH_CODE.fullmatch(text.upper()):
+                rows = connection.execute(
+                    "SELECT id FROM inventory_batches WHERE custom_code=?", (text.upper(),)
+                ).fetchall()
+            else:
+                from .label_parser import parse_qr_payload
+
+                fields = parse_qr_payload(text)
+                order = fields.get("order_number")
+                lcsc = fields.get("lcsc_part_number")
+                if not order or not lcsc:
+                    raise DomainError("VALIDATION_ERROR", "二维码不是有效的立创袋贴或 CL 批次码")
+                rows = connection.execute(
+                    """SELECT id FROM inventory_batches
+                    WHERE order_number=? AND lcsc_part_number=?""",
+                    (order.normalized_value.upper(), lcsc.normalized_value.upper()),
+                ).fetchall()
+        if not rows:
+            raise DomainError("NOT_FOUND", "没有找到对应的已入库批次")
+        if len(rows) > 1:
+            raise DomainError("CONFLICT", "二维码对应多个批次，请人工选择")
+        result = self.get_batch(str(rows[0]["id"]))
+        if result["remaining_quantity"] <= 0:
+            raise DomainError("INSUFFICIENT_STOCK", "该批次已经没有剩余库存")
+        return result
+
     def preview_order_import(self, lines: list[OrderImportLine]) -> list[dict[str, Any]]:
         """标记订单行将创建、匹配或跳过的状态，不修改数据库。"""
 
@@ -818,18 +1015,26 @@ class Database:
         location_id: str | None = None,
         location_overrides: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """在单个立即事务中导入订单商品、批次和流水。
+        """在单个立即事务中导入订单商品、批次和库存流水。
+
+        :param lines: 用户在预览页确认需要导入的订单商品行
+        :param location_id: 可选，所有商品共用的默认目标库位
+        :param location_overrides: 可选，以“订单号:立创编号”为键的逐商品库位覆盖
+        :return: 事务组编号、导入数、跳过数和新建元件数
+        :raises DomainError: 未选择库位或引用的库位不存在时抛出
 
         订单号与立创编号组成持久幂等键，重复选择同一文件只会跳过已经导入的商品。
         已有元件的用户资料不会被覆盖，只补齐空字段；价格和购买日期作为最新采购信息
         更新，并在批次中保留当次值。
         """
 
+        ### 初始化事务统计信息 ###
         group_id = str(uuid.uuid4())
         imported_count = 0
         skipped_count = 0
         created_count = 0
         timestamp = utc_now()
+        ### 在同一个立即事务内处理每条订单商品 ###
         with self.write() as connection:
             for line in lines:
                 import_key = f"{line.order_number}:{line.lcsc_part_number}"
@@ -902,10 +1107,16 @@ class Database:
                     )
                     created_count += 1
                 lot_id = str(uuid.uuid4())
+                batch_id = self._get_or_create_batch(
+                    connection,
+                    component_id,
+                    order_number=line.order_number,
+                    metadata={"source": "order_import"},
+                )
                 connection.execute(
                     """INSERT INTO stock_lots(id,component_id,location_id,initial_quantity,
-                    remaining_quantity,source,unit_price,notes,received_at,purchase_date)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    remaining_quantity,source,unit_price,notes,received_at,purchase_date,batch_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         lot_id,
                         component_id,
@@ -917,6 +1128,7 @@ class Database:
                         "从用户保存的订单页面导入",
                         timestamp,
                         line.purchased_at[:10],
+                        batch_id,
                     ),
                 )
                 self._insert_transaction(
@@ -993,18 +1205,34 @@ class Database:
             )
 
     def receive(self, data: ReceiveRequest, kind: str = "RECEIVE") -> dict[str, Any]:
-        """创建批次并记录正向流水。"""
+        """创建或复用批次，新增库存批次并记录正向流水。
 
+        :param data: 元件、库位、数量、采购信息及可选批次信息
+        :param kind: 流水类型，默认 ``RECEIVE``；内部流程可传入更具体类型
+        :return: 事务组编号、流水数量和批次编号
+        :raises DomainError: 元件或库位不存在时抛出
+
+        库存批次、流水和元件最新采购信息位于同一事务，任一步失败都会整体回滚。
+        """
+
+        ### 校验引用并创建库存批次 ###
         with self.write() as connection:
             self._require(connection, "components", data.component_id, "元件")
             self._require(connection, "locations", data.location_id, "仓库")
             group_id = str(uuid.uuid4())
             lot_id = str(uuid.uuid4())
             timestamp = utc_now()
+            batch_id = self._get_or_create_batch(
+                connection,
+                data.component_id,
+                batch_code=data.batch_code,
+                order_number=data.order_number,
+                metadata=data.batch_metadata,
+            )
             connection.execute(
                 """INSERT INTO stock_lots(id,component_id,location_id,initial_quantity,
-                remaining_quantity,source,unit_price,supplier_part_id,notes,received_at,purchase_date)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                remaining_quantity,source,unit_price,supplier_part_id,notes,received_at,purchase_date,
+                batch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     lot_id,
                     data.component_id,
@@ -1017,8 +1245,10 @@ class Database:
                     clean(data.notes),
                     timestamp,
                     clean(data.purchase_date),
+                    batch_id,
                 ),
             )
+            ### 记录不可变流水并更新元件采购信息 ###
             self._insert_transaction(
                 connection,
                 group_id,
@@ -1035,10 +1265,22 @@ class Database:
                 purchase_date=COALESCE(?,purchase_date),archived_at=NULL,updated_at=? WHERE id=?""",
                 (data.unit_price, clean(data.purchase_date), timestamp, data.component_id),
             )
-        return {"transaction_group_id": group_id, "affected_transactions": 1}
+        return {
+            "transaction_group_id": group_id,
+            "affected_transactions": 1,
+            "batch_id": batch_id,
+        }
 
     def issue(self, data: IssueRequest, kind: str = "ISSUE") -> dict[str, Any]:
-        """按接收时间从批次扣减库存，检查与扣减位于同一事务。"""
+        """按接收时间顺序从库存批次扣减数量。
+
+        :param data: 元件、可选库位/批次、出库数量和用途说明
+        :param kind: 生成的流水类型，默认 ``ISSUE``
+        :return: 事务组编号和实际生成的流水条数
+        :raises DomainError: 元件不存在或可用库存不足时抛出
+
+        注意：库存检查和扣减位于同一个立即事务中，避免并发出库造成负库存。
+        """
 
         with self.write() as connection:
             self._require(connection, "components", data.component_id, "元件")
@@ -1052,23 +1294,37 @@ class Database:
                 data.source,
                 data.notes,
                 kind,
+                data.batch_id,
             )
         return {"transaction_group_id": group_id, "affected_transactions": count}
 
     def transfer(self, data: TransferRequest) -> dict[str, Any]:
-        """原子移动库存并为来源和目标分别记录流水。"""
+        """在两个库位之间原子移动库存，并分别记录移出、移入流水。
 
+        :param data: 元件、源库位、目标库位、数量及备注
+        :return: 事务组编号和生成的流水条数
+        :raises DomainError: 两个库位相同、库位不存在或源库存不足时抛出
+
+        每个被消耗的源批次都会生成对应目标批次，并继承原批次编号和单价，保证
+        移库后仍可追溯采购来源。
+        """
+
+        ### 校验源库位和目标库位 ###
         if data.from_location_id == data.to_location_id:
             raise DomainError("VALIDATION_ERROR", "源仓库和目标仓库不能相同")
         with self.write() as connection:
             self._require(connection, "locations", data.from_location_id, "源仓库")
             self._require(connection, "locations", data.to_location_id, "目标仓库")
             group_id = str(uuid.uuid4())
+            ### 按批次消耗源库存并逐批创建目标库存 ###
             used = self._consume_lots(
                 connection, data.component_id, data.from_location_id, data.quantity
             )
             affected = 0
             for source_lot, quantity, unit_price in used:
+                source_batch = connection.execute(
+                    "SELECT batch_id FROM stock_lots WHERE id=?", (source_lot,)
+                ).fetchone()[0]
                 self._insert_transaction(
                     connection,
                     group_id,
@@ -1083,8 +1339,8 @@ class Database:
                 target_lot = str(uuid.uuid4())
                 connection.execute(
                     """INSERT INTO stock_lots(id,component_id,location_id,initial_quantity,
-                    remaining_quantity,source,unit_price,notes,received_at)
-                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    remaining_quantity,source,unit_price,notes,received_at,batch_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (
                         target_lot,
                         data.component_id,
@@ -1095,6 +1351,7 @@ class Database:
                         unit_price,
                         clean(data.notes),
                         utc_now(),
+                        source_batch,
                     ),
                 )
                 self._insert_transaction(
@@ -1114,10 +1371,15 @@ class Database:
     def adjust(self, data: AdjustRequest) -> dict[str, Any]:
         """把仓库库存调整到目标值，差额仍通过批次流水表达。
 
+        :param data: 元件、库位、盘点目标数量和调整原因
+        :return: 事务组编号和生成的调整流水条数
+        :raises DomainError: 引用不存在、目标量未变化或减库存时库存不足时抛出
+
         当前数量的读取、差额计算和流水写入必须处于同一个立即事务中。若把读取
         放在事务外，另一线程可能在两步之间入库，最终数量便不再等于盘点目标。
         """
 
+        ### 在事务内读取当前数量并计算差额 ###
         with self.write() as connection:
             self._require(connection, "components", data.component_id, "元件")
             self._require(connection, "locations", data.location_id, "仓库")
@@ -1132,6 +1394,7 @@ class Database:
                 raise DomainError("CONFLICT", "目标数量与当前库存相同")
 
             group_id = str(uuid.uuid4())
+            ### 根据差额方向创建入库或出库流水 ###
             if difference > 0:
                 lot_id = str(uuid.uuid4())
                 connection.execute(
@@ -1186,8 +1449,17 @@ class Database:
         return [dict(row) for row in rows]
 
     def reverse_group(self, group_id: str, reason: str) -> dict[str, Any]:
-        """用数值相反的流水冲销整个事务组，原流水不会被删除。"""
+        """用数值相反的新流水冲销整个事务组。
 
+        :param group_id: 需要冲销的原事务组编号
+        :param reason: 必填的冲销原因，写入审计流水
+        :return: 新冲销事务组编号和受影响流水数
+        :raises DomainError: 原组不存在、已冲销或相关入库数量已被使用时抛出
+
+        注意：原流水不会被删除。正向入库的冲销必须先确认对应批次仍有足够余量。
+        """
+
+        ### 校验冲销请求和原事务组 ###
         if not reason.strip():
             raise DomainError("VALIDATION_ERROR", "必须填写冲销原因")
         with self.write() as connection:
@@ -1204,6 +1476,7 @@ class Database:
                 ids,
             ).fetchone():
                 raise DomainError("CONFLICT", "该事务组已经冲销")
+            ### 验证正向流水仍可撤销 ###
             # 正向流水的冲销需要从原批次取回数量，因此必须先验证剩余量。
             for row in rows:
                 if row["quantity_delta"] > 0:
@@ -1214,6 +1487,7 @@ class Database:
                     )
                     if remaining + EPSILON < row["quantity_delta"]:
                         raise DomainError("INSUFFICIENT_STOCK", "部分已入库库存已经使用，无法冲销")
+            ### 写入反向库存变化和审计流水 ###
             reversal_group = str(uuid.uuid4())
             for row in rows:
                 connection.execute(
@@ -1235,17 +1509,45 @@ class Database:
         return {"transaction_group_id": reversal_group, "affected_transactions": len(rows)}
 
     def commit_bom(self, data: BomCommitRequest) -> dict[str, Any]:
-        """验证全部 BOM 行后一次性出库，任意缺料都会回滚整个事务。"""
+        """验证全部 BOM 行后一次性创建 BOM 并扣减库存。
 
+        :param data: 用户确认后的 BOM 名称、来源文件和逐行元件选择
+        :return: BOM 编号、事务组编号和生成的出库流水数
+        :raises DomainError: 元件不存在或任意累计需求库存不足时抛出
+
+        注意：同一元件可能出现在多行中，必须先按元件和指定库位汇总需求；任一行
+        缺料都会回滚 BOM、映射记录和所有库存变化。
+        """
+
+        ### 汇总并验证全部 BOM 需求 ###
         with self.write() as connection:
-            # 先验证每一行，确保不会在中途产生部分扣减。
+            # 同一元件可能在 BOM 中出现多行，必须按累计需求验证，不能逐行各自
+            # 对比完整库存。指定仓库的需求还要额外验证该仓库自身的余量。
+            total_demand: dict[str, int] = {}
+            location_demand: dict[tuple[str, str], int] = {}
             for line in data.lines:
-                available = self._available(connection, line.component_id, line.location_id)
-                if available + EPSILON < line.quantity:
+                self._require(connection, "components", line.component_id, "元件")
+                total_demand[line.component_id] = (
+                    total_demand.get(line.component_id, 0) + line.quantity
+                )
+                if line.location_id:
+                    key = (line.component_id, line.location_id)
+                    location_demand[key] = location_demand.get(key, 0) + line.quantity
+            for component_id, required in total_demand.items():
+                available = self._available(connection, component_id, None)
+                if available + EPSILON < required:
                     raise DomainError(
                         "INSUFFICIENT_STOCK",
-                        f"BOM 第 {line.row_number} 行库存不足：需要 {line.quantity}，可用 {available}",
+                        f"BOM 累计库存不足：需要 {required}，可用 {available}",
                     )
+            for (component_id, location_id), required in location_demand.items():
+                available = self._available(connection, component_id, location_id)
+                if available + EPSILON < required:
+                    raise DomainError(
+                        "INSUFFICIENT_STOCK",
+                        f"BOM 指定仓库库存不足：需要 {required}，可用 {available}",
+                    )
+            ### 保存 BOM、人工映射并逐行扣减库存 ###
             bom_id = str(uuid.uuid4())
             group_id = str(uuid.uuid4())
             connection.execute(
@@ -1260,11 +1562,26 @@ class Database:
                         str(uuid.uuid4()),
                         bom_id,
                         line.row_number,
-                        "{}",
+                        json.dumps(
+                            {
+                                "input": line.raw_input,
+                                "mapping_key": line.mapping_key,
+                                "match_reason": line.match_reason,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
                         line.component_id,
                         line.quantity,
                     ),
                 )
+                if line.remember_mapping and line.mapping_key:
+                    connection.execute(
+                        """INSERT INTO part_mappings(id,mapping_key,component_id,created_at)
+                        VALUES(?,?,?,?) ON CONFLICT(mapping_key) DO UPDATE SET
+                        component_id=excluded.component_id,created_at=excluded.created_at""",
+                        (str(uuid.uuid4()), line.mapping_key, line.component_id, utc_now()),
+                    )
                 affected += self._issue_from_lots(
                     connection,
                     group_id,
@@ -1282,20 +1599,23 @@ class Database:
         }
 
     def _available(
-        self, connection: sqlite3.Connection, component_id: str, location_id: str | None
+        self,
+        connection: sqlite3.Connection,
+        component_id: str,
+        location_id: str | None,
+        batch_id: str | None = None,
     ) -> float:
         """在当前事务快照内计算可用库存。"""
 
+        sql = "SELECT COALESCE(SUM(remaining_quantity),0) FROM stock_lots WHERE component_id=?"
+        parameters: list[Any] = [component_id]
         if location_id:
-            row = connection.execute(
-                "SELECT COALESCE(SUM(remaining_quantity),0) FROM stock_lots WHERE component_id=? AND location_id=?",
-                (component_id, location_id),
-            ).fetchone()
-        else:
-            row = connection.execute(
-                "SELECT COALESCE(SUM(remaining_quantity),0) FROM stock_lots WHERE component_id=?",
-                (component_id,),
-            ).fetchone()
+            sql += " AND location_id=?"
+            parameters.append(location_id)
+        if batch_id:
+            sql += " AND batch_id=?"
+            parameters.append(batch_id)
+        row = connection.execute(sql, parameters).fetchone()
         return float(row[0])
 
     def _consume_lots(
@@ -1304,10 +1624,19 @@ class Database:
         component_id: str,
         location_id: str | None,
         quantity: float,
+        batch_id: str | None = None,
     ) -> list[tuple[str, float, float | None]]:
         """按 FIFO 扣减批次，返回 ``(批次, 使用量, 单价)``。"""
 
-        available = self._available(connection, component_id, location_id)
+        if batch_id:
+            batch = connection.execute(
+                "SELECT component_id FROM inventory_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                raise DomainError("NOT_FOUND", "批次不存在")
+            if batch["component_id"] != component_id:
+                raise DomainError("VALIDATION_ERROR", "批次与出库元件不一致")
+        available = self._available(connection, component_id, location_id, batch_id)
         if available + EPSILON < quantity:
             raise DomainError("INSUFFICIENT_STOCK", f"库存不足：需要 {quantity}，可用 {available}")
         sql = "SELECT id,remaining_quantity,unit_price FROM stock_lots WHERE component_id=? AND remaining_quantity>0"
@@ -1315,6 +1644,9 @@ class Database:
         if location_id:
             sql += " AND location_id=?"
             parameters.append(location_id)
+        if batch_id:
+            sql += " AND batch_id=?"
+            parameters.append(batch_id)
         sql += " ORDER BY received_at,id"
         remaining = quantity
         used: list[tuple[str, float, float | None]] = []
@@ -1340,10 +1672,11 @@ class Database:
         source: str | None,
         notes: str | None,
         kind: str,
+        batch_id: str | None = None,
     ) -> int:
         """扣减批次并写入负向流水；调用方必须已经开启写事务。"""
 
-        used = self._consume_lots(connection, component_id, location_id, quantity)
+        used = self._consume_lots(connection, component_id, location_id, quantity, batch_id)
         for lot_id, amount, _ in used:
             actual_location = connection.execute(
                 "SELECT location_id FROM stock_lots WHERE id=?", (lot_id,)
@@ -1562,7 +1895,8 @@ CREATE INDEX IF NOT EXISTS idx_components_mpn ON components(manufacturer_part_nu
 CREATE TABLE IF NOT EXISTS warehouses(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE CHECK(trim(name)<>''),notes TEXT,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS locations(id TEXT PRIMARY KEY,warehouse_id TEXT NOT NULL REFERENCES warehouses(id),name TEXT NOT NULL CHECK(trim(name)<>''),notes TEXT,created_at TEXT NOT NULL,UNIQUE(warehouse_id,name));
 CREATE TABLE IF NOT EXISTS supplier_parts(id TEXT PRIMARY KEY,component_id TEXT NOT NULL REFERENCES components(id),provider TEXT NOT NULL,provider_part_number TEXT NOT NULL,snapshot_json TEXT,last_fetched_at TEXT,UNIQUE(provider,provider_part_number));
-CREATE TABLE IF NOT EXISTS stock_lots(id TEXT PRIMARY KEY,component_id TEXT NOT NULL REFERENCES components(id),location_id TEXT NOT NULL REFERENCES locations(id),initial_quantity INTEGER NOT NULL CHECK(initial_quantity>0),remaining_quantity INTEGER NOT NULL CHECK(remaining_quantity>=0),source TEXT,unit_price REAL,supplier_part_id TEXT REFERENCES supplier_parts(id),notes TEXT,received_at TEXT NOT NULL,purchase_date TEXT);
+CREATE TABLE IF NOT EXISTS inventory_batches(id TEXT PRIMARY KEY,component_id TEXT NOT NULL REFERENCES components(id),source_type TEXT NOT NULL CHECK(source_type IN ('JLC','CUSTOM')),external_key TEXT NOT NULL UNIQUE,order_number TEXT,lcsc_part_number TEXT,custom_code TEXT UNIQUE,metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS stock_lots(id TEXT PRIMARY KEY,component_id TEXT NOT NULL REFERENCES components(id),location_id TEXT NOT NULL REFERENCES locations(id),initial_quantity INTEGER NOT NULL CHECK(initial_quantity>0),remaining_quantity INTEGER NOT NULL CHECK(remaining_quantity>=0),source TEXT,unit_price REAL,supplier_part_id TEXT REFERENCES supplier_parts(id),notes TEXT,received_at TEXT NOT NULL,purchase_date TEXT,batch_id TEXT REFERENCES inventory_batches(id));
 CREATE INDEX IF NOT EXISTS idx_lots_fifo ON stock_lots(component_id,location_id,received_at);
 CREATE TABLE IF NOT EXISTS inventory_transactions(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,kind TEXT NOT NULL,component_id TEXT NOT NULL REFERENCES components(id),lot_id TEXT NOT NULL REFERENCES stock_lots(id),location_id TEXT NOT NULL REFERENCES locations(id),quantity_delta INTEGER NOT NULL CHECK(quantity_delta<>0),source TEXT,notes TEXT,reversal_of TEXT REFERENCES inventory_transactions(id),created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_transactions_component ON inventory_transactions(component_id,created_at);
@@ -1598,6 +1932,7 @@ INSERT OR IGNORE INTO schema_migrations VALUES(2,datetime('now'));
 INSERT OR IGNORE INTO schema_migrations VALUES(4,datetime('now'));
 INSERT OR IGNORE INTO schema_migrations VALUES(5,datetime('now'));
 INSERT OR IGNORE INTO schema_migrations VALUES(6,datetime('now'));
+INSERT OR IGNORE INTO schema_migrations VALUES(9,datetime('now'));
 """
 
 INTEGER_TRIGGERS = """

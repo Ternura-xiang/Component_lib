@@ -14,7 +14,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from .label_parser import merge_fields, parse_ocr_lines, parse_qr_payload
+from .label_parser import merge_fields, parse_label_text, parse_ocr_lines, parse_qr_payload
 from .models import LabelDraft, OcrLine
 
 
@@ -34,6 +34,8 @@ class RecognitionEngine:
     """
 
     def __init__(self) -> None:
+        """创建尚未加载模型的识别器，并准备串行化 OCR 调用的进程内锁。"""
+
         self._ocr: Any | None = None
         self._lock = threading.Lock()
         self.model_version = "RapidOCR/ONNX (not loaded)"
@@ -69,11 +71,19 @@ class RecognitionEngine:
         return {"available": True, "model_version": self.model_version, "backend": "onnxruntime"}
 
     def analyze(self, image_bytes: bytes) -> LabelDraft:
-        """识别一张图片并返回待确认草稿，不产生任何数据库副作用。"""
+        """识别一张袋贴图片并生成需要人工确认的结构化草稿。
+
+        :param image_bytes: PNG/JPEG 等 OpenCV 可解码的完整图片字节
+        :return: 包含 OCR 行、条码字段、质量指标、警告和标注图的 ``LabelDraft``
+
+        注意：本方法不修改数据库。OCR 模型调用由实例锁串行化，避免多个摄像头帧
+        同时进入非线程安全的推理会话。
+        """
 
         import cv2
         import numpy as np
 
+        ### 解码图片并生成预处理分支 ###
         encoded = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
         if image is None:
@@ -83,10 +93,16 @@ class RecognitionEngine:
         prepared = self._prepare_variants(image)
         barcode_payload = self._decode_barcodes(prepared)
 
+        ### 串行执行 OCR 并解析条码字段 ###
         with self._lock:
             lines, branch, recognized_image = self._recognize_best(prepared)
         ocr_fields = parse_ocr_lines(lines)
         barcode_fields = parse_qr_payload(barcode_payload or "")
+        if barcode_payload and not barcode_fields:
+            parsed_barcode = parse_label_text(barcode_payload)
+            if "batch_code" in parsed_barcode.fields:
+                barcode_fields = parsed_barcode.fields
+        ### 合并识别结果并生成质量警告 ###
         fields, warnings = merge_fields(ocr_fields, barcode_fields)
         if float(quality["blur_score"]) < 45:
             warnings.append("画面可能失焦，请重新拍摄并确认所有字段")
@@ -107,6 +123,42 @@ class RecognitionEngine:
             warnings=warnings,
             annotated_image_png=annotated,
         )
+
+    def decode_barcode(self, image_bytes: bytes) -> str | None:
+        """只执行二维码/条码解码，避免实时出库时加载 OCR 模型。
+
+        :param image_bytes: 摄像头帧编码后的图片字节
+        :return: 首个符合业务优先级的条码文本；无法解码时返回 ``None``
+
+        注意：会同时尝试完整画面、中央区域和标签矫正图；完整画面必须优先保留，
+        否则反光区域可能被误识别为标签并裁掉真正二维码。
+        """
+
+        import cv2
+        import numpy as np
+
+        ### 解码并限制图像尺寸 ###
+        encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        image = self._resize(image, 1920)
+        # 实时扫码先使用完整相机帧。若直接复用 OCR 的白色标签矫正，
+        # 反光、桌面或其他明亮矩形可能被误当成标签，导致二维码被裁出画面。
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        height, width = image.shape[:2]
+        center = image[height // 10 : height * 9 // 10, width // 10 : width * 9 // 10]
+        ### 构建由宽到窄的解码候选 ###
+        prepared = [
+            PreparedImage("camera-color", image),
+            PreparedImage("camera-gray", gray),
+            PreparedImage("camera-clahe", clahe),
+        ]
+        if center.size:
+            prepared.append(PreparedImage("camera-center", center))
+        prepared.extend(self._prepare_variants(image))
+        return self._decode_barcodes(prepared, qr_only=True)
 
     @staticmethod
     def _resize(image: Any, maximum: int) -> Any:
@@ -211,7 +263,9 @@ class RecognitionEngine:
         return ordered
 
     @staticmethod
-    def _decode_barcodes(prepared: list[PreparedImage]) -> str | None:
+    def _decode_barcodes(
+        prepared: list[PreparedImage], *, qr_only: bool = False
+    ) -> str | None:
         """尝试所有图像分支，优先返回嘉立创结构化二维码。
 
         袋贴同时存在一维码与二维码时，ZXing 的返回顺序不是业务优先级。若直接取第一项，
@@ -222,15 +276,33 @@ class RecognitionEngine:
             import zxingcpp
         except ImportError:
             return None
-        fallback: str | None = None
+        qr_fallback: str | None = None
+        barcode_fallback: str | None = None
         for branch in prepared:
-            for result in zxingcpp.read_barcodes(branch.image):
+            # 出库摄像头画面中常同时存在底部物流一维码。若二维码
+            # 暂时失焦而一维码先被读到，不能将它当成批次码提交。
+            if qr_only:
+                results = zxingcpp.read_barcodes(
+                    branch.image, formats=zxingcpp.BarcodeFormat.QRCode
+                )
+            else:
+                # zxing-cpp 2.3 的 pybind 签名展示 formats 默认为 None，
+                # 但显式传入 formats=None 会报 incompatible function arguments。
+                results = zxingcpp.read_barcodes(branch.image)
+            for result in results:
                 if result.text:
-                    text = str(result.text)
-                    if text.startswith("{") and "pc:" in text and "qty:" in text:
+                    text = str(result.text).strip()
+                    compact = text.replace('"', "").replace(" ", "")
+                    if (
+                        text.upper().startswith("CL")
+                        or (compact.startswith("{") and "pc:" in compact and "qty:" in compact)
+                    ):
                         return text
-                    fallback = fallback or text
-        return fallback
+                    if result.format == zxingcpp.BarcodeFormat.QRCode:
+                        qr_fallback = qr_fallback or text
+                    else:
+                        barcode_fallback = barcode_fallback or text
+        return qr_fallback if qr_only else qr_fallback or barcode_fallback
 
     def _load_ocr(self) -> Any:
         """延迟创建 RapidOCR；正式包中的模型必须随 wheel 一起存在。"""
@@ -243,7 +315,14 @@ class RecognitionEngine:
         return self._ocr
 
     def _recognize_best(self, prepared: list[PreparedImage]) -> tuple[list[OcrLine], str, Any]:
-        """比较三个预处理分支和四个方向，选择可信文字最多的结果。"""
+        """比较各预处理分支和四个旋转方向，选择综合得分最高的结果。
+
+        :param prepared: 已生成的 OCR 图像分支列表，不能为空
+        :return: ``(文字行列表, 分支名称, 实际识别图像)``
+
+        得分由文字置信度总和及有限的行数奖励组成；单个分支异常会降级为空结果，
+        不会中断其他方向的尝试。
+        """
 
         import cv2
 
@@ -252,6 +331,7 @@ class RecognitionEngine:
         best_name = "none"
         best_image = prepared[0].image
         best_score = -1.0
+        ### 遍历每个预处理分支和旋转方向 ###
         for branch in prepared:
             current = branch.image
             for turns in range(4):

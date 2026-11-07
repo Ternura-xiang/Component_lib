@@ -7,10 +7,11 @@
 from __future__ import annotations
 
 import time
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QThreadPool, QUrl, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import (
     QCamera,
@@ -21,6 +22,7 @@ from PySide6.QtMultimedia import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -41,6 +43,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -48,9 +51,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..bom import parse_bom, preview_bom
-from ..database import Database
-from ..jlc_import import parse_copied_product
+from ..bom import ALIASES, parse_bom, preview_bom
+from ..database import Database, DomainError
+from ..label_parser import CUSTOM_BATCH_PATTERN, parse_qr_payload
 from ..models import (
     ComponentCreate,
     IssueRequest,
@@ -66,6 +69,18 @@ from ..order_import import parse_saved_orders
 from ..recognition import RecognitionEngine
 from .jlc_browser import JlcBrowserDialog, JlcMergeDialog
 from .workers import Worker
+
+
+def qimage_to_png(image: QImage) -> bytes:
+    """把 Qt 图像编码为内存 PNG，兼容 PySide6 6.12 的运行时参数。"""
+
+    data = QByteArray()
+    buffer = QBuffer(data)
+    if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        raise RuntimeError("无法创建摄像头帧内存缓冲区")
+    if not image.save(buffer, "PNG"):  # type: ignore[call-overload]
+        raise RuntimeError("无法将摄像头帧编码为 PNG")
+    return bytes(data.data())
 
 
 def make_table(headers: list[str]) -> QTableWidget:
@@ -110,6 +125,8 @@ class WheelSafeSpinBox(QSpinBox):
     """忽略鼠标滚轮，防止滚动页面时意外改变整数数量。"""
 
     def wheelEvent(self, event: Any) -> None:
+        """拒绝滚轮事件，让父级滚动区域继续处理页面滚动。"""
+
         event.ignore()
 
 
@@ -117,6 +134,8 @@ class WheelSafeDoubleSpinBox(QDoubleSpinBox):
     """忽略鼠标滚轮，防止滚动页面时意外改变单价。"""
 
     def wheelEvent(self, event: Any) -> None:
+        """拒绝滚轮事件，避免未聚焦时误改浮点数值。"""
+
         event.ignore()
 
 
@@ -137,6 +156,8 @@ class InlineEditor(QLineEdit):
         self.cancelled.emit()
 
     def keyPressEvent(self, event: Any) -> None:
+        """拦截 Escape 作为取消，其余按键交还 QLineEdit 默认实现。"""
+
         if event.key() == Qt.Key.Key_Escape:
             self.cancel_edit()
             return
@@ -252,6 +273,11 @@ class ComponentEditDialog(QDialog):
     """双击库存行时编辑元件主数据和类别参数。"""
 
     def __init__(self, database: Database, component_id: str, parent: QWidget) -> None:
+        """读取 ``component_id`` 的完整详情并构造可编辑表单。
+
+        参数字段会保留数据库中的稳定键与分组；对话框确认前不写入数据。
+        """
+
         super().__init__(parent)
         self.database = database
         self.component_id = component_id
@@ -327,6 +353,12 @@ class ComponentEditDialog(QDialog):
         values: dict[str, str] | None = None,
         definitions: list[tuple[str, str, str]] | None = None,
     ) -> None:
+        """重建类别参数输入框，同时尽量保留用户尚未保存的输入。
+
+        ``definitions`` 用于恢复持久化的键、标签和分组；为空时按当前类别使用默认
+        定义。动态删除的旧控件通过 ``deleteLater`` 交给 Qt 安全回收。
+        """
+
         preserved = {key: field.text() for key, (_, field) in self.parameter_fields.items()}
         if values:
             preserved.update(values)
@@ -398,6 +430,8 @@ class OrderLineEditDialog(QDialog):
     """编辑订单导入草稿的一行，不直接修改库存。"""
 
     def __init__(self, line: OrderImportLine, parent: QWidget) -> None:
+        """从订单草稿行填充控件；保存结果写入 ``edited_line`` 而非数据库。"""
+
         super().__init__(parent)
         self.original = line
         self.edited_line = line
@@ -435,6 +469,8 @@ class OrderLineEditDialog(QDialog):
         form.addRow(buttons)
 
     def save(self) -> None:
+        """校验必填名称并生成不可变草稿的更新副本。"""
+
         if not self.name.text().strip():
             QMessageBox.critical(self, "保存失败", "元件名称不能为空")
             return
@@ -457,6 +493,8 @@ class StorageEditDialog(QDialog):
     """修改具体仓库的所属位置、名称和备注。"""
 
     def __init__(self, database: Database, item: dict[str, Any], parent: QWidget) -> None:
+        """用库位记录初始化所属位置、名称和备注编辑控件。"""
+
         super().__init__(parent)
         self.setWindowTitle("修改仓库")
         form = QFormLayout(self)
@@ -483,6 +521,8 @@ class BasePage(QWidget):
     changed = Signal()
 
     def __init__(self, database: Database) -> None:
+        """保存共享数据库引用并复用全局 Qt 线程池。"""
+
         super().__init__()
         self.database = database
         self.pool = QThreadPool.globalInstance()
@@ -502,6 +542,8 @@ class InventoryPage(BasePage):
     """元件搜索和分仓库库存完整信息总览。"""
 
     def __init__(self, database: Database) -> None:
+        """构建库存筛选、表格、原位编辑和右键菜单，并加载首次快照。"""
+
         super().__init__(database)
         layout = QVBoxLayout(self)
         search_row = QHBoxLayout()
@@ -732,6 +774,8 @@ class InventoryPage(BasePage):
         )
 
         def save() -> None:
+            """把当前库存单元格编辑委托给统一校验与刷新流程。"""
+
             self._save_inline_component(editor, str(component_id), field, row, column)
 
         editor.editingFinished.connect(save)
@@ -822,16 +866,176 @@ class InventoryPage(BasePage):
                 QDesktopServices.openUrl(QUrl(str(url)))
 
 
+class BatchCodeScanDialog(QDialog):
+    """使用摄像头扫描非立创物料的 ``CL`` 批次二维码。"""
+
+    def __init__(self, recognition: RecognitionEngine, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("扫描自定义批次二维码")
+        self.resize(720, 560)
+        self.recognition = recognition
+        self.code: str | None = None
+        self.camera: QCamera | None = None
+        self.session: QMediaCaptureSession | None = None
+        self.sink: QVideoSink | None = None
+        self.worker: Worker | None = None
+        self.busy = False
+        self.last_frame_at = 0.0
+        self.pool = QThreadPool.globalInstance()
+        layout = QVBoxLayout(self)
+        self.status = QLabel("正在准备摄像头…")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.preview = QLabel("摄像头未启动")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(360)
+        self.preview.setStyleSheet("background:#17202a;color:#ccd6dd;border-radius:8px")
+        layout.addWidget(self.preview)
+        controls = QHBoxLayout()
+        self.camera_choice = QComboBox()
+        self._refresh_cameras()
+        restart = QPushButton("重新打开摄像头")
+        restart.clicked.connect(self.start_camera)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        controls.addWidget(self.camera_choice)
+        controls.addWidget(restart)
+        controls.addWidget(cancel)
+        layout.addLayout(controls)
+
+    def _refresh_cameras(self) -> None:
+        selected = self.camera_choice.currentText() if self.camera_choice.count() else ""
+        self.camera_choice.clear()
+        devices = QMediaDevices.videoInputs()
+        for device in devices:
+            self.camera_choice.addItem(device.description())
+        if not devices:
+            self.camera_choice.addItem("未检测到摄像头")
+            self.camera_choice.setEnabled(False)
+            return
+        self.camera_choice.setEnabled(True)
+        previous = self.camera_choice.findText(selected)
+        if previous >= 0:
+            self.camera_choice.setCurrentIndex(previous)
+
+    def start_camera(self) -> None:
+        """打开所选摄像头并自动扫描。"""
+
+        self._refresh_cameras()
+        devices = QMediaDevices.videoInputs()
+        if not devices:
+            self.status.setText("未检测到摄像头，请检查系统权限")
+            return
+        self.stop_camera()
+        index = max(0, min(self.camera_choice.currentIndex(), len(devices) - 1))
+        device = devices[index]
+        self.camera = QCamera(device)
+        formats = [
+            item
+            for item in device.videoFormats()
+            if item.resolution().width() * item.resolution().height() <= 1280 * 720
+            and item.maxFrameRate() >= 15
+        ]
+        if formats:
+            self.camera.setCameraFormat(
+                max(
+                    formats,
+                    key=lambda item: (
+                        item.resolution().width() * item.resolution().height(),
+                        item.maxFrameRate(),
+                    ),
+                )
+            )
+        if self.camera.isFocusModeSupported(QCamera.FocusMode.FocusModeAutoNear):
+            self.camera.setFocusMode(QCamera.FocusMode.FocusModeAutoNear)
+        elif self.camera.isFocusModeSupported(QCamera.FocusMode.FocusModeAuto):
+            self.camera.setFocusMode(QCamera.FocusMode.FocusModeAuto)
+        self.camera.errorOccurred.connect(
+            lambda _error, message: self.status.setText(f"摄像头异常：{message}")
+        )
+        self.session = QMediaCaptureSession()
+        self.sink = QVideoSink()
+        self.session.setCamera(self.camera)
+        self.session.setVideoSink(self.sink)
+        self.sink.videoFrameChanged.connect(self._frame)
+        self.status.setText("请将 CL 加十位数字的二维码放入画面中央")
+        self.camera.start()
+
+    def stop_camera(self) -> None:
+        if self.camera:
+            self.camera.stop()
+        self.camera = None
+        self.session = None
+        self.sink = None
+
+    def _frame(self, frame: QVideoFrame) -> None:
+        image = frame.toImage()
+        if image.isNull():
+            return
+        self.preview.setPixmap(
+            QPixmap.fromImage(image).scaled(
+                self.preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        now = time.monotonic()
+        if self.busy or now - self.last_frame_at < 0.35:
+            return
+        self.last_frame_at = now
+        try:
+            image_bytes = qimage_to_png(image.copy())
+        except Exception as error:
+            self.status.setText(f"图像处理异常：{error}")
+            return
+        self.busy = True
+        self.worker = Worker(lambda: self.recognition.decode_barcode(image_bytes))
+        self.worker.signals.succeeded.connect(self._decoded)
+        self.worker.signals.failed.connect(
+            lambda message: self.status.setText(f"二维码解码异常：{message}")
+        )
+        self.worker.signals.finished.connect(self._finished)
+        self.pool.start(self.worker)
+
+    def _finished(self) -> None:
+        self.busy = False
+        self.worker = None
+
+    def _decoded(self, raw_text: str | None) -> None:
+        text = raw_text.strip().upper() if raw_text else ""
+        if not text:
+            return
+        if not CUSTOM_BATCH_PATTERN.fullmatch(text):
+            self.status.setText(f"已识别二维码，但不是 CL 批次码：{text}")
+            return
+        self.code = text
+        self.stop_camera()
+        self.accept()
+
+    def reject(self) -> None:
+        self.stop_camera()
+        super().reject()
+
+    def closeEvent(self, event: Any) -> None:
+        self.stop_camera()
+        super().closeEvent(event)
+
+
 class ReceivePage(BasePage):
     """使用可输入下拉框匹配已有元件，未匹配内容作为新元件入库。"""
 
     open_order_import = Signal()
+    open_scan = Signal()
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, recognition: RecognitionEngine) -> None:
+        """构建手工入库表单、商城导入入口和动态类别参数区域。"""
+
         super().__init__(database)
+        self.recognition = recognition
         self._creating_new = True
         self._selected_component_id: str | None = None
         self._jlc_draft_active = False
+        self._scan_raw_barcode: str | None = None
         self._components: dict[str, dict[str, Any]] = {}
         self.parameter_fields: dict[str, tuple[str, QLineEdit]] = {}
         self.parameter_groups: dict[str, str] = {}
@@ -842,9 +1046,14 @@ class ReceivePage(BasePage):
         layout = QVBoxLayout(self.scroll_content)
         self.scroll_area.setWidget(self.scroll_content)
         page_layout.addWidget(self.scroll_area)
+        action_row = QHBoxLayout()
         open_orders = QPushButton("订单导入")
         open_orders.clicked.connect(self.open_order_import.emit)
-        layout.addWidget(open_orders)
+        open_scan = QPushButton("扫描 / 图片识别入库")
+        open_scan.clicked.connect(self.open_scan.emit)
+        action_row.addWidget(open_orders)
+        action_row.addWidget(open_scan)
+        layout.addLayout(action_row)
         form = QFormLayout()
         self.name = QComboBox()
         self.name.setEditable(True)
@@ -896,6 +1105,17 @@ class ReceivePage(BasePage):
         storage_layout.addWidget(self.location)
         self.quantity = WheelSafeSpinBox()
         self.quantity.setRange(1, 1_000_000_000)
+        self.batch_code = QLineEdit()
+        self.batch_code.setPlaceholderText("可选：CL 加十位数字")
+        batch_code_row = QWidget()
+        batch_code_layout = QHBoxLayout(batch_code_row)
+        batch_code_layout.setContentsMargins(0, 0, 0, 0)
+        batch_code_layout.addWidget(self.batch_code)
+        scan_batch = QPushButton("摄像头扫码")
+        scan_batch.clicked.connect(self.scan_batch_code)
+        batch_code_layout.addWidget(scan_batch)
+        self.order_number = QLineEdit()
+        self.order_number.setPlaceholderText("扫描立创袋贴后自动填写")
         self.notes = QLineEdit()
         for label, main_widget in (
             ("元件名称", self.name),
@@ -915,16 +1135,15 @@ class ReceivePage(BasePage):
             ("元件备注", self.component_notes),
             ("位置 / 仓库", storage_row),
             ("数量", self.quantity),
+            ("自定义批次二维码", batch_code_row),
+            ("立创订单号", self.order_number),
             ("备注", self.notes),
         ):
             form.addRow(label, detail_widget)
         layout.addLayout(form)
-        search_jlc = QPushButton("从立创商城选择（匿名临时浏览器）")
+        search_jlc = QPushButton("从立创商城选择")
         search_jlc.clicked.connect(self.open_jlc_browser)
         layout.addWidget(search_jlc)
-        paste_jlc = QPushButton("从剪贴板导入已复制的商城资料")
-        paste_jlc.clicked.connect(self.import_jlc_clipboard)
-        layout.addWidget(paste_jlc)
         submit = QPushButton("确认入库")
         submit.clicked.connect(self.submit)
         layout.addWidget(submit)
@@ -972,6 +1191,7 @@ class ReceivePage(BasePage):
         """按输入内容重建同一个下拉框，并立即展开过滤结果。"""
 
         self._jlc_draft_active = False
+        self._scan_raw_barcode = None
         if not self._creating_new:
             self._clear_matched_fields()
         self._creating_new = True
@@ -1088,6 +1308,12 @@ class ReceivePage(BasePage):
         values: dict[str, str] | None = None,
         definitions: list[tuple[str, str, str]] | None = None,
     ) -> None:
+        """根据类别模板和商城字段重建入库参数表单。
+
+        已保存的同类参数定义优先，``definitions`` 中的新字段追加；按稳定键去重后
+        保留当前输入，防止切换类别或合并草稿时丢失用户内容。
+        """
+
         has_category = bool(self.category.currentText().strip() or definitions)
         self.parameter_group.setVisible(has_category)
         preserved = {key: field.text() for key, (_, field) in self.parameter_fields.items()}
@@ -1133,6 +1359,8 @@ class ReceivePage(BasePage):
             self.parameter_groups[key] = group_name
 
     def _parameters(self) -> dict[str, tuple[str, str]]:
+        """返回当前参数键到“显示标签、原始输入值”的映射。"""
+
         return {key: (label, field.text()) for key, (label, field) in self.parameter_fields.items()}
 
     def _parameter_group_models(self) -> list[JlcParameterGroup]:
@@ -1150,6 +1378,8 @@ class ReceivePage(BasePage):
         ]
 
     def _component_form(self) -> ComponentCreate:
+        """把主数据控件转换为经 Pydantic 校验的元件写入模型。"""
+
         return ComponentCreate(
             name=self.name.currentText(),
             lcsc_part_number=self.lcsc.text() or None,
@@ -1165,16 +1395,32 @@ class ReceivePage(BasePage):
         )
 
     def open_jlc_browser(self) -> None:
-        """打开匿名临时浏览器，并把用户确认的商品资料应用到当前草稿。"""
+        """打开立创商城选择器，并把用户确认的商品资料应用到当前草稿。"""
 
         browser = JlcBrowserDialog(self)
         if browser.exec() != QDialog.DialogCode.Accepted or not browser.draft:
             return
         self.apply_jlc_draft(browser.draft)
 
-    def apply_jlc_draft(self, draft: JlcProductDraft) -> None:
-        """精确匹配已有元件，展示逐字段合并预览，但此时不写数据库。"""
+    def scan_batch_code(self) -> None:
+        """打开专用摄像头对话框，并回填符合规则的自定义批次码。"""
 
+        dialog = BatchCodeScanDialog(self.recognition, self)
+        QTimer.singleShot(0, dialog.start_camera)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.code:
+            self.batch_code.setText(dialog.code)
+
+    def apply_jlc_draft(self, draft: JlcProductDraft) -> None:
+        """将立创商品草稿与当前入库表单进行逐字段合并。
+
+        :param draft: 内嵌浏览器解析并经用户选中的商品草稿
+        :return: 无返回值
+
+        首先按立创编号精确查找已有元件，再打开合并对话框；用户取消时不改变表单，
+        用户确认后也只更新草稿控件，不会在此步骤写数据库或增加库存。
+        """
+
+        ### 查找已有元件并建立合并基线 ###
         exact = next(
             (
                 item
@@ -1225,9 +1471,11 @@ class ReceivePage(BasePage):
                 "datasheet_url": self.datasheet_url.text(),
                 "notes": self.component_notes.text(),
             }
+        ### 等待用户逐字段确认 ###
         merge = JlcMergeDialog(draft, current_fields, current_parameters, self)
         if merge.exec() != QDialog.DialogCode.Accepted:
             return
+        ### 将确认结果写回当前入库草稿 ###
         result = merge.result_data()
         if exact:
             self._apply_existing_component(exact)
@@ -1287,6 +1535,8 @@ class ReceivePage(BasePage):
             self.product_url,
             self.datasheet_url,
             self.component_notes,
+            self.batch_code,
+            self.order_number,
             self.notes,
         ):
             field.clear()
@@ -1300,29 +1550,19 @@ class ReceivePage(BasePage):
         self.quantity.setValue(1)
         self._rebuild_category_fields({})
 
-    def import_jlc_clipboard(self) -> None:
-        from PySide6.QtWidgets import QApplication
-
-        fields = parse_copied_product(QApplication.clipboard().text())
-        if not fields:
-            self.show_error("剪贴板中没有找到立创编号、封装或公开链接")
-            return
-        if not self.name.currentText() and fields.get("suggested_name"):
-            value = str(fields["suggested_name"])
-            self._name_edited(value)
-            self.name.setEditText(value)
-        if fields.get("lcsc_part_number"):
-            self.lcsc.setText(str(fields["lcsc_part_number"]))
-        if fields.get("package"):
-            self.package.setText(str(fields["package"]))
-        # 商城展示价格不是用户实际购入价，剪贴板导入也不覆盖购买单价。
-        if fields.get("product_url"):
-            self.product_url.setText(str(fields["product_url"]))
-        if fields.get("datasheet_url"):
-            self.datasheet_url.setText(str(fields["datasheet_url"]))
-        self.show_info("已生成可编辑草稿，请核对后再决定是否保存和入库")
-
     def apply_scan_draft(self, draft: Any) -> None:
+        """把 OCR/条码草稿映射到手工入库控件。
+
+        :param draft: ``RecognitionEngine`` 返回的 ``LabelDraft`` 或兼容对象
+        :return: 无返回值
+
+        注意：原始条码会保存在批次元数据中以便追溯；本方法只填充控件，不创建元件
+        或修改库存，最终数据仍需用户检查并点击确认。
+        """
+
+        ### 保存追溯信息并提取规范值 ###
+
+        self._scan_raw_barcode = draft.raw_barcode
         values = {key: field.normalized_value for key, field in draft.fields.items()}
         name = values.get("description") or values.get("mpn") or ""
         self._name_edited(name)
@@ -1331,11 +1571,21 @@ class ReceivePage(BasePage):
         self.mpn.setText(values.get("manufacturer_part_number") or values.get("mpn") or "")
         self.brand.setText(values.get("brand") or "")
         self.package.setText(values.get("package") or "")
+        self.batch_code.setText(values.get("batch_code") or "")
+        self.order_number.setText(values.get("order_number") or "")
         quantity = values.get("quantity")
         if quantity and quantity.isdigit():
             self.quantity.setValue(int(quantity))
 
     def submit(self) -> None:
+        """保存元件及参数后执行入库事务，并在全部成功后重置表单。
+
+        :return: 无返回值
+
+        已选已有元件时同步保存表单修改；任一步异常都会显示错误且不会伪装为完成。
+        """
+
+        ### 创建或更新元件主数据 ###
         try:
             if self._creating_new:
                 component_id = self.database.create_component(self._component_form())["id"]
@@ -1347,6 +1597,7 @@ class ReceivePage(BasePage):
                     self.database.update_component(component_id, self._component_form())
             if not component_id or not self.location.currentData():
                 raise ValueError("请选择元件和仓库")
+            ### 保存动态参数并执行库存入库 ###
             self.database.save_component_parameter_groups(
                 component_id, self._parameter_group_models()
             )
@@ -1358,9 +1609,15 @@ class ReceivePage(BasePage):
                     source="手工入库",
                     unit_price=self.price.value(),
                     purchase_date=self.purchase_date.text().strip() or None,
+                    batch_code=self.batch_code.text().strip() or None,
+                    order_number=self.order_number.text().strip() or None,
+                    batch_metadata={"raw_barcode": draft_raw}
+                    if (draft_raw := getattr(self, "_scan_raw_barcode", None))
+                    else {},
                     notes=self.notes.text() or None,
                 )
             )
+            ### 全部成功后重置草稿并通知其他页面刷新 ###
             self.show_info("入库完成")
             self._reset_after_receive()
             self.reload()
@@ -1373,6 +1630,8 @@ class StoragePriorityDialog(QDialog):
     """配置全局或单个元件类别的仓库优先级。"""
 
     def __init__(self, database: Database, category: str | None, parent: QWidget) -> None:
+        """列出所有库位及当前显式优先级；``category=None`` 表示全局配置。"""
+
         super().__init__(parent)
         self.database = database
         self.category = category
@@ -1424,6 +1683,8 @@ class OrderImportPage(BasePage):
     back_requested = Signal()
 
     def __init__(self, database: Database) -> None:
+        """构建订单文件选择、异步预览、逐行编辑和提交控件。"""
+
         super().__init__(database)
         self.lines: list[Any] = []
         self.location_boxes: dict[str, QComboBox] = {}
@@ -1665,6 +1926,8 @@ class OrderImportPage(BasePage):
         )
 
         def save() -> None:
+            """把订单单元格的新值交给统一校验函数并重建预览。"""
+
             self._save_inline_order_line(editor, row, column, field)
 
         editor.editingFinished.connect(save)
@@ -1784,12 +2047,87 @@ class IssuePage(BasePage):
 
     open_bom = Signal()
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, recognition: RecognitionEngine | None = None) -> None:
+        """构建手工/FIFO 出库与实时扫码出库两条流程。
+
+        可注入 ``recognition`` 便于共享模型会话和测试；缺省时创建延迟加载实例。
+        """
+
         super().__init__(database)
+        self.recognition = recognition or RecognitionEngine()
+        self.selected_batch: dict[str, Any] | None = None
+        self.camera: QCamera | None = None
+        self.session: QMediaCaptureSession | None = None
+        self.sink: QVideoSink | None = None
+        self.scan_busy = False
+        self.last_scan_at = 0.0
+        self.last_camera_code: str | None = None
+        self.scan_attempts = 0
+        self.scan_received_frames = 0
+        self.scan_worker: Worker | None = None
         layout = QVBoxLayout(self)
         open_bom = QPushButton("BOM 出库")
         open_bom.clicked.connect(self.open_bom.emit)
         layout.addWidget(open_bom)
+        scan_group = QGroupBox("扫码出库")
+        scan_layout = QVBoxLayout(scan_group)
+        self.scan_preview = QLabel("摄像头未启动")
+        self.scan_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scan_preview.setMinimumHeight(180)
+        self.scan_preview.setStyleSheet("background:#17202a;color:#ccd6dd;border-radius:8px")
+        scan_layout.addWidget(self.scan_preview)
+        scan_row = QHBoxLayout()
+        self.scan_text = QLineEdit()
+        self.scan_text.setPlaceholderText("也可粘贴立创二维码原文或 CL 批次码")
+        self.camera_choice = QComboBox()
+        self.camera_choice.setMinimumWidth(150)
+        self._refresh_camera_choices()
+        resolve = QPushButton("解析二维码")
+        resolve.clicked.connect(self.resolve_manual_scan)
+        start = QPushButton("打开摄像头")
+        start.clicked.connect(self.start_camera)
+        stop = QPushButton("关闭摄像头")
+        stop.clicked.connect(self.stop_camera)
+        scan_row.addWidget(self.scan_text)
+        scan_row.addWidget(self.camera_choice)
+        scan_row.addWidget(resolve)
+        scan_row.addWidget(start)
+        scan_row.addWidget(stop)
+        scan_layout.addLayout(scan_row)
+        self.scan_result = QGroupBox("扫码出库确认")
+        result_form = QFormLayout(self.scan_result)
+        self.scan_status = QLabel()
+        self.scan_status.setWordWrap(True)
+        self.scan_code_info = QLabel()
+        self.scan_code_info.setWordWrap(True)
+        self.scan_component_info = QLabel()
+        self.scan_component_info.setWordWrap(True)
+        self.scan_batch_info = QLabel()
+        self.scan_batch_info.setWordWrap(True)
+        self.scan_stock_info = QLabel()
+        self.scan_stock_info.setWordWrap(True)
+        self.scan_location = QComboBox()
+        self.scan_location.currentIndexChanged.connect(self._scan_location_changed)
+        self.scan_quantity = WheelSafeSpinBox()
+        self.scan_quantity.setRange(1, 1)
+        self.scan_quantity.setEnabled(False)
+        self.scan_notes = QLineEdit()
+        self.scan_notes.setPlaceholderText("可选，填写用途或异常说明")
+        self.scan_confirm = QPushButton("确认扫码出库")
+        self.scan_confirm.setEnabled(False)
+        self.scan_confirm.clicked.connect(self.submit_scan)
+        result_form.addRow("识别状态", self.scan_status)
+        result_form.addRow("二维码", self.scan_code_info)
+        result_form.addRow("元件", self.scan_component_info)
+        result_form.addRow("批次", self.scan_batch_info)
+        result_form.addRow("库存分布", self.scan_stock_info)
+        result_form.addRow("出库仓库", self.scan_location)
+        result_form.addRow("出库数量", self.scan_quantity)
+        result_form.addRow("用途 / 异常备注", self.scan_notes)
+        result_form.addRow(self.scan_confirm)
+        self.scan_result.hide()
+        scan_layout.addWidget(self.scan_result)
+        layout.addWidget(scan_group)
         form = QFormLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("输入名称、型号、品牌、封装或立创编号")
@@ -1814,6 +2152,365 @@ class IssuePage(BasePage):
         layout.addLayout(form)
         layout.addStretch()
         self.reload()
+
+    def start_camera(self) -> None:
+        """打开默认摄像头并立即识别，识别成功后自动停止。"""
+
+        self._refresh_camera_choices()
+        devices = QMediaDevices.videoInputs()
+        if not devices:
+            self.scan_result.show()
+            self.scan_code_info.setText("等待识别")
+            self._show_scan_error("没有发现摄像头，请检查权限或粘贴二维码内容")
+            self.show_error("没有发现摄像头，可粘贴二维码内容后解析")
+            return
+        self.stop_camera()
+        # 每次用户主动打开摄像头都是新会话；同一会话内的连续帧只触发一次。
+        self.last_camera_code = None
+        self.scan_busy = False
+        self.last_scan_at = 0.0
+        self.scan_attempts = 0
+        self.scan_received_frames = 0
+        self.scan_worker = None
+        self.scan_preview.setPixmap(QPixmap())
+        self.scan_preview.setText("摄像头已打开，正在自动识别二维码…")
+        self.selected_batch = None
+        self.scan_result.show()
+        self.scan_status.setText("正在自动识别，请将完整二维码放入画面中央并保持清晰")
+        self.scan_status.setStyleSheet("color:#c58b00;font-weight:600")
+        self.scan_code_info.setText("等待识别…")
+        self.scan_component_info.setText("-")
+        self.scan_batch_info.setText("-")
+        self.scan_stock_info.setText("-")
+        self.scan_location.clear()
+        self.scan_quantity.setEnabled(False)
+        self.scan_confirm.setEnabled(False)
+        device_index = max(0, min(self.camera_choice.currentIndex(), len(devices) - 1))
+        device = devices[device_index]
+        self.camera = QCamera(device)
+        formats = list(device.videoFormats())
+        if formats:
+            suitable = [
+                item
+                for item in formats
+                if item.resolution().width() * item.resolution().height() <= 1920 * 1080
+            ]
+            candidates = suitable or formats
+            best = max(
+                candidates,
+                key=lambda item: (
+                    item.resolution().width() * item.resolution().height(),
+                    item.maxFrameRate(),
+                ),
+            )
+            self.camera.setCameraFormat(best)
+        if self.camera.isFocusModeSupported(QCamera.FocusMode.FocusModeAutoNear):
+            self.camera.setFocusMode(QCamera.FocusMode.FocusModeAutoNear)
+        elif self.camera.isFocusModeSupported(QCamera.FocusMode.FocusModeAuto):
+            self.camera.setFocusMode(QCamera.FocusMode.FocusModeAuto)
+        self.camera.errorOccurred.connect(self._camera_failed)
+        self.session = QMediaCaptureSession()
+        self.sink = QVideoSink()
+        self.session.setCamera(self.camera)
+        self.session.setVideoSink(self.sink)
+        self.sink.videoFrameChanged.connect(self._scan_frame)
+        self.camera.start()
+
+    def _refresh_camera_choices(self) -> None:
+        """刷新摄像头选择，避免多摄像头设备时固定打开错误镜头。"""
+
+        selected = self.camera_choice.currentText() if self.camera_choice.count() else ""
+        self.camera_choice.clear()
+        devices = QMediaDevices.videoInputs()
+        for device in devices:
+            self.camera_choice.addItem(device.description())
+        if not devices:
+            self.camera_choice.addItem("未检测到摄像头")
+            self.camera_choice.setEnabled(False)
+            return
+        self.camera_choice.setEnabled(True)
+        previous = self.camera_choice.findText(selected)
+        if previous >= 0:
+            self.camera_choice.setCurrentIndex(previous)
+
+    def _camera_failed(self, _error: Any, message: str) -> None:
+        """在页面中显示摄像头驱动或权限错误。"""
+
+        self.selected_batch = None
+        self.scan_result.show()
+        self.scan_code_info.setText("未获取")
+        self._show_scan_error(f"摄像头异常：{message or '无法读取视频帧'}")
+
+    def stop_camera(self) -> None:
+        """停止摄像头并释放会话与帧接收器引用；重复调用是安全的。"""
+
+        if self.camera:
+            self.camera.stop()
+        self.camera = None
+        self.session = None
+        self.sink = None
+
+    def _scan_frame(self, frame: QVideoFrame) -> None:
+        """显示实时帧，在主线程固化图像后交给后台解码。"""
+
+        image = frame.toImage()
+        if image.isNull():
+            return
+        self.scan_received_frames += 1
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.scan_preview.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.scan_preview.setPixmap(pixmap)
+        now = time.monotonic()
+        if self.scan_busy:
+            if self.scan_received_frames % 10 == 0:
+                self.scan_status.setText(
+                    f"摄像头已接收 {self.scan_received_frames} 帧，"
+                    f"正在处理第 {self.scan_attempts} 次识别"
+                )
+            return
+        if now - self.last_scan_at < 0.35:
+            return
+        self.last_scan_at = now
+        # QVideoFrame.toImage() 返回的 QImage 可能仍引用视频缓冲区，且 Qt 图像
+        # 编码器不应在工作线程中读取该对象。先在主线程生成独立 PNG
+        # 字节，避免帧回调返回后底层缓冲区失效导致始终识别不到。
+        try:
+            image_bytes = ScanPage._image_bytes(image.copy())
+        except Exception as error:
+            self._barcode_decode_failed(str(error))
+            return
+        self.scan_attempts += 1
+        self.scan_status.setText(
+            f"正在自动识别（已检查 {self.scan_attempts} 帧），"
+            "请将完整二维码放入画面中央"
+        )
+        self.scan_status.setStyleSheet("color:#c58b00;font-weight:600")
+        self.scan_busy = True
+        self.scan_worker = Worker(lambda: self.recognition.decode_barcode(image_bytes))
+        self.scan_worker.signals.succeeded.connect(self._barcode_decoded)
+        self.scan_worker.signals.failed.connect(self._barcode_decode_failed)
+        self.scan_worker.signals.finished.connect(self._scan_decode_finished)
+        self.pool.start(self.scan_worker)
+
+    def _scan_decode_finished(self) -> None:
+        """释放实时解码忙碌状态，使后续摄像头帧能继续进入识别。"""
+
+        self.scan_busy = False
+        self.scan_worker = None
+
+    def _barcode_decode_failed(self, message: str) -> None:
+        """展示解码依赖或图像处理异常，避免静默失败。"""
+
+        self.scan_result.show()
+        self.scan_status.setText(f"二维码解码异常：{message}")
+        self.scan_status.setStyleSheet("color:#b42318;font-weight:600")
+
+    def _barcode_decoded(self, raw_barcode: str | None) -> None:
+        """去重有效条码、解析批次并在首次识别后关闭摄像头。"""
+
+        normalized = raw_barcode.strip() if raw_barcode else ""
+        if not normalized:
+            self.scan_status.setText(
+                f"摄像头工作正常，已接收 {self.scan_received_frames} 帧，"
+                f"已检查 {self.scan_attempts} 帧，"
+                "尚未检测到二维码"
+            )
+            self.scan_status.setStyleSheet("color:#c58b00;font-weight:600")
+            return
+        if normalized == self.last_camera_code:
+            return
+        # 先记录再解析，避免无效码在每一帧中反复触发异常。
+        self.last_camera_code = normalized
+        self.scan_text.setText(normalized)
+        self.resolve_scan(normalized)
+        # 解码成功即停止摄像头；批次未入库属于库存匹配问题，
+        # 不应继续对同一二维码反复解码。
+        self.stop_camera()
+
+    def resolve_manual_scan(self) -> None:
+        """解析粘贴的二维码文本，空输入不发起无效查询。"""
+
+        raw_text = self.scan_text.text().strip()
+        if not raw_text:
+            self.scan_result.show()
+            self.scan_status.setText("请先粘贴二维码原文，或打开摄像头自动识别")
+            self.scan_status.setStyleSheet("color:#c58b00;font-weight:600")
+            self.scan_code_info.setText("未输入二维码内容")
+            self.scan_component_info.setText("-")
+            self.scan_batch_info.setText("-")
+            self.scan_stock_info.setText("-")
+            self.scan_location.clear()
+            self.scan_quantity.setEnabled(False)
+            self.scan_confirm.setEnabled(False)
+            return
+        self.resolve_scan(raw_text)
+
+    def resolve_scan(self, raw_text: str) -> bool:
+        """解析二维码并在扫码确认区展示对应库存批次。
+
+        :param raw_text: 摄像头或外部扫码器提供的二维码原文/内部批次码
+        :return: 找到可出库批次时返回 ``True``，否则返回 ``False``
+
+        注意：这里只解析和查询，不扣减库存；所有失败信息都会显示在确认区，用户仍需
+        选择库位、数量并点击确认出库。
+        """
+
+        ### 解析二维码中的可读字段 ###
+        raw_text = raw_text.strip()
+        self.scan_result.show()
+        parsed_fields = parse_qr_payload(raw_text)
+        details = []
+        for key, label in (
+            ("order_number", "订单号"),
+            ("lcsc_part_number", "立创编号"),
+            ("manufacturer_part_number", "型号"),
+            ("quantity", "标签数量"),
+        ):
+            if field := parsed_fields.get(key):
+                details.append(f"{label}：{field.normalized_value}")
+        self.scan_code_info.setText(
+            "\n".join([raw_text or "（空）", *details])
+        )
+        try:
+            batch = self.database.resolve_batch_code(raw_text)
+            self.selected_batch = batch
+            self._show_scan_batch(batch)
+            return True
+        except DomainError as error:
+            self.selected_batch = None
+            recognized = bool(parsed_fields) or bool(CUSTOM_BATCH_PATTERN.fullmatch(raw_text))
+            if recognized and error.code in {"NOT_FOUND", "CONFLICT", "INSUFFICIENT_STOCK"}:
+                self._show_scan_inventory_error(parsed_fields, str(error))
+            else:
+                self._show_scan_error(str(error))
+            return False
+        except Exception as error:
+            self.selected_batch = None
+            self._show_scan_error(str(error))
+            return False
+
+    def _show_scan_inventory_error(
+        self, parsed_fields: dict[str, Any], message: str
+    ) -> None:
+        """区分“二维码已识别”和“库存批次不可出库”。"""
+
+        self.scan_status.setText(f"二维码识别成功，但无法出库：{message}")
+        self.scan_status.setStyleSheet("color:#c58b00;font-weight:600")
+        part = parsed_fields.get("lcsc_part_number")
+        model = parsed_fields.get("manufacturer_part_number")
+        self.scan_component_info.setText(
+            "；".join(
+                value
+                for value in (
+                    f"立创编号：{part.normalized_value}" if part else "",
+                    f"型号：{model.normalized_value}" if model else "",
+                )
+                if value
+            )
+            or "自定义批次码已识别"
+        )
+        order = parsed_fields.get("order_number")
+        quantity = parsed_fields.get("quantity")
+        self.scan_batch_info.setText(
+            "；".join(
+                value
+                for value in (
+                    f"订单号：{order.normalized_value}" if order else "",
+                    f"标签数量：{quantity.normalized_value}" if quantity else "",
+                )
+                if value
+            )
+            or "未找到批次资料"
+        )
+        self.scan_stock_info.setText("未关联到可出库库存，请先完成该批次入库")
+        self.scan_location.clear()
+        self.scan_quantity.setRange(1, 1)
+        self.scan_quantity.setValue(1)
+        self.scan_quantity.setEnabled(False)
+        self.scan_confirm.setEnabled(False)
+
+    def _show_scan_batch(self, batch: dict[str, Any], message: str | None = None) -> None:
+        """在扫码区持续展示批次详情和可扣减的仓库余量。"""
+
+        remaining = int(batch["remaining_quantity"])
+        self.scan_status.setText(message or "识别成功，请选择仓库和出库数量后确认")
+        self.scan_status.setStyleSheet("color:#18794e;font-weight:600")
+        self.scan_component_info.setText(
+            f"{batch['component_name']}（ID：{batch['component_id']}）"
+        )
+        source_names = {"jlc": "立创", "custom": "自定义"}
+        source = source_names.get(str(batch.get("source_type")), str(batch.get("source_type") or "未知"))
+        label = batch.get("custom_code") or (
+            f"订单 {batch.get('order_number') or '-'} / 立创编号 "
+            f"{batch.get('lcsc_part_number') or '-'}"
+        )
+        self.scan_batch_info.setText(
+            f"{label}；来源：{source}；原始数量：{int(batch['initial_quantity'])}；"
+            f"剩余数量：{remaining}"
+        )
+        active_locations = [
+            item for item in batch["locations"] if int(item["remaining_quantity"]) > 0
+        ]
+        self.scan_stock_info.setText(
+            "；".join(
+                f"{item['warehouse_name']} / {item['location_name']}："
+                f"{int(item['remaining_quantity'])}"
+                for item in active_locations
+            )
+            or "无可用库存"
+        )
+        self.scan_location.blockSignals(True)
+        self.scan_location.clear()
+        self.scan_location.addItem(f"全部仓库（批次总余量 {remaining}）", None)
+        for item in active_locations:
+            self.scan_location.addItem(
+                f"{item['warehouse_name']} / {item['location_name']}"
+                f"（{int(item['remaining_quantity'])}）",
+                item["location_id"],
+            )
+        self.scan_location.blockSignals(False)
+        self.scan_quantity.setEnabled(remaining > 0)
+        self.scan_quantity.setRange(1, max(1, remaining))
+        self.scan_quantity.setValue(max(1, remaining))
+        self.scan_confirm.setEnabled(remaining > 0)
+
+    def _show_scan_error(self, message: str) -> None:
+        """将识别或库存异常保留在扫码区，便于用户处理。"""
+
+        self.scan_status.setText(f"识别异常：{message}")
+        self.scan_status.setStyleSheet("color:#b42318;font-weight:600")
+        self.scan_component_info.setText("-")
+        self.scan_batch_info.setText("-")
+        self.scan_stock_info.setText("-")
+        self.scan_location.clear()
+        self.scan_quantity.setRange(1, 1)
+        self.scan_quantity.setValue(1)
+        self.scan_quantity.setEnabled(False)
+        self.scan_confirm.setEnabled(False)
+
+    def _scan_location_changed(self) -> None:
+        """切换仓库时按该仓库的批次余量限制数量。"""
+
+        if not self.selected_batch:
+            return
+        location_id = self.scan_location.currentData()
+        available = int(self.selected_batch["remaining_quantity"])
+        if location_id is not None:
+            available = next(
+                (
+                    int(item["remaining_quantity"])
+                    for item in self.selected_batch["locations"]
+                    if item["location_id"] == location_id
+                ),
+                0,
+            )
+        self.scan_quantity.setRange(1, max(1, available))
+        self.scan_quantity.setValue(max(1, available))
+        self.scan_quantity.setEnabled(available > 0)
+        self.scan_confirm.setEnabled(available > 0)
 
     def reload(self) -> None:
         """刷新选择数据。"""
@@ -1861,7 +2558,7 @@ class IssuePage(BasePage):
             )
 
     def submit(self) -> None:
-        """提交出库并显示库存不足等业务错误。"""
+        """提交手工出库并显示库存不足等业务错误。"""
 
         try:
             self.database.issue(
@@ -1869,6 +2566,7 @@ class IssuePage(BasePage):
                     component_id=str(self.component.currentData()),
                     quantity=self.quantity.value(),
                     location_id=self.location.currentData(),
+                    batch_id=None,
                     source="手工出库",
                     notes=self.notes.text() or None,
                 )
@@ -1878,11 +2576,53 @@ class IssuePage(BasePage):
         except Exception as error:
             self.show_error(str(error))
 
+    def submit_scan(self) -> None:
+        """经用户确认后只扣减当前扫描到的批次。"""
+
+        if not self.selected_batch:
+            self._show_scan_error("请先扫描并识别有效的批次二维码")
+            return
+        batch_id = str(self.selected_batch["id"])
+        quantity = self.scan_quantity.value()
+        try:
+            self.database.issue(
+                IssueRequest(
+                    component_id=str(self.selected_batch["component_id"]),
+                    quantity=quantity,
+                    location_id=self.scan_location.currentData(),
+                    batch_id=batch_id,
+                    source="扫码出库",
+                    notes=self.scan_notes.text() or None,
+                )
+            )
+            updated = self.database.get_batch(batch_id)
+            self.scan_notes.clear()
+            if int(updated["remaining_quantity"]) > 0:
+                self.selected_batch = updated
+                self._show_scan_batch(
+                    updated,
+                    f"出库完成：本次 {quantity}，批次剩余 {int(updated['remaining_quantity'])}",
+                )
+            else:
+                self.selected_batch = None
+                self.scan_status.setText(f"出库完成：本次 {quantity}，该批次已全部出库")
+                self.scan_status.setStyleSheet("color:#18794e;font-weight:600")
+                self.scan_stock_info.setText("无可用库存")
+                self.scan_location.clear()
+                self.scan_quantity.setEnabled(False)
+                self.scan_confirm.setEnabled(False)
+            self.changed.emit()
+        except Exception as error:
+            self.scan_status.setText(f"出库失败：{error}")
+            self.scan_status.setStyleSheet("color:#b42318;font-weight:600")
+
 
 class LocationsPage(BasePage):
     """维护上级位置和其中的具体仓库，并集中配置推荐优先级。"""
 
     def __init__(self, database: Database) -> None:
+        """构建位置、仓库新增区和可原位编辑的层级列表。"""
+
         super().__init__(database)
         layout = QVBoxLayout(self)
         warehouse_row = QHBoxLayout()
@@ -2022,6 +2762,8 @@ class LocationsPage(BasePage):
         )
 
         def save() -> None:
+            """把位置/仓库单元格的新值交给统一保存流程。"""
+
             self._save_inline_storage(editor, row, column)
 
         editor.editingFinished.connect(save)
@@ -2168,16 +2910,76 @@ class LocationsPage(BasePage):
         StoragePriorityDialog(self.database, category, self).exec()
 
 
+class BomFieldMappingDialog(QDialog):
+    """当立创 EDA 自定义了导出标题时，让用户明确映射原始列。"""
+
+    FIELDS = (
+        ("quantity", "数量"),
+        ("name", "名称 / Comment"),
+        ("specification", "规格 / Value"),
+        ("designators", "位号 / Designator"),
+        ("footprint", "封装 / Footprint"),
+        ("lcsc_part_number", "立创编号 / Supplier Part"),
+        ("manufacturer_part_number", "制造商料号"),
+        ("custom_part_number", "自定义编号"),
+        ("manufacturer", "制造商 / 品牌"),
+    )
+
+    def __init__(self, headers: list[str], parent: QWidget) -> None:
+        """为每个目标字段创建原始表头选择器，并预选可识别别名。"""
+
+        super().__init__(parent)
+        self.setWindowTitle("确认 BOM 字段映射")
+        self.selectors: dict[str, QComboBox] = {}
+        form = QFormLayout(self)
+        for field, label in self.FIELDS:
+            selector = QComboBox()
+            selector.addItem("不映射", None)
+            for header in headers:
+                selector.addItem(header, header)
+            detected = next(
+                (
+                    header
+                    for header in headers
+                    if ALIASES.get(header.strip().casefold()) == field
+                ),
+                None,
+            )
+            if detected:
+                selector.setCurrentIndex(selector.findData(detected))
+            self.selectors[field] = selector
+            form.addRow(label, selector)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def mapping(self) -> dict[str, str]:
+        """返回“原始表头到内部字段名”的非空映射。"""
+
+        return {
+            str(selector.currentData()): field
+            for field, selector in self.selectors.items()
+            if selector.currentData()
+        }
+
+
 class BomPage(BasePage):
     """BOM 文件解析、候选预览与原子出库页面。"""
 
     back_requested = Signal()
 
     def __init__(self, database: Database) -> None:
+        """构建 BOM 选择、匹配候选、缺料预览和原子提交区域。"""
+
         super().__init__(database)
         self.rows: list[Any] = []
         self.preview: list[dict[str, Any]] = []
         self.source: Path | None = None
+        self.sheet_name: str | None = None
+        self._mapping_attempted = False
         layout = QVBoxLayout(self)
         back = QPushButton("返回出库")
         back.clicked.connect(self.back_requested.emit)
@@ -2185,7 +2987,9 @@ class BomPage(BasePage):
         choose = QPushButton("选择 CSV / XLSX")
         choose.clicked.connect(self.choose)
         layout.addWidget(choose)
-        self.table = make_table(["行", "物料", "需求", "匹配", "可用", "缺料"])
+        self.table = make_table(
+            ["行", "物料", "需求", "匹配候选", "置信度 / 原因", "可用", "缺料", "记住匹配"]
+        )
         layout.addWidget(self.table)
         self.commit = QPushButton("确认 BOM 出库")
         self.commit.setEnabled(False)
@@ -2200,7 +3004,21 @@ class BomPage(BasePage):
             return
         source = Path(filename)
         self.source = source
-        worker = Worker(lambda: (parse_bom(source),))
+        self._mapping_attempted = False
+        sheet_name: str | None = None
+        if source.suffix.casefold() == ".xlsx":
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(source, read_only=True, data_only=True)
+            if len(workbook.sheetnames) > 1:
+                selected, accepted = QInputDialog.getItem(
+                    self, "选择工作表", "工作表", workbook.sheetnames, 0, False
+                )
+                if not accepted:
+                    return
+                sheet_name = selected
+        self.sheet_name = sheet_name
+        worker = Worker(lambda: (parse_bom(source, sheet_name),))
         worker.signals.succeeded.connect(self._parsed)
         worker.signals.failed.connect(self.show_error)
         self.pool.start(worker)
@@ -2209,9 +3027,28 @@ class BomPage(BasePage):
         """显示解析和匹配结果。"""
 
         self.rows = result[0]
+        if (
+            self.rows
+            and not self._mapping_attempted
+            and all(row.errors for row in self.rows)
+            and self.source is not None
+        ):
+            dialog = BomFieldMappingDialog(list(self.rows[0].raw_fields), self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._mapping_attempted = True
+                source = self.source
+                mapping = dialog.mapping()
+                worker = Worker(
+                    lambda: (
+                        parse_bom(source, self.sheet_name, mapping),
+                    )
+                )
+                worker.signals.succeeded.connect(self._parsed)
+                worker.signals.failed.connect(self.show_error)
+                self.pool.start(worker)
+                return
         self.preview = preview_bom(self.database, self.rows)
         display = []
-        ready = bool(self.preview)
         for item in self.preview:
             source = item["input"]
             name = (
@@ -2219,24 +3056,85 @@ class BomPage(BasePage):
                 or source.get("lcsc_part_number")
                 or source.get("manufacturer_part_number")
             )
-            candidates = item["candidates"]
-            matched = (
-                candidates[0]["component"]["name"]
-                if len(candidates) == 1
-                else f"{len(candidates)} 个候选"
-            )
             display.append(
                 [
                     source["row_number"],
                     name,
                     item["required_quantity"],
-                    matched,
+                    "",
+                    f"{item['confidence']} · {item['reason']}",
                     int(item["available_quantity"]),
                     int(item["shortage"]),
+                    "",
                 ]
             )
-            ready = ready and bool(item["selected_component_id"]) and item["shortage"] <= 0
         fill_table(self.table, display)
+        all_components = self.database.list_components()
+        for row_index, item in enumerate(self.preview):
+            selector = QComboBox()
+            selector.setEditable(True)
+            selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            selector.addItem("请选择元件", None)
+            candidate_ids = {
+                str(candidate["component"]["id"]) for candidate in item["candidates"]
+            }
+            ordered = [candidate["component"] for candidate in item["candidates"]]
+            ordered.extend(
+                component for component in all_components if str(component["id"]) not in candidate_ids
+            )
+            for component in ordered:
+                selector.addItem(
+                    f"{component['name']} · {component.get('package') or '无封装'}",
+                    str(component["id"]),
+                )
+            selected_index = selector.findData(item["selected_component_id"])
+            selector.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+            selector.currentIndexChanged.connect(
+                lambda _index, row=row_index, widget=selector: self._candidate_changed(
+                    row, widget.currentData()
+                )
+            )
+            self.table.setCellWidget(row_index, 3, selector)
+            remember = QCheckBox()
+            remember.setChecked(item["match_status"] != "auto")
+            remember.setEnabled(not bool(item["input"].get("errors")))
+            self.table.setCellWidget(row_index, 7, remember)
+        self._refresh_bom_ready()
+
+    def _candidate_changed(self, row: int, component_id: str | None) -> None:
+        """接受人工候选选择并按所有行的累计需求重新计算缺料。"""
+
+        item = self.preview[row]
+        item["selected_component_id"] = component_id
+        item["match_status"] = "manual" if component_id else "unmatched"
+        item["reason"] = "人工选择" if component_id else "尚未选择"
+        if reason_cell := self.table.item(row, 4):
+            reason_cell.setText(item["reason"])
+        self._refresh_bom_ready()
+
+    def _refresh_bom_ready(self) -> None:
+        """按同一元件的累计需求重算缺料，并仅在所有行可提交时启用按钮。"""
+
+        totals: dict[str, int] = {}
+        for stock in self.database.list_stock():
+            component_id = str(stock["component_id"])
+            totals[component_id] = totals.get(component_id, 0) + int(stock["quantity"])
+        demand: dict[str, int] = {}
+        for item in self.preview:
+            if selected := item.get("selected_component_id"):
+                demand[selected] = demand.get(selected, 0) + int(item["required_quantity"])
+        ready = bool(self.preview)
+        for row, item in enumerate(self.preview):
+            selected = item.get("selected_component_id")
+            available = totals.get(selected, 0) if selected else 0
+            shortage = max(0, demand.get(selected, 0) - available) if selected else item["required_quantity"]
+            item["available_quantity"] = available
+            item["shortage"] = shortage
+            if available_cell := self.table.item(row, 5):
+                available_cell.setText(str(available))
+            if shortage_cell := self.table.item(row, 6):
+                shortage_cell.setText(str(shortage))
+            ready = ready and bool(selected) and not item["input"].get("errors") and shortage <= 0
         self.commit.setEnabled(ready)
 
     def commit_bom(self) -> None:
@@ -2253,8 +3151,18 @@ class BomPage(BasePage):
                         row_number=item["input"]["row_number"],
                         component_id=item["selected_component_id"],
                         quantity=item["required_quantity"],
+                        raw_input=item["input"],
+                        mapping_key=item["mapping_key"],
+                        match_reason=item["reason"],
+                        remember_mapping=bool(
+                            checkbox.isChecked()
+                            if isinstance(
+                                (checkbox := self.table.cellWidget(row, 7)), QCheckBox
+                            )
+                            else False
+                        ),
                     )
-                    for item in self.preview
+                    for row, item in enumerate(self.preview)
                 ],
             )
             self.database.commit_bom(request)
@@ -2269,8 +3177,11 @@ class ScanPage(BasePage):
     """摄像头/图片文字识别与字段确认页面。"""
 
     use_for_receive = Signal(object)
+    back_requested = Signal()
 
     def __init__(self, database: Database, recognition: RecognitionEngine) -> None:
+        """构建摄像头/图片识别界面，并复用应用级离线识别器。"""
+
         super().__init__(database)
         self.recognition = recognition
         self.camera: QCamera | None = None
@@ -2279,7 +3190,11 @@ class ScanPage(BasePage):
         self.last_frame_at = 0.0
         self.busy = False
         self.last_draft: Any | None = None
+        self.recognition_worker: Worker | None = None
         layout = QVBoxLayout(self)
+        back = QPushButton("返回入库")
+        back.clicked.connect(self.back_requested.emit)
+        layout.addWidget(back)
         self.status = QLabel("● 等待图像")
         self.status.setStyleSheet("color:#657786;font-weight:600")
         layout.addWidget(self.status)
@@ -2296,12 +3211,16 @@ class ScanPage(BasePage):
         )
         layout.addWidget(self.recognition_preview)
         controls = QHBoxLayout()
+        self.camera_choice = QComboBox()
+        self.camera_choice.setMinimumWidth(150)
+        self._refresh_camera_choices()
         start = QPushButton("打开摄像头")
         start.clicked.connect(self.start_camera)
         stop = QPushButton("关闭摄像头")
         stop.clicked.connect(self.stop_camera)
         load = QPushButton("导入照片")
         load.clicked.connect(self.choose_image)
+        controls.addWidget(self.camera_choice)
         controls.addWidget(start)
         controls.addWidget(stop)
         controls.addWidget(load)
@@ -2316,18 +3235,66 @@ class ScanPage(BasePage):
     def start_camera(self) -> None:
         """打开默认摄像头并在 Python 中接收视频帧。"""
 
+        self._refresh_camera_choices()
         devices = QMediaDevices.videoInputs()
         if not devices:
             self.show_error("没有发现摄像头，请使用图片导入")
             return
         self.stop_camera()
-        self.camera = QCamera(devices[0])
+        device_index = max(0, min(self.camera_choice.currentIndex(), len(devices) - 1))
+        device = devices[device_index]
+        self.camera = QCamera(device)
+        formats = list(device.videoFormats())
+        if formats:
+            suitable = [
+                item
+                for item in formats
+                if item.resolution().width() * item.resolution().height() <= 1280 * 720
+                and item.maxFrameRate() >= 15
+            ]
+            if suitable:
+                best = max(
+                    suitable,
+                    key=lambda item: (
+                        item.resolution().width() * item.resolution().height(),
+                        item.maxFrameRate(),
+                    ),
+                )
+                self.camera.setCameraFormat(best)
+        if self.camera.isFocusModeSupported(QCamera.FocusMode.FocusModeAutoNear):
+            self.camera.setFocusMode(QCamera.FocusMode.FocusModeAutoNear)
+        elif self.camera.isFocusModeSupported(QCamera.FocusMode.FocusModeAuto):
+            self.camera.setFocusMode(QCamera.FocusMode.FocusModeAuto)
+        self.camera.errorOccurred.connect(self._camera_failed)
         self.session = QMediaCaptureSession()
         self.sink = QVideoSink()
         self.session.setCamera(self.camera)
         self.session.setVideoSink(self.sink)
         self.sink.videoFrameChanged.connect(self._frame)
         self.camera.start()
+
+    def _refresh_camera_choices(self) -> None:
+        """刷新入库识别摄像头列表。"""
+
+        selected = self.camera_choice.currentText() if self.camera_choice.count() else ""
+        self.camera_choice.clear()
+        devices = QMediaDevices.videoInputs()
+        for device in devices:
+            self.camera_choice.addItem(device.description())
+        if not devices:
+            self.camera_choice.addItem("未检测到摄像头")
+            self.camera_choice.setEnabled(False)
+            return
+        self.camera_choice.setEnabled(True)
+        previous = self.camera_choice.findText(selected)
+        if previous >= 0:
+            self.camera_choice.setCurrentIndex(previous)
+
+    def _camera_failed(self, _error: Any, message: str) -> None:
+        """展示入库识别摄像头异常。"""
+
+        self.status.setText(f"● 摄像头异常：{message or '无法读取视频帧'}")
+        self.status.setStyleSheet("color:#b42318;font-weight:700")
 
     def stop_camera(self) -> None:
         """停止并释放摄像头。"""
@@ -2368,17 +3335,18 @@ class ScanPage(BasePage):
         now = time.monotonic()
         if not self.busy and now - self.last_frame_at >= 1.0:
             self.last_frame_at = now
-            self._analyze(self._image_bytes(image))
+            try:
+                image_bytes = self._image_bytes(image.copy())
+            except Exception as error:
+                self._recognition_failed(str(error))
+                return
+            self._analyze(image_bytes)
 
     @staticmethod
     def _image_bytes(image: QImage) -> bytes:
         """把 Qt 图像编码为内存 PNG，不创建临时文件。"""
 
-        data = QByteArray()
-        buffer = QBuffer(data)
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        image.save(buffer, b"PNG")
-        return bytes(data.data())
+        return qimage_to_png(image)
 
     def choose_image(self) -> None:
         """导入照片并启动后台识别。"""
@@ -2390,23 +3358,46 @@ class ScanPage(BasePage):
             self._analyze(Path(filename).read_bytes())
 
     def _analyze(self, image: bytes) -> None:
-        """在线程池中运行 OCR，保证摄像头预览不被模型阻塞。"""
+        """在线程池中启动一次 OCR 识别。
 
+        :param image: 已编码为 PNG/JPEG 的图像字节
+        :return: 无返回值；结果通过 Worker 信号传给 ``_show_draft``
+
+        注意：识别期间设置 ``busy``，摄像头帧处理会据此跳过重复任务，避免模型推理
+        堆积并阻塞界面。
+        """
+
+        ### 更新忙碌状态和视觉提示 ###
         self.busy = True
         self.status.setText("● 正在识别印刷文字……")
         self.status.setStyleSheet("color:#c58b00;font-weight:700")
         self.recognition_preview.setStyleSheet(
             "background:#fffdf5;color:#657786;border:3px solid #e0a800;border-radius:8px"
         )
-        worker = Worker(lambda: self.recognition.analyze(image))
-        worker.signals.succeeded.connect(self._show_draft)
-        worker.signals.failed.connect(self._recognition_failed)
-        worker.signals.finished.connect(lambda: setattr(self, "busy", False))
-        self.pool.start(worker)
+        ### 在线程池执行识别并回到主线程更新界面 ###
+        self.recognition_worker = Worker(lambda: self.recognition.analyze(image))
+        self.recognition_worker.signals.succeeded.connect(self._show_draft)
+        self.recognition_worker.signals.failed.connect(self._recognition_failed)
+        self.recognition_worker.signals.finished.connect(self._recognition_finished)
+        self.pool.start(self.recognition_worker)
+
+    def _recognition_finished(self) -> None:
+        """释放入库 OCR 忙碌状态，允许后续摄像头帧继续识别。"""
+
+        self.busy = False
+        self.recognition_worker = None
 
     def _show_draft(self, draft: Any) -> None:
-        """显示结构化字段、置信度和所有警告。"""
+        """显示识别草稿中的标注图、字段、置信度和警告。
 
+        :param draft: 后台识别成功后返回的 ``LabelDraft``
+        :return: 无返回值
+
+        本方法由 Qt 信号在主线程调用，可以安全更新 QWidget；结果只作为草稿展示，
+        不会自动写入数据库。
+        """
+
+        ### 显示带文字框的识别图 ###
         self.last_draft = draft
         if draft.annotated_image_png:
             pixmap = QPixmap()
@@ -2428,6 +3419,7 @@ class ScanPage(BasePage):
         self.recognition_preview.setStyleSheet(
             f"background:#ffffff;border:3px solid {color};border-radius:8px"
         )
+        ### 输出结构化字段和人工核对警告 ###
         lines = [f"模型：{draft.model_version}", f"预处理：{draft.preprocessing}", ""]
         for name, field in draft.fields.items():
             lines.append(
@@ -2461,6 +3453,8 @@ class TransactionsPage(BasePage):
     """库存流水查看页面。"""
 
     def __init__(self, database: Database) -> None:
+        """构建只读库存流水表并立即加载当前记录。"""
+
         super().__init__(database)
         layout = QVBoxLayout(self)
         button = QPushButton("刷新")
@@ -2489,56 +3483,57 @@ class TransactionsPage(BasePage):
         )
 
 
-class CorrectionsPage(BasePage):
-    """本机 OCR 纠错样本的可见性页面。"""
-
-    def __init__(self, database: Database) -> None:
-        super().__init__(database)
-        layout = QVBoxLayout(self)
-        self.table = make_table(["时间", "字段", "原值", "修正值", "模型", "置信度"])
-        layout.addWidget(self.table)
-        refresh = QPushButton("刷新")
-        refresh.clicked.connect(self.reload)
-        layout.addWidget(refresh)
-        self.reload()
-
-    def reload(self) -> None:
-        """读取纠错记录；原始照片不会在这里展示。"""
-
-        fill_table(
-            self.table,
-            [
-                [
-                    item["created_at"],
-                    item["field_name"],
-                    item["original_text"],
-                    item["corrected_text"],
-                    item["model_version"],
-                    item["confidence"],
-                ]
-                for item in self.database.list_corrections()
-            ],
-        )
-
-
 class SettingsPage(BasePage):
-    """数据库备份、恢复和本机 API 信息页面。"""
+    """集中管理连接信息、备份恢复与关于信息。"""
 
     def __init__(self, database: Database, token: str) -> None:
+        """构建设置选项卡。"""
+
         super().__init__(database)
-        layout = QFormLayout(self)
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        connection_tab = QWidget()
+        connection_form = QFormLayout(connection_tab)
         api = QLineEdit("http://127.0.0.1:17635")
         api.setReadOnly(True)
         token_field = QLineEdit(token)
         token_field.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("本机 API", api)
-        layout.addRow("Bearer Token", token_field)
+        connection_form.addRow("本机 API", api)
+        connection_form.addRow("Bearer Token", token_field)
+        self.tabs.addTab(connection_tab, "连接信息")
+
+        backup_tab = QWidget()
+        backup_layout = QVBoxLayout(backup_tab)
+        backup_tip = QLabel(
+            "备份使用 SQLite 在线快照；恢复文件会先校验，并在下次启动时生效。"
+        )
+        backup_tip.setWordWrap(True)
+        backup_layout.addWidget(backup_tip)
         backup = QPushButton("创建备份")
         backup.clicked.connect(self.backup)
         restore = QPushButton("选择备份并在重启后恢复")
         restore.clicked.connect(self.restore)
-        layout.addRow(backup)
-        layout.addRow(restore)
+        backup_layout.addWidget(backup)
+        backup_layout.addWidget(restore)
+        backup_layout.addStretch()
+        self.tabs.addTab(backup_tab, "备份与恢复")
+
+        about_tab = QWidget()
+        about_form = QFormLayout(about_tab)
+        try:
+            app_version = version("component-library")
+        except PackageNotFoundError:
+            app_version = "0.8.8"
+        about_form.addRow("应用", QLabel("元件库"))
+        about_form.addRow("版本", QLabel(app_version))
+        about_form.addRow("作者", QLabel("Ternura_xiang"))
+        about_form.addRow("许可证", QLabel("MIT"))
+        description = QLabel("本地优先的电子元件库存、批次、BOM 与扫码管理工具。")
+        description.setWordWrap(True)
+        about_form.addRow("简介", description)
+        self.tabs.addTab(about_tab, "关于")
 
     def backup(self) -> None:
         """让用户选择目录并创建数据库快照。"""
@@ -2567,6 +3562,8 @@ class MainWindow(QMainWindow):
     """组织所有功能页并同步数据刷新。"""
 
     def __init__(self, database: Database, recognition: RecognitionEngine, token: str) -> None:
+        """实例化所有主页面和子页面，连接跨页信号并应用全局样式。"""
+
         super().__init__()
         self.setWindowTitle("元件库")
         self.resize(1280, 800)
@@ -2576,33 +3573,35 @@ class MainWindow(QMainWindow):
         self.navigation.setFixedWidth(180)
         self.stack = QStackedWidget()
         self.inventory_page = InventoryPage(database)
-        self.receive_page = ReceivePage(database)
-        self.issue_page = IssuePage(database)
+        self.receive_page = ReceivePage(database, recognition)
+        self.issue_page = IssuePage(database, recognition)
         self.locations_page = LocationsPage(database)
         self.scan_page = ScanPage(database, recognition)
         self.order_page = OrderImportPage(database)
         self.bom_page = BomPage(database)
+        self.transactions_page = TransactionsPage(database)
+        self.settings_page = SettingsPage(database, token)
         pages: list[tuple[str, QWidget]] = [
             ("元件库存", self.inventory_page),
             ("入库", self.receive_page),
             ("出库", self.issue_page),
             ("位置与仓库", self.locations_page),
-            ("扫描入库", self.scan_page),
-            ("库存流水", TransactionsPage(database)),
-            ("OCR 样本", CorrectionsPage(database)),
-            ("设置与备份", SettingsPage(database, token)),
+            ("库存流水", self.transactions_page),
+            ("设置", self.settings_page),
         ]
         for name, page in pages:
             self.navigation.addItem(name)
             self.stack.addWidget(page)
             if isinstance(page, BasePage):
                 page.changed.connect(self.refresh_pages)
-        for page in (self.order_page, self.bom_page):
+        for page in (self.scan_page, self.order_page, self.bom_page):
             self.stack.addWidget(page)
             page.changed.connect(self.refresh_pages)
         self.navigation.currentRowChanged.connect(self._show_main_page)
         self.receive_page.open_order_import.connect(lambda: self._show_subpage(self.order_page))
+        self.receive_page.open_scan.connect(lambda: self._show_subpage(self.scan_page))
         self.issue_page.open_bom.connect(lambda: self._show_subpage(self.bom_page))
+        self.scan_page.back_requested.connect(lambda: self._show_main_page(1))
         self.order_page.back_requested.connect(lambda: self._show_main_page(1))
         self.bom_page.back_requested.connect(lambda: self._show_main_page(2))
         self.scan_page.use_for_receive.connect(self._open_receive_draft)
