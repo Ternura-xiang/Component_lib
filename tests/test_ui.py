@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtWidgets import QDialog, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QDialog, QLabel, QLineEdit, QMessageBox, QPushButton
 from test_jlc_product import PRODUCT_HTML
 
 from component_library.database import Database
@@ -18,8 +18,14 @@ from component_library.models import (
     WarehouseCreate,
 )
 from component_library.recognition import RecognitionEngine
-from component_library.ui.jlc_browser import JlcMergeDialog
-from component_library.ui.main_window import BatchCodeScanDialog, InlineEditor, MainWindow
+from component_library.ui.jlc_browser import JlcBatchMergeDialog, JlcMergeDialog
+from component_library.ui.main_window import (
+    BatchCodeScanDialog,
+    CollapsibleSection,
+    InlineEditor,
+    MainWindow,
+    WheelSafeComboBox,
+)
 
 
 def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
@@ -33,13 +39,14 @@ def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
     assert "QGroupBox::indicator" in window.styleSheet()
     assert "border: 2px solid #111111" in window.styleSheet()
     assert "checkmark.svg" in window.styleSheet()
-    assert window.stack.count() == 9
+    assert window.stack.count() == 10
     assert [window.navigation.item(index).text() for index in range(window.navigation.count())] == [
         "元件库存",
         "入库",
         "出库",
         "位置与仓库",
         "库存流水",
+        "统计",
         "设置",
     ]
     window._show_main_page(1)
@@ -61,6 +68,21 @@ def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
     assert window.stack.currentWidget() is window.issue_page
 
 
+def test_leaving_receive_scan_stops_camera(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """从扫描入库子页返回或切换主页时必须释放摄像头。"""
+
+    window = MainWindow(Database(tmp_path / "inventory.db"), RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    stopped: list[bool] = []
+    monkeypatch.setattr(window.scan_page, "stop_camera", lambda: stopped.append(True))
+    window._show_main_page(1)
+    window.receive_page.open_scan.emit()
+    window._show_main_page(0)
+    assert stopped == [True]
+
+
 def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
     """入库页只保留商城选择和扫描入口，设置包含备份与关于。"""
 
@@ -80,7 +102,9 @@ def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
         label.text() for label in window.settings_page.tabs.widget(2).findChildren(QLabel)
     }
     assert "Ternura_xiang" in about_labels
-    assert "0.8.8" in about_labels
+    assert "0.9.0" in about_labels
+    assert "第三方许可" not in about_labels
+    assert isinstance(window.receive_page.category, WheelSafeComboBox)
 
 
 def test_batch_code_scan_dialog_accepts_only_custom_code(qtbot: Any) -> None:
@@ -121,6 +145,33 @@ def test_issue_search_generates_stock_locations(qtbot: Any, tmp_path: Path) -> N
     assert issue_page.location.itemText(1) == "主柜 / B04（20）"
 
 
+def test_manual_issue_clears_parameters_after_success(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="手工出库元件"))
+    warehouse = database.create_warehouse(WarehouseCreate(name="主柜"))
+    location = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="A01"))
+    database.receive(
+        ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=5)
+    )
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+    monkeypatch.setattr(issue, "show_info", lambda _message: None)
+    issue.search.setText("手工出库元件")
+    issue.quantity.setValue(2)
+    issue.notes.setText("测试用途")
+    issue.submit()
+
+    assert issue.search.text() == ""
+    assert issue.component.count() == 0
+    assert issue.location.currentData() is None
+    assert issue.location.currentText() == ""
+    assert issue.quantity.value() == 1
+    assert issue.notes.text() == ""
+
+
 def test_issue_scan_prefills_batch_without_immediate_mutation(
     qtbot: Any, tmp_path: Path
 ) -> None:
@@ -150,6 +201,10 @@ def test_issue_scan_prefills_batch_without_immediate_mutation(
     ] == 4
     assert "本次 3" in issue.scan_status.text()
     assert "批次剩余 4" in issue.scan_status.text()
+    assert issue.selected_batch is None
+    assert issue.scan_text.text() == ""
+    assert not issue.scan_quantity.isEnabled()
+    assert not issue.scan_confirm.isEnabled()
 
 
 def test_issue_scan_missing_batch_stays_visible_without_mutating_stock(
@@ -338,6 +393,9 @@ def test_receive_existing_component_saves_form_edits_without_extra_checkbox(
     receive._apply_existing_component(database.get_component(component["id"]))
     receive.brand.setText("新品牌")
     receive.quantity.setValue(3)
+    receive.batch_code.setText("CL0000000123")
+    receive.notes.setText("入库备注")
+    receive._scan_raw_barcode = "raw-test"
     receive.submit()
 
     assert database.get_component(component["id"])["brand"] == "新品牌"
@@ -345,6 +403,30 @@ def test_receive_existing_component_saves_form_edits_without_extra_checkbox(
     assert len(stock) == 1
     assert stock[0]["location_id"] == location["id"]
     assert stock[0]["quantity"] == 3
+    assert receive.name.currentText() == ""
+    assert receive.brand.text() == ""
+    assert receive.batch_code.text() == ""
+    assert receive.notes.text() == ""
+    assert receive.quantity.value() == 1
+    assert receive._scan_raw_barcode is None
+
+
+def test_inventory_context_delete_path_uses_safe_delete(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    database.create_component(ComponentCreate(name="可删除元件"))
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.inventory_page.delete_component_at_row(0)
+
+    assert database.list_components() == []
 
 
 def test_order_import_cancel_clears_preview(qtbot: Any, tmp_path: Path) -> None:
@@ -370,9 +452,27 @@ def test_order_import_cancel_clears_preview(qtbot: Any, tmp_path: Path) -> None:
         ]
     )
     assert page.table.rowCount() == 1
+    assert page.table.horizontalHeaderItem(7).text() == "详细信息"
+    details = page.table.cellWidget(0, 7)
+    assert isinstance(details, CollapsibleSection)
+    assert not details.isChecked()
     page.cancel_import()
     assert page.table.rowCount() == 0
     assert page.lines == []
+
+
+def test_batch_merge_supports_component_and_field_selection(qtbot: Any) -> None:
+    """批量变更窗口应同时支持元件整体和单独字段的对号选择。"""
+
+    draft = parse_jlc_product_page("https://item.szlcsc.com/123456.html", PRODUCT_HTML)
+    dialog = JlcBatchMergeDialog(
+        [("component-1", "测试元件", draft, {"brand": "旧品牌"}, [])]
+    )
+    qtbot.addWidget(dialog)
+    result = dialog.result_data()["component-1"]
+    assert result.brand == draft.brand
+    dialog.masters["component-1"].setChecked(False)
+    assert dialog.result_data() == {}
 
 
 def test_inline_cell_editing_saves_on_finish(qtbot: Any, tmp_path: Path) -> None:

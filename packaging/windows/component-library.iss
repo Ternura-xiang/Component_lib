@@ -1,5 +1,5 @@
 #define AppName "元件库"
-#define AppVersion "0.8.8"
+#define AppVersion "0.9.0"
 
 [Setup]
 AppId={{B83CB0AA-4C40-49C8-9183-4BC54707A321}

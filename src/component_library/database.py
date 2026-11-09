@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -179,6 +179,7 @@ class Database:
             self._migrate_v6(connection)
             self._migrate_v8(connection)
             self._migrate_v9(connection)
+            self._migrate_v10(connection)
 
     @staticmethod
     def _migrate_v3(connection: sqlite3.Connection) -> None:
@@ -218,6 +219,19 @@ class Database:
         if "archived_at" not in columns:
             connection.execute("ALTER TABLE components ADD COLUMN archived_at TEXT")
         connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(6,datetime('now'))")
+
+    @staticmethod
+    def _migrate_v10(connection: sqlite3.Connection) -> None:
+        """记录元件是否已由商品详情页补全，避免反复访问相同页面。"""
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(components)").fetchall()
+        }
+        if "jlc_matched" not in columns:
+            connection.execute(
+                "ALTER TABLE components ADD COLUMN jlc_matched INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(10,datetime('now'))")
 
     @staticmethod
     def _migrate_v8(connection: sqlite3.Connection) -> None:
@@ -316,6 +330,7 @@ class Database:
             clean(data.product_url),
             clean(data.datasheet_url),
             clean(data.notes),
+            int(bool(data.jlc_matched)),
             timestamp,
         )
         try:
@@ -324,8 +339,8 @@ class Database:
                     """INSERT INTO components(
                     id,name,aliases,lcsc_part_number,manufacturer_part_number,
                     custom_part_number,brand,package,category,specification,price,
-                    purchase_date,product_url,datasheet_url,notes,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    purchase_date,product_url,datasheet_url,notes,jlc_matched,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (*values, timestamp),
                 )
         except sqlite3.IntegrityError as error:
@@ -536,6 +551,7 @@ class Database:
                     """UPDATE components SET name=?,aliases=?,lcsc_part_number=?,
                     manufacturer_part_number=?,custom_part_number=?,brand=?,package=?,category=?,
                     specification=?,price=?,purchase_date=?,product_url=?,datasheet_url=?,notes=?,
+                    jlc_matched=COALESCE(?,jlc_matched),
                     updated_at=? WHERE id=?""",
                     (
                         data.name.strip(),
@@ -552,6 +568,7 @@ class Database:
                         clean(data.product_url),
                         clean(data.datasheet_url),
                         clean(data.notes),
+                        int(data.jlc_matched) if data.jlc_matched is not None else None,
                         utc_now(),
                         component_id,
                     ),
@@ -850,6 +867,140 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def inventory_export_rows(
+        self, component_ids: Collection[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """返回适合表格导出的当前库存明细。
+
+        :param component_ids: 限定元件集合；``None`` 表示全部活动元件，空集合表示无结果
+        :return: 每个活动元件、仓库一行；无库存元件仍保留一行空仓库记录
+
+        价值优先使用剩余批次的实际单价，批次未记录单价时回退到元件当前单价。
+        两者都缺失的数量计入 ``unpriced_quantity``，不会被静默当作已定价库存。
+        """
+
+        selected = tuple(dict.fromkeys(component_ids)) if component_ids is not None else None
+        if selected == ():
+            return []
+        where = "c.archived_at IS NULL"
+        parameters: list[Any] = []
+        if selected is not None:
+            placeholders = ",".join("?" for _ in selected)
+            where += f" AND c.id IN ({placeholders})"
+            parameters.extend(selected)
+        with self.read() as connection:
+            rows = connection.execute(
+                f"""SELECT c.id component_id,c.name component_name,c.aliases,
+                c.lcsc_part_number,c.manufacturer_part_number,c.custom_part_number,
+                c.category,c.brand,c.package,c.specification,c.price component_price,
+                c.purchase_date,c.product_url,c.datasheet_url,c.notes,
+                w.name warehouse_name,l.name location_name,
+                COALESCE(SUM(s.remaining_quantity),0) quantity,
+                COALESCE(SUM(CASE WHEN COALESCE(s.unit_price,c.price) IS NOT NULL
+                    THEN s.remaining_quantity*COALESCE(s.unit_price,c.price) ELSE 0 END),0) value,
+                COALESCE(SUM(CASE WHEN COALESCE(s.unit_price,c.price) IS NULL
+                    THEN s.remaining_quantity ELSE 0 END),0) unpriced_quantity
+                FROM components c
+                LEFT JOIN stock_lots s ON s.component_id=c.id AND s.remaining_quantity>0
+                LEFT JOIN locations l ON l.id=s.location_id
+                LEFT JOIN warehouses w ON w.id=l.warehouse_id
+                WHERE {where}
+                GROUP BY c.id,l.id
+                ORDER BY c.name COLLATE NOCASE,w.name COLLATE NOCASE,l.name COLLATE NOCASE""",
+                parameters,
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["aliases"] = ", ".join(json.loads(item["aliases"] or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                item["aliases"] = ""
+            item["quantity"] = int(item["quantity"] or 0)
+            item["unpriced_quantity"] = int(item["unpriced_quantity"] or 0)
+            item["value"] = float(item["value"] or 0)
+            output.append(item)
+        return output
+
+    def inventory_statistics(
+        self, component_ids: Collection[str] | None = None
+    ) -> dict[str, Any]:
+        """汇总元件种类、库存数量、仓库、类别和库存价值。"""
+
+        rows = self.inventory_export_rows(component_ids)
+        component_ids_seen = {str(row["component_id"]) for row in rows}
+        total_quantity = sum(int(row["quantity"]) for row in rows)
+        unpriced_quantity = sum(int(row["unpriced_quantity"]) for row in rows)
+
+        def grouped(key: str, empty_label: str) -> list[dict[str, Any]]:
+            groups: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                label = str(row.get(key) or empty_label)
+                group = groups.setdefault(
+                    label,
+                    {
+                        "name": label,
+                        "component_ids": set(),
+                        "quantity": 0,
+                        "value": 0.0,
+                        "unpriced_quantity": 0,
+                    },
+                )
+                group["component_ids"].add(str(row["component_id"]))
+                group["quantity"] += int(row["quantity"])
+                group["value"] += float(row["value"])
+                group["unpriced_quantity"] += int(row["unpriced_quantity"])
+            return [
+                {
+                    "name": group["name"],
+                    "component_types": len(group["component_ids"]),
+                    "quantity": group["quantity"],
+                    "value": group["value"],
+                    "unpriced_quantity": group["unpriced_quantity"],
+                }
+                for group in sorted(groups.values(), key=lambda item: str(item["name"]).casefold())
+            ]
+
+        location_rows = [row for row in rows if row.get("location_name")]
+        location_groups: dict[str, dict[str, Any]] = {}
+        for row in location_rows:
+            label = f"{row['warehouse_name']} / {row['location_name']}"
+            group = location_groups.setdefault(
+                label,
+                {
+                    "name": label,
+                    "component_ids": set(),
+                    "quantity": 0,
+                    "value": 0.0,
+                    "unpriced_quantity": 0,
+                },
+            )
+            group["component_ids"].add(str(row["component_id"]))
+            group["quantity"] += int(row["quantity"])
+            group["value"] += float(row["value"])
+            group["unpriced_quantity"] += int(row["unpriced_quantity"])
+        by_location = [
+            {
+                "name": group["name"],
+                "component_types": len(group["component_ids"]),
+                "quantity": group["quantity"],
+                "value": group["value"],
+                "unpriced_quantity": group["unpriced_quantity"],
+            }
+            for group in sorted(
+                location_groups.values(), key=lambda item: str(item["name"]).casefold()
+            )
+        ]
+        return {
+            "component_types": len(component_ids_seen),
+            "total_quantity": total_quantity,
+            "priced_quantity": total_quantity - unpriced_quantity,
+            "unpriced_quantity": unpriced_quantity,
+            "total_value": sum(float(row["value"]) for row in rows),
+            "by_location": by_location,
+            "by_category": grouped("category", "未分类"),
+        }
+
     @staticmethod
     def _get_or_create_batch(
         connection: sqlite3.Connection,
@@ -1059,8 +1210,10 @@ class Database:
                         """UPDATE components SET category=COALESCE(category,?),
                         manufacturer_part_number=COALESCE(manufacturer_part_number,?),
                         package=COALESCE(package,?),brand=COALESCE(brand,?),
-                        product_url=COALESCE(product_url,?),notes=COALESCE(notes,?),
+                        product_url=COALESCE(product_url,?),datasheet_url=COALESCE(datasheet_url,?),
+                        notes=COALESCE(notes,?),
                         specification=COALESCE(specification,?),price=?,purchase_date=?,
+                        jlc_matched=MAX(jlc_matched,?),
                         archived_at=NULL,updated_at=?
                         WHERE id=?""",
                         (
@@ -1069,10 +1222,12 @@ class Database:
                             clean(line.package),
                             clean(line.brand),
                             clean(line.product_url),
+                            clean(line.datasheet_url),
                             clean(line.description),
                             _order_specification(line),
                             line.unit_price,
                             line.purchased_at[:10],
+                            int(line.jlc_matched),
                             timestamp,
                             component_id,
                         ),
@@ -1083,8 +1238,8 @@ class Database:
                         """INSERT INTO components(
                         id,name,aliases,lcsc_part_number,manufacturer_part_number,
                         custom_part_number,brand,package,category,specification,price,
-                        purchase_date,product_url,datasheet_url,notes,created_at,updated_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        purchase_date,product_url,datasheet_url,notes,jlc_matched,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             component_id,
                             line.name,
@@ -1099,13 +1254,39 @@ class Database:
                             line.unit_price,
                             line.purchased_at[:10],
                             clean(line.product_url),
-                            None,
+                            clean(line.datasheet_url),
                             clean(line.description) or f"由立创订单 {line.order_number} 离线导入",
+                            int(line.jlc_matched),
                             timestamp,
                             timestamp,
                         ),
                     )
                     created_count += 1
+                if line.parameter_groups:
+                    connection.execute(
+                        "DELETE FROM component_category_parameters WHERE component_id=?",
+                        (component_id,),
+                    )
+                    parameter_rows = [
+                        (parameter.key, parameter.label.strip(), parameter.value.strip(), group.name)
+                        for group in line.parameter_groups
+                        for parameter in group.parameters
+                        if parameter.label.strip() and parameter.value.strip()
+                    ]
+                    for sort_order, (key, label, value, group_name) in enumerate(parameter_rows):
+                        connection.execute(
+                            """INSERT INTO component_category_parameters(
+                            component_id,parameter_key,label,value,sort_order,group_name)
+                            VALUES(?,?,?,?,?,?)""",
+                            (component_id, key, label, value, sort_order, group_name or "类别参数"),
+                        )
+                    specification = "；".join(
+                        f"{label}: {value}" for _key, label, value, _group in parameter_rows
+                    )
+                    connection.execute(
+                        "UPDATE components SET specification=? WHERE id=?",
+                        (specification or None, component_id),
+                    )
                 lot_id = str(uuid.uuid4())
                 batch_id = self._get_or_create_batch(
                     connection,
@@ -1888,7 +2069,8 @@ CREATE TABLE IF NOT EXISTS components(
  id TEXT PRIMARY KEY,name TEXT NOT NULL CHECK(trim(name)<>''),aliases TEXT NOT NULL DEFAULT '[]',
  lcsc_part_number TEXT UNIQUE,manufacturer_part_number TEXT,custom_part_number TEXT UNIQUE,
  brand TEXT,package TEXT,category TEXT,specification TEXT,price REAL,purchase_date TEXT,
- product_url TEXT,datasheet_url TEXT,notes TEXT,archived_at TEXT,
+ product_url TEXT,datasheet_url TEXT,notes TEXT,jlc_matched INTEGER NOT NULL DEFAULT 0,
+ archived_at TEXT,
  created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_components_name ON components(name);
 CREATE INDEX IF NOT EXISTS idx_components_mpn ON components(manufacturer_part_number);

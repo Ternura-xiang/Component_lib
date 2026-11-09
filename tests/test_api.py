@@ -52,6 +52,29 @@ def test_api_rejects_missing_token(tmp_path: Path) -> None:
     assert response.status_code == 401
 
 
+def test_statistics_api_returns_empty_snapshot(tmp_path: Path) -> None:
+    """新数据库的统计接口应返回结构稳定的零值快照。"""
+
+    response = asyncio.run(
+        request(
+            application(tmp_path),
+            "GET",
+            "/api/v1/statistics",
+            headers={"Authorization": "Bearer test-token"},
+        )
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "component_types": 0,
+        "total_quantity": 0,
+        "priced_quantity": 0,
+        "unpriced_quantity": 0,
+        "total_value": 0,
+        "by_location": [],
+        "by_category": [],
+    }
+
+
 def test_write_requires_idempotency_key(tmp_path: Path) -> None:
     response = asyncio.run(
         request(

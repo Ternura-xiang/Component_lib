@@ -34,6 +34,20 @@ def inventory(tmp_path: Path) -> tuple[Database, dict, dict, dict]:
     return database, component, warehouse, location
 
 
+def test_jlc_match_state_is_persistent_and_manual_edit_preserves_it(tmp_path: Path) -> None:
+    """详情页确认状态应持久化，后续普通编辑不得误清除。"""
+
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(
+        ComponentCreate(name="已补全元件", lcsc_part_number="C12345", jlc_matched=True)
+    )
+    assert database.get_component(component["id"])["jlc_matched"] == 1
+    database.update_component(
+        component["id"], ComponentCreate(name="手工改名", lcsc_part_number="C12345")
+    )
+    assert database.get_component(component["id"])["jlc_matched"] == 1
+
+
 def total(database: Database, component_id: str) -> float:
     """汇总一个元件的全部库存。"""
 
@@ -348,3 +362,38 @@ def test_zero_stock_component_with_history_is_archived(
     assert database.delete_component(component["id"])["mode"] == "archived"
     assert all(item["id"] != component["id"] for item in database.list_components())
     assert database.get_component(component["id"])["archived_at"] is not None
+
+
+def test_inventory_statistics_tracks_value_and_unpriced_stock(tmp_path: Path) -> None:
+    """统计价值应使用批次/元件价格，并单独报告没有价格的库存。"""
+
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主柜"))
+    first_location = database.create_location(
+        LocationCreate(warehouse_id=position["id"], name="A01")
+    )
+    second_location = database.create_location(
+        LocationCreate(warehouse_id=position["id"], name="B01")
+    )
+    priced = database.create_component(ComponentCreate(name="已定价", category="电阻", price=2))
+    unpriced = database.create_component(ComponentCreate(name="未定价", category="电容"))
+    database.receive(
+        ReceiveRequest(component_id=priced["id"], location_id=first_location["id"], quantity=3)
+    )
+    database.receive(
+        ReceiveRequest(component_id=unpriced["id"], location_id=second_location["id"], quantity=2)
+    )
+
+    statistics = database.inventory_statistics()
+    assert statistics["component_types"] == 2
+    assert statistics["total_quantity"] == 5
+    assert statistics["priced_quantity"] == 3
+    assert statistics["unpriced_quantity"] == 2
+    assert statistics["total_value"] == 6
+    assert {item["name"] for item in statistics["by_location"]} == {
+        "主柜 / A01",
+        "主柜 / B01",
+    }
+    categories = {item["name"]: item for item in statistics["by_category"]}
+    assert categories["电阻"]["value"] == 6
+    assert categories["电容"]["unpriced_quantity"] == 2

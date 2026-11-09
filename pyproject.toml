@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "component-library"
-version = "0.8.8"
+version = "0.9.0"
 description = "本地优先的电子元件库存与袋贴文字识别工具"
 readme = "README.md"
 license = "MIT"

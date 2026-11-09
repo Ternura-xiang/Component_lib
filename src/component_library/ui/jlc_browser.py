@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QUrl, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -214,6 +215,104 @@ class JlcBrowserDialog(QDialog):
         super().done(result)
 
 
+class JlcBatchBrowserDialog(QDialog):
+    """依次打开指定商品详情页，并收集可供用户确认的结构化草稿。"""
+
+    def __init__(
+        self, targets: list[tuple[str, str, str]], parent: QWidget | None = None
+    ) -> None:
+        """创建批量补全窗口。
+
+        :param targets: ``(内部键, 显示名称, 商品页 URL)`` 列表
+        :param parent: 父窗口
+        """
+
+        super().__init__(parent)
+        self.targets = targets
+        self.drafts: dict[str, JlcProductDraft] = {}
+        self.errors: dict[str, str] = {}
+        self._index = -1
+        self._closed = False
+        self.setWindowTitle("自动补充立创商品资料")
+        self.resize(1120, 760)
+        layout = QVBoxLayout(self)
+        self.status = QLabel("准备打开商品详情页……")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.profile = QWebEngineProfile(self)
+        self.profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
+        )
+        self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
+        self.profile.downloadRequested.connect(JlcBrowserDialog._cancel_download)
+        self.page = SafeJlcPage(self.profile, self)
+        self.view = QWebEngineView(self)
+        self.view.setPage(self.page)
+        layout.addWidget(self.view, 1)
+        controls = QHBoxLayout()
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.clicked.connect(self.reject)
+        controls.addStretch()
+        controls.addWidget(self.cancel_button)
+        layout.addLayout(controls)
+        self.view.loadProgress.connect(self._show_progress)
+        self.view.loadFinished.connect(self._loaded)
+
+    def start(self) -> None:
+        """从第一项开始遍历；空任务直接完成。"""
+
+        if not self.targets:
+            self.accept()
+            return
+        self._load_next()
+
+    def _show_progress(self, progress: int) -> None:
+        if 0 <= self._index < len(self.targets):
+            _key, name, _url = self.targets[self._index]
+            self.status.setText(
+                f"正在读取 {self._index + 1}/{len(self.targets)}：{name}（{progress}%）"
+            )
+
+    def _load_next(self) -> None:
+        self._index += 1
+        if self._index >= len(self.targets):
+            self.status.setText(
+                f"读取完成：成功 {len(self.drafts)} 项，失败 {len(self.errors)} 项"
+            )
+            self.accept()
+            return
+        _key, _name, url = self.targets[self._index]
+        self.view.setUrl(QUrl(url))
+
+    def _loaded(self, ok: bool) -> None:
+        if self._closed or not (0 <= self._index < len(self.targets)):
+            return
+        key, name, url = self.targets[self._index]
+        if not ok:
+            self.errors[key] = f"{name}：页面加载失败"
+            self._load_next()
+            return
+        self.page.toHtml(lambda html, item_key=key, item_name=name, source=url: self._parsed(
+            item_key, item_name, source, html
+        ))
+
+    def _parsed(self, key: str, name: str, url: str, html: str) -> None:
+        if self._closed:
+            return
+        try:
+            self.drafts[key] = parse_jlc_product_page(url, html)
+        except Exception as error:
+            self.errors[key] = f"{name}：{error}"
+        self._load_next()
+
+    def done(self, result: int) -> None:
+        self._closed = True
+        self.view.stop()
+        self.profile.cookieStore().deleteAllCookies()
+        self.profile.clearHttpCache()
+        super().done(result)
+
+
 class JlcMergeDialog(QDialog):
     """显示现有值、商城值和最终值，由用户逐项授权应用。"""
 
@@ -392,3 +491,177 @@ class JlcMergeDialog(QDialog):
                 for name, parameters in groups.items()
             ],
         )
+
+
+class JlcBatchMergeDialog(QDialog):
+    """集中展示批量补全差异，并允许按元件及单独字段授权覆盖。"""
+
+    def __init__(
+        self,
+        changes: list[
+            tuple[str, str, JlcProductDraft, dict[str, str], list[dict[str, str]]]
+        ],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.changes = changes
+        self.rows: dict[str, list[tuple[str, str, QCheckBox, str, str]]] = {}
+        self.masters: dict[str, QCheckBox] = {}
+        self.ranges: dict[str, tuple[int, int]] = {}
+        self.setWindowTitle("确认自动补充的资料变更")
+        self.resize(1080, 760)
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "对号用于选择是否应用；三角形只控制详情显示。取消某个元件后，其全部字段均不会写入。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["应用", "元件 / 字段", "现有值", "商城值", "类型"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+        for key, name, draft, current_fields, current_parameters in changes:
+            self._append_component(key, name, draft, current_fields, current_parameters)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
+        )
+        apply_button = buttons.button(QDialogButtonBox.StandardButton.Apply)
+        apply_button.setText("应用所选变更")
+        apply_button.clicked.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _draft_fields(draft: JlcProductDraft) -> dict[str, str]:
+        return {
+            "name": draft.name,
+            "lcsc_part_number": draft.lcsc_part_number,
+            "manufacturer_part_number": draft.manufacturer_part_number or "",
+            "brand": draft.brand or "",
+            "package": draft.package or "",
+            "category": draft.category or "",
+            "product_url": draft.product_url,
+            "datasheet_url": draft.datasheet_url or "",
+            "notes": draft.description or "",
+        }
+
+    def _append_component(
+        self,
+        key: str,
+        name: str,
+        draft: JlcProductDraft,
+        current_fields: dict[str, str],
+        current_parameters: list[dict[str, str]],
+    ) -> None:
+        header = self.table.rowCount()
+        self.table.insertRow(header)
+        master = QCheckBox()
+        master.setChecked(True)
+        self.table.setCellWidget(header, 0, master)
+        toggle = QToolButton()
+        toggle.setText(name)
+        toggle.setCheckable(True)
+        toggle.setArrowType(Qt.ArrowType.RightArrow)
+        toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.table.setCellWidget(header, 1, toggle)
+        self.table.setItem(header, 2, QTableWidgetItem(""))
+        self.table.setItem(header, 3, QTableWidgetItem(""))
+        self.table.setItem(header, 4, QTableWidgetItem("整体"))
+        rows: list[tuple[str, str, QCheckBox, str, str]] = []
+        values = self._draft_fields(draft)
+        for field, _label in JlcMergeDialog.FIELD_LABELS:
+            website = values.get(field, "")
+            if website:
+                rows.append(("field", field, QCheckBox(), current_fields.get(field, ""), website))
+        existing_parameters = {
+            item["parameter_key"]: item for item in current_parameters if item.get("parameter_key")
+        }
+        for parameter_group in draft.parameter_groups:
+            for parameter in parameter_group.parameters:
+                old = existing_parameters.get(parameter.key, {})
+                rows.append(
+                    (
+                        "parameter",
+                        f"{parameter_group.name}\x1f{parameter.key}\x1f{parameter.label}",
+                        QCheckBox(),
+                        str(old.get("value") or ""),
+                        parameter.value,
+                    )
+                )
+        start = self.table.rowCount()
+        for kind, field, check, current, website in rows:
+            check.setChecked(True)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setCellWidget(row, 0, check)
+            label = field
+            if kind == "field":
+                label = dict(JlcMergeDialog.FIELD_LABELS).get(field, field)
+            else:
+                group_name, _parameter_key, parameter_label = field.split("\x1f", 2)
+                label = f"{group_name} / {parameter_label}"
+            self.table.setItem(row, 1, QTableWidgetItem(label))
+            self.table.setItem(row, 2, QTableWidgetItem(current))
+            self.table.setItem(row, 3, QTableWidgetItem(website))
+            self.table.setItem(row, 4, QTableWidgetItem("基础字段" if kind == "field" else "商品参数"))
+            self.table.setRowHidden(row, True)
+        end = self.table.rowCount()
+        self.rows[key] = rows
+        self.masters[key] = master
+        self.ranges[key] = (start, end)
+        master.toggled.connect(
+            lambda checked, item_rows=rows: [check.setChecked(checked) for *_rest, check, _a, _b in item_rows]
+        )
+        toggle.toggled.connect(
+            lambda expanded, item_key=key, button=toggle: self._toggle_rows(
+                item_key, button, expanded
+            )
+        )
+
+    def _toggle_rows(self, key: str, button: QToolButton, expanded: bool) -> None:
+        button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        start, end = self.ranges[key]
+        for row in range(start, end):
+            self.table.setRowHidden(row, not expanded)
+
+    def result_data(self) -> dict[str, JlcMergeResult]:
+        output: dict[str, JlcMergeResult] = {}
+        change_by_key = {item[0]: item for item in self.changes}
+        for key, master in self.masters.items():
+            if not master.isChecked():
+                continue
+            _key, _name, _draft, _fields, current_parameters = change_by_key[key]
+            selected_fields: dict[str, str | None] = {}
+            merged_parameters: dict[str, tuple[str, JlcParameter]] = {
+                item["parameter_key"]: (
+                    item.get("group_name") or "类别参数",
+                    JlcParameter(
+                        key=item["parameter_key"], label=item["label"], value=item["value"]
+                    ),
+                )
+                for item in current_parameters
+                if item.get("parameter_key") and item.get("value")
+            }
+            for kind, field, check, _current, website in self.rows[key]:
+                if not check.isChecked():
+                    continue
+                if kind == "field":
+                    selected_fields[field] = website or None
+                else:
+                    group, parameter_key, label = field.split("\x1f", 2)
+                    merged_parameters[parameter_key] = (
+                        group,
+                        JlcParameter(key=parameter_key, label=label, value=website),
+                    )
+            groups: dict[str, list[JlcParameter]] = {}
+            for group_name, parameter in merged_parameters.values():
+                groups.setdefault(group_name, []).append(parameter)
+            output[key] = JlcMergeResult(
+                **selected_fields,
+                parameter_groups=[
+                    JlcParameterGroup(name=group_name, parameters=parameters)
+                    for group_name, parameters in groups.items()
+                ],
+            )
+        return output

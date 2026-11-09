@@ -354,6 +354,12 @@ def create_api(context: ApiContext) -> FastAPI:
 
         return context.database.list_stock()
 
+    @app.get("/api/v1/statistics", dependencies=[Depends(auth)])
+    async def statistics() -> dict[str, Any]:
+        """返回全库库存总量、估值以及分库和分类汇总。"""
+
+        return context.database.inventory_statistics()
+
     @app.post("/api/v1/inventory/receive", dependencies=[Depends(auth)])
     async def receive(data: ReceiveRequest, request_key: str = Depends(key)) -> dict[str, Any]:
         """执行入库事务；数量必须为正，成功后返回事务组信息。"""

@@ -7,7 +7,10 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 root = Path(SPECPATH).parent
 
 rapidocr_datas, rapidocr_binaries, rapidocr_hidden = collect_all("rapidocr")
-app_datas = collect_data_files("component_library")
+app_datas = collect_data_files("component_library") + [
+    (str(root / "LICENSE"), "."),
+    (str(root / "THIRD_PARTY_NOTICES.md"), "."),
+]
 
 a = Analysis(
     [str(root / "packaging" / "entry.py")],

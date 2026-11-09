@@ -28,6 +28,9 @@ class ComponentCreate(BaseModel):
     product_url: str | None = None
     datasheet_url: str | None = None
     notes: str | None = None
+    jlc_matched: bool | None = Field(
+        default=None, description="是否已经从立创商品详情页补充并由用户确认"
+    )
 
 
 class WarehouseCreate(BaseModel):
@@ -260,5 +263,8 @@ class OrderImportLine(BaseModel):
     unit_price: float = Field(ge=0)
     quantity: int = Field(gt=0)
     product_url: str | None = None
+    datasheet_url: str | None = None
+    parameter_groups: list[JlcParameterGroup] = Field(default_factory=list, exclude=True)
     resistor: ResistorDetails | None = None
     mosfet: MosfetDetails | None = None
+    jlc_matched: bool = Field(default=False, exclude=True)

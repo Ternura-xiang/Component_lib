@@ -4,7 +4,12 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from component_library.database import Database
-from component_library.models import LocationCreate, WarehouseCreate
+from component_library.models import (
+    JlcParameter,
+    JlcParameterGroup,
+    LocationCreate,
+    WarehouseCreate,
+)
 from component_library.order_import import parse_saved_orders
 
 HTML = """<!doctype html><html><body><ul><li class="mt-[10px] relative">
@@ -79,6 +84,32 @@ def test_order_import_is_idempotent(tmp_path: Path) -> None:
     assert second["imported"] == 0
     assert second["skipped"] == 1
     assert database.list_stock()[0]["quantity"] == 2
+
+
+def test_enriched_order_persists_match_state_datasheet_and_parameters(tmp_path: Path) -> None:
+    """订单自动补全结果应随原子入库保存，不能只停留在预览界面。"""
+
+    database = Database(tmp_path / "inventory.db")
+    warehouse = database.create_warehouse(WarehouseCreate(name="主柜"))
+    location = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="A01"))
+    source = parse_saved_orders(saved_order_zip(tmp_path))[0]
+    enriched = source.model_copy(
+        update={
+            "datasheet_url": "https://example.com/datasheet.pdf",
+            "jlc_matched": True,
+            "parameter_groups": [
+                JlcParameterGroup(
+                    name="基础参数",
+                    parameters=[JlcParameter(key="color", label="发光颜色", value="红色")],
+                )
+            ],
+        }
+    )
+    database.import_order_lines([enriched], location["id"])
+    detail = database.list_components(enriched.lcsc_part_number)[0]
+    assert detail["jlc_matched"] == 1
+    assert detail["datasheet_url"] == "https://example.com/datasheet.pdf"
+    assert database.get_component(detail["id"])["category_parameters"][0]["value"] == "红色"
 
 
 def test_name_matching_and_category_priority_recommendation(tmp_path: Path) -> None:
