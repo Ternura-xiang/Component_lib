@@ -9,7 +9,12 @@ from openpyxl import load_workbook
 
 from component_library.database import Database
 from component_library.export import export_inventory_csv, export_inventory_xlsx
-from component_library.models import ComponentCreate, LocationCreate, ReceiveRequest, WarehouseCreate
+from component_library.models import (
+    ComponentCreate,
+    LocationCreate,
+    ReceiveRequest,
+    WarehouseCreate,
+)
 
 
 def populated_database(tmp_path: Path) -> tuple[Database, dict[str, object]]:

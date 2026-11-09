@@ -41,7 +41,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | 元件 | `GET/POST /api/v1/components`，`GET/PUT/DELETE /api/v1/components/{component_id}` |
 | 位置与仓库 | `GET/POST /api/v1/warehouses`、`GET/POST /api/v1/locations`，各自 `PUT/DELETE /{id}` |
 | 优先级 | `GET/PUT /api/v1/storage-priorities` |
-| 库存与流水 | `GET /api/v1/stock`、`POST /api/v1/inventory/{receive,issue,transfer,adjust}`、`GET /api/v1/inventory/transactions`、`POST /api/v1/inventory/transactions/{group_id}/reverse` |
+| 库存、统计与流水 | `GET /api/v1/stock`、`GET /api/v1/statistics`、`POST /api/v1/inventory/{receive,issue,transfer,adjust}`、`GET /api/v1/inventory/transactions`、`POST /api/v1/inventory/transactions/{group_id}/reverse` |
 | 批次扫码 | `POST /api/v1/inventory/batches/resolve`、`GET /api/v1/inventory/batches/{batch_id}`；解析接口只返回批次，不扣库存 |
 | BOM | `POST /api/v1/bom/import/preview`、`POST /api/v1/bom/preview`、`POST /api/v1/bom/commit` |
 | 离线订单 | `POST /api/v1/order-import/preview`、`POST /api/v1/order-import/commit` |
