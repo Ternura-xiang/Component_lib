@@ -15,6 +15,8 @@ def documentation_files() -> list[Path]:
 
     return [
         ROOT / "README.md",
+        ROOT / "CONTRIBUTING.md",
+        ROOT / "android" / "README.md",
         *(ROOT / "docs").rglob("*.md"),
         *(ROOT / "tools").rglob("README.md"),
     ]

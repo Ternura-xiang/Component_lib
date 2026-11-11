@@ -5,21 +5,23 @@ from __future__ import annotations
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from PySide6.QtCore import QLockFile
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .api import ApiContext, ApiServer, create_api
+from .connection import ConnectionManager
 from .database import Database
 from .paths import data_directory, load_or_create_token
 from .recognition import RecognitionEngine
+from .sessions import SessionService
 from .ui.main_window import MainWindow
 
 
 def configure_logging(directory: object) -> None:
     """配置只保存在本机的轮换日志，不记录图片或 API 令牌。"""
-
-    from pathlib import Path
 
     path = Path(str(directory)) / "logs"
     path.mkdir(parents=True, exist_ok=True)
@@ -39,6 +41,12 @@ def main() -> int:
     application = QApplication(sys.argv)
     application.setApplicationName("元件库")
     application.setOrganizationName("local.component-library.app")
+    package = Path(__file__).resolve().parent
+    icon_path = package / "assets" / "component-library.png"
+    if not icon_path.is_file():
+        icon_path = package.parents[1] / "packaging/assets/icons/component-library.png"
+    if icon_path.is_file():
+        application.setWindowIcon(QIcon(str(icon_path)))
     directory = data_directory()
     configure_logging(directory)
 
@@ -55,8 +63,11 @@ def main() -> int:
     database.integrity_check()
     token = load_or_create_token(directory)
     recognition = RecognitionEngine()
+    sessions = SessionService(database)
+    connection = ConnectionManager(database, directory)
+    api = create_api(ApiContext(database, token, recognition, connection, sessions))
     try:
-        api_server = ApiServer(create_api(ApiContext(database, token, recognition)))
+        api_server = ApiServer(api)
     except OSError as error:
         QMessageBox.critical(
             None,
@@ -68,11 +79,42 @@ def main() -> int:
         return 1
     api_server.start()
 
-    window = MainWindow(database, recognition, token)
+    lan_server: ApiServer | None = None
+    try:
+        lan_server = ApiServer(
+            api,
+            host="0.0.0.0",
+            port=connection.port,
+            ssl_certfile=str(connection.cert_path),
+            ssl_keyfile=str(connection.key_path),
+        )
+        lan_server.start()
+    except OSError as error:
+        QMessageBox.warning(
+            None,
+            "局域网连接未启动",
+            f"HTTPS 端口 0.0.0.0:{connection.port} 无法监听，手机连接暂不可用。\n\n{error}",
+        )
+    if lan_server is not None:
+        try:
+            connection.start_discovery()
+        except Exception as error:
+            logging.getLogger(__name__).warning("mDNS 自动发现启动失败：%s", error)
+            QMessageBox.warning(
+                None,
+                "自动发现未启动",
+                "手机仍可使用配对二维码中的地址连接，但桌面 IP 变化后需要重新配对。",
+            )
+
+    window = MainWindow(database, recognition, token, connection, sessions)
     window.show()
     exit_code = application.exec()
     api_server.stop()
     api_server.join(timeout=5)
+    if lan_server is not None:
+        lan_server.stop()
+        lan_server.join(timeout=5)
+    connection.stop_discovery()
     lock.unlock()
     return exit_code
 

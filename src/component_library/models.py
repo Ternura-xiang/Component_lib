@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+ORDER_IMPORT_BATCH_SIZE = 1_000
+
 
 class ComponentCreate(BaseModel):
     """创建元件所需字段；只有名称是必填项。"""
@@ -135,6 +137,31 @@ class BomCommitRequest(BaseModel):
     name: str = Field(min_length=1)
     source_filename: str | None = None
     lines: list[BomCommitLine] = Field(min_length=1)
+
+
+class SessionCreateRequest(BaseModel):
+    """创建由桌面端统一驱动的移动操作会话。"""
+
+    kind: Literal["RECEIVE", "ISSUE", "BOM_PICK"]
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionCommandRequest(BaseModel):
+    """对操作会话执行一次带修订号和幂等标识的命令。"""
+
+    command_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=0)
+    command: str = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class PairDeviceRequest(BaseModel):
+    """手机使用限时配对码换取独立设备令牌。"""
+
+    pairing_code: str = Field(pattern=r"^\d{6}$")
+    device_name: str = Field(min_length=1, max_length=80)
+    device_type: Literal["ANDROID_PHONE"] = "ANDROID_PHONE"
+    client_version: str = Field(default="1.0.0", min_length=1, max_length=32)
 
 
 class OcrLine(BaseModel):

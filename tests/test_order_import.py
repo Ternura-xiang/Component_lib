@@ -3,7 +3,9 @@
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from component_library.database import Database
+import pytest
+
+from component_library.database import Database, DomainError
 from component_library.models import (
     JlcParameter,
     JlcParameterGroup,
@@ -66,6 +68,66 @@ def test_parse_resistor_category_details(tmp_path: Path) -> None:
     assert line.resistor.tolerance_percent == 1
     assert line.resistor.power_mw == 62.5
     assert line.resistor.technology == "厚膜"
+
+
+def test_parse_reports_current_date_and_part(tmp_path: Path) -> None:
+    """离线解析应报告非敏感进度。"""
+
+    second = (
+        HTML.replace("SO26102118592", "SO26102118593")
+        .replace("C27636670", "C27636671")
+        .replace("GS2821CR-G", "GS2821CR-H")
+    )
+    path = tmp_path / "two-orders.html"
+    path.write_text(HTML + second, encoding="utf-8")
+    progress: list[str] = []
+    lines = parse_saved_orders(path, progress.append)
+    assert len(lines) == 2
+    assert "2026-10-21" in progress[0]
+    assert "GS2821CR-G" in progress[0]
+
+
+def test_collapsed_view_all_section_still_imports_hidden_products(tmp_path: Path) -> None:
+    """保存页面中的折叠只影响 CSS 展示，解析器必须读取其隐藏商品节点。"""
+
+    hidden_product = RESISTOR_HTML.split("<section class=\"flex justify-between pl-[10px]\">")[
+        1
+    ].split("</section></li>", 1)[0]
+    page = HTML.replace(
+        "</section></li></ul>",
+        "<button>查看全部商品</button>"
+        '<section style="display:none" class="flex justify-between pl-[10px]">'
+        + hidden_product
+        + "</section></section></li></ul>",
+    )
+    # 隐藏商品属于同一订单，需换成立创编号以避免正常去重。
+    page = page.replace("C12345678", "C12345679")
+    path = tmp_path / "collapsed.html"
+    path.write_text(page, encoding="utf-8")
+    warnings: list[str] = []
+    assert {line.lcsc_part_number for line in parse_saved_orders(path, warning=warnings.append)} == {
+        "C27636670",
+        "C12345679",
+    }
+    assert "未展开订单" in warnings[0]
+
+
+def test_order_import_fixed_batch_limit_requires_reupload(tmp_path: Path) -> None:
+    """业务层固定每批一千条，避免 UI 或 API 绕过批次限制。"""
+
+    database = Database(tmp_path / "inventory.db")
+    source = parse_saved_orders(saved_order_zip(tmp_path))[0]
+    lines = [
+        source.model_copy(
+            update={
+                "order_number": f"SO261110{index:05d}",
+                "lcsc_part_number": f"C{index + 10000}",
+            }
+        )
+        for index in range(1_001)
+    ]
+    with pytest.raises(DomainError, match="单次最多导入 1000 条"):
+        database.import_order_lines(lines)
 
 
 def test_order_import_is_idempotent(tmp_path: Path) -> None:

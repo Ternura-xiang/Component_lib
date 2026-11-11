@@ -1,14 +1,21 @@
 """本机 API 认证、契约与幂等测试。"""
 
 import asyncio
+import json
+import socket
+import ssl
 import sys
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from wsproto import ConnectionType, WSConnection
+from wsproto.events import Request as UpgradeRequest
+from wsproto.events import TextMessage
 
 from component_library.api import ApiContext, ApiServer, create_api
+from component_library.connection import ConnectionManager
 from component_library.database import Database
 from component_library.recognition import RecognitionEngine
 
@@ -26,6 +33,87 @@ def test_api_server_without_console(monkeypatch: pytest.MonkeyPatch) -> None:
         with httpx.Client(transport=httpx.HTTPTransport(retries=5)) as client:
             response = client.get(f"http://127.0.0.1:{port}/openapi.json")
         assert response.status_code == 200
+    finally:
+        server.stop()
+        server.join(timeout=10)
+    assert not server.is_alive()
+
+
+def test_https_pairing_and_device_heartbeat(tmp_path: Path) -> None:
+    """局域网 TLS 服务应能配对独立设备令牌并用于认证。"""
+
+    database = Database(tmp_path / "inventory.db")
+    connection = ConnectionManager(database, tmp_path)
+    app = create_api(ApiContext(database, "desktop-token", RecognitionEngine(), connection))
+    server = ApiServer(
+        app,
+        port=0,
+        ssl_certfile=str(connection.cert_path),
+        ssl_keyfile=str(connection.key_path),
+    )
+    server.start()
+    try:
+        port = server._socket.getsockname()[1]
+        with httpx.Client(
+            transport=httpx.HTTPTransport(
+                retries=5, verify=ssl.create_default_context(cafile=connection.ca_path)
+            )
+        ) as client:
+            paired = client.post(
+                f"https://127.0.0.1:{port}/api/v1/pairing",
+                json={
+                    "pairing_code": connection.pairing_payload()["pairing_code"],
+                    "device_name": "Android 测试机",
+                    "device_type": "ANDROID_PHONE",
+                    "client_version": "1.0.0",
+                },
+            )
+            assert paired.status_code == 200
+            assert paired.json()["ca_pem"]
+            heartbeat = client.post(
+                f"https://127.0.0.1:{port}/api/v1/devices/heartbeat",
+                headers={
+                    "Authorization": f"Bearer {paired.json()['device_token']}",
+                    "X-Client-Version": "1.0.5",
+                },
+            )
+            assert heartbeat.status_code == 200
+            assert heartbeat.json()["capabilities"]["api_major"] == 1
+            assert connection.list_devices()[0]["client_version"] == "1.0.5"
+            bearer = f"Bearer {paired.json()['device_token']}"
+            base = f"https://127.0.0.1:{port}/api/v1/sessions"
+            created = client.post(
+                base, headers={"Authorization": bearer, "Idempotency-Key": "start-camera"},
+                json={"kind": "ISSUE", "payload": {"camera_stream": True}},
+            )
+            assert created.status_code == 200
+            session_id = created.json()["session_id"]
+            tls = ssl.create_default_context(cafile=connection.ca_path)
+            protocol = WSConnection(ConnectionType.CLIENT)
+            with (
+                socket.create_connection(("127.0.0.1", port), timeout=5) as tcp,
+                tls.wrap_socket(tcp, server_hostname="127.0.0.1") as ws,
+            ):
+                ws.sendall(protocol.send(UpgradeRequest(
+                    host=f"127.0.0.1:{port}", target=f"/api/v1/sessions/{session_id}/events",
+                    extra_headers=[(b"authorization", bearer.encode())],
+                )))
+
+                def next_snapshot() -> dict[str, object]:
+                    while data := ws.recv(65536):
+                        protocol.receive_data(data)
+                        for event in protocol.events():
+                            if isinstance(event, TextMessage):
+                                return json.loads(event.data)
+                    pytest.fail("WebSocket 未返回会话快照")
+
+                assert next_snapshot()["state"] == "DRAFT"
+                response = client.post(
+                    f"{base}/{session_id}/commands", headers={"Authorization": bearer},
+                    json={"command_id": "close-camera", "expected_revision": 0, "command": "CANCEL"},
+                )
+                assert response.status_code == 200
+                assert next_snapshot()["state"] == "CANCELLED"
     finally:
         server.stop()
         server.join(timeout=10)
@@ -205,3 +293,80 @@ def test_storage_priority_api_round_trip(tmp_path: Path) -> None:
             assert loaded.json()[0]["location_id"] == location.json()["id"]
 
     asyncio.run(scenario())
+
+
+def test_session_api_returns_canonical_response_and_revision_conflict(tmp_path: Path) -> None:
+    """桌面与手机入口共用相同会话响应，并拒绝旧修订覆盖新状态。"""
+
+    async def scenario() -> None:
+        app = application(tmp_path)
+        headers = {
+            "Authorization": "Bearer test-token",
+            "Idempotency-Key": "create-mobile-session",
+        }
+        created = await request(
+            app,
+            "POST",
+            "/api/v1/sessions",
+            headers=headers,
+            json={"kind": "ISSUE", "payload": {"quantity": 1}},
+        )
+        assert created.status_code == 200
+        body = created.json()
+        assert set(body) == {
+            "session_id",
+            "created_by",
+            "revision",
+            "state",
+            "snapshot",
+            "action_result",
+            "warnings",
+            "capabilities",
+        }
+        updated = await request(
+            app,
+            "POST",
+            f"/api/v1/sessions/{body['session_id']}/commands",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "command_id": "mobile-update",
+                "expected_revision": 0,
+                "command": "UPDATE",
+                "payload": {"notes": "手机输入"},
+            },
+        )
+        assert updated.json()["revision"] == 1
+        stale = await request(
+            app,
+            "POST",
+            f"/api/v1/sessions/{body['session_id']}/commands",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "command_id": "desktop-stale",
+                "expected_revision": 0,
+                "command": "UPDATE",
+                "payload": {"notes": "过期输入"},
+            },
+        )
+        assert stale.status_code == 409
+        repeated = await request(
+            app,
+            "POST",
+            f"/api/v1/sessions/{body['session_id']}/commands",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "command_id": "mobile-update",
+                "expected_revision": 0,
+                "command": "UPDATE",
+                "payload": {"notes": "不会覆盖首次结果"},
+            },
+        )
+        assert repeated.json() == updated.json()
+
+    asyncio.run(scenario())
+
+
+def test_capabilities_do_not_require_token(tmp_path: Path) -> None:
+    response = asyncio.run(request(application(tmp_path), "GET", "/api/v1/capabilities"))
+    assert response.status_code == 200
+    assert response.json()["api_major"] == 1

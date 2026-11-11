@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    ORDER_IMPORT_BATCH_SIZE,
     AdjustRequest,
     BomCommitRequest,
     ComponentCreate,
@@ -180,6 +181,9 @@ class Database:
             self._migrate_v8(connection)
             self._migrate_v9(connection)
             self._migrate_v10(connection)
+            self._migrate_v11(connection)
+            self._migrate_v12(connection)
+            self._migrate_v13(connection)
 
     @staticmethod
     def _migrate_v3(connection: sqlite3.Connection) -> None:
@@ -232,6 +236,74 @@ class Database:
                 "ALTER TABLE components ADD COLUMN jlc_matched INTEGER NOT NULL DEFAULT 0"
             )
         connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(10,datetime('now'))")
+
+    @staticmethod
+    def _migrate_v11(connection: sqlite3.Connection) -> None:
+        """增加移动设备、统一会话和 BOM 取货任务持久化结构。"""
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS paired_devices(
+             id TEXT PRIMARY KEY,name TEXT NOT NULL,device_type TEXT NOT NULL,
+             token_hash TEXT NOT NULL UNIQUE,client_version TEXT NOT NULL,
+             created_at TEXT NOT NULL,last_seen_at TEXT,revoked_at TEXT);
+            CREATE TABLE IF NOT EXISTS operation_sessions(
+             id TEXT PRIMARY KEY,kind TEXT NOT NULL,state TEXT NOT NULL,
+             revision INTEGER NOT NULL DEFAULT 0,snapshot_json TEXT NOT NULL,
+             result_json TEXT,created_by TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_commands(
+             session_id TEXT NOT NULL REFERENCES operation_sessions(id),command_id TEXT NOT NULL,
+             response_json TEXT NOT NULL,created_at TEXT NOT NULL,
+             PRIMARY KEY(session_id,command_id));
+            CREATE TABLE IF NOT EXISTS bom_pick_tasks(
+             id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE REFERENCES operation_sessions(id),
+             name TEXT NOT NULL,source_filename TEXT,state TEXT NOT NULL,
+             transaction_group_id TEXT,created_at TEXT NOT NULL,completed_at TEXT);
+            CREATE TABLE IF NOT EXISTS bom_pick_items(
+             id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES bom_pick_tasks(id),
+             row_number INTEGER NOT NULL,mapping_key TEXT,raw_json TEXT NOT NULL,
+             planned_component_id TEXT NOT NULL REFERENCES components(id),
+             required_quantity INTEGER NOT NULL CHECK(required_quantity>0));
+            CREATE TABLE IF NOT EXISTS bom_pick_entries(
+             id TEXT PRIMARY KEY,item_id TEXT NOT NULL REFERENCES bom_pick_items(id),
+             actual_component_id TEXT NOT NULL REFERENCES components(id),
+             location_id TEXT REFERENCES locations(id),batch_id TEXT REFERENCES inventory_batches(id),
+             quantity INTEGER NOT NULL CHECK(quantity>0),method TEXT NOT NULL,
+             substitute_reason TEXT,actor TEXT,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bom_substitution_mappings(
+             id TEXT PRIMARY KEY,mapping_key TEXT NOT NULL,
+             substitute_component_id TEXT NOT NULL REFERENCES components(id),
+             reason TEXT,created_at TEXT NOT NULL,
+             UNIQUE(mapping_key,substitute_component_id));
+            CREATE INDEX IF NOT EXISTS idx_pick_items_task ON bom_pick_items(task_id,row_number);
+            CREATE INDEX IF NOT EXISTS idx_pick_entries_item ON bom_pick_entries(item_id,created_at);
+            INSERT OR IGNORE INTO schema_migrations VALUES(11,datetime('now'));
+            """
+        )
+
+    @staticmethod
+    def _migrate_v12(connection: sqlite3.Connection) -> None:
+        """为 BOM 取货行保存用户指定的具体仓库约束。"""
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(bom_pick_items)").fetchall()
+        }
+        if "preferred_location_id" not in columns:
+            connection.execute(
+                "ALTER TABLE bom_pick_items ADD COLUMN preferred_location_id TEXT "
+                "REFERENCES locations(id)"
+            )
+        connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(12,datetime('now'))")
+
+    @staticmethod
+    def _migrate_v13(connection: sqlite3.Connection) -> None:
+        """记录新流水的确认端，保留原有来源和备注。"""
+
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(inventory_transactions)")}
+        if "operation_platform" not in columns:
+            connection.execute("ALTER TABLE inventory_transactions ADD COLUMN operation_platform TEXT")
+        connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(13,datetime('now'))")
 
     @staticmethod
     def _migrate_v8(connection: sqlite3.Connection) -> None:
@@ -1136,16 +1208,23 @@ class Database:
         """标记订单行将创建、匹配或跳过的状态，不修改数据库。"""
 
         with self.read() as connection:
+            components = {
+                str(row["lcsc_part_number"]): row
+                for row in connection.execute(
+                    "SELECT id,name,lcsc_part_number FROM components "
+                    "WHERE archived_at IS NULL AND lcsc_part_number IS NOT NULL"
+                )
+            }
+            imported_keys = {
+                (str(row["order_number"]), str(row["lcsc_part_number"]))
+                for row in connection.execute(
+                    "SELECT order_number,lcsc_part_number FROM order_import_items"
+                )
+            }
             output = []
             for line in lines:
-                existing = connection.execute(
-                    "SELECT id,name FROM components WHERE lcsc_part_number=?",
-                    (line.lcsc_part_number,),
-                ).fetchone()
-                imported = connection.execute(
-                    "SELECT 1 FROM order_import_items WHERE order_number=? AND lcsc_part_number=?",
-                    (line.order_number, line.lcsc_part_number),
-                ).fetchone()
+                existing = components.get(line.lcsc_part_number)
+                imported = (line.order_number, line.lcsc_part_number) in imported_keys
                 output.append(
                     {
                         "line": line.model_dump(),
@@ -1159,6 +1238,15 @@ class Database:
                     }
                 )
         return output
+
+    def imported_order_keys(self) -> set[tuple[str, str]]:
+        """返回已完成订单导入的幂等键，供同一文件分批续导。"""
+
+        with self.read() as connection:
+            rows = connection.execute(
+                "SELECT order_number,lcsc_part_number FROM order_import_items"
+            ).fetchall()
+        return {(str(row[0]), str(row[1])) for row in rows}
 
     def import_order_lines(
         self,
@@ -1178,6 +1266,12 @@ class Database:
         已有元件的用户资料不会被覆盖，只补齐空字段；价格和购买日期作为最新采购信息
         更新，并在批次中保留当次值。
         """
+
+        if len(lines) > ORDER_IMPORT_BATCH_SIZE:
+            raise DomainError(
+                "VALIDATION_ERROR",
+                f"单次最多导入 {ORDER_IMPORT_BATCH_SIZE} 条；完成后重新上传同一文件继续",
+            )
 
         ### 初始化事务统计信息 ###
         group_id = str(uuid.uuid4())
@@ -1320,8 +1414,8 @@ class Database:
                     lot_id,
                     selected_location,
                     line.quantity,
-                    f"立创订单 {line.order_number}",
                     "离线订单导入",
+                    f"立创订单 {line.order_number}",
                 )
                 connection.execute(
                     """INSERT INTO order_import_items(
@@ -1385,7 +1479,9 @@ class Database:
                 ),
             )
 
-    def receive(self, data: ReceiveRequest, kind: str = "RECEIVE") -> dict[str, Any]:
+    def receive(
+        self, data: ReceiveRequest, kind: str = "RECEIVE", *, platform: str | None = None
+    ) -> dict[str, Any]:
         """创建或复用批次，新增库存批次并记录正向流水。
 
         :param data: 元件、库位、数量、采购信息及可选批次信息
@@ -1440,6 +1536,7 @@ class Database:
                 data.quantity,
                 data.source,
                 data.notes,
+                platform=platform,
             )
             connection.execute(
                 """UPDATE components SET price=COALESCE(?,price),
@@ -1452,7 +1549,36 @@ class Database:
             "batch_id": batch_id,
         }
 
-    def issue(self, data: IssueRequest, kind: str = "ISSUE") -> dict[str, Any]:
+    def last_issue_location(self) -> str | None:
+        """取最近一次明确选择的出库仓库，兼容升级前的库存流水。"""
+
+        with self.read() as connection:
+            preference = connection.execute(
+                "SELECT location_id FROM issue_preferences WHERE id=1"
+            ).fetchone()
+            if preference:
+                return str(preference[0]) if preference[0] is not None else None
+            row = connection.execute(
+                """SELECT location_id FROM inventory_transactions WHERE kind='ISSUE'
+                ORDER BY created_at DESC,rowid DESC LIMIT 1"""
+            ).fetchone()
+            return str(row[0]) if row else None
+
+    def remember_issue_location(self, location_id: str | None) -> None:
+        with self.write() as connection:
+            self._save_issue_location(connection, location_id)
+
+    @staticmethod
+    def _save_issue_location(connection: sqlite3.Connection, location_id: str | None) -> None:
+        connection.execute(
+            """INSERT INTO issue_preferences(id,location_id) VALUES(1,?)
+            ON CONFLICT(id) DO UPDATE SET location_id=excluded.location_id""",
+            (location_id,),
+        )
+
+    def issue(
+        self, data: IssueRequest, kind: str = "ISSUE", *, platform: str | None = None
+    ) -> dict[str, Any]:
         """按接收时间顺序从库存批次扣减数量。
 
         :param data: 元件、可选库位/批次、出库数量和用途说明
@@ -1476,7 +1602,10 @@ class Database:
                 data.notes,
                 kind,
                 data.batch_id,
+                platform=platform,
             )
+            if kind == "ISSUE":
+                self._save_issue_location(connection, data.location_id)
         return {"transaction_group_id": group_id, "affected_transactions": count}
 
     def transfer(self, data: TransferRequest) -> dict[str, Any]:
@@ -1689,7 +1818,9 @@ class Database:
                 )
         return {"transaction_group_id": reversal_group, "affected_transactions": len(rows)}
 
-    def commit_bom(self, data: BomCommitRequest) -> dict[str, Any]:
+    def commit_bom(
+        self, data: BomCommitRequest, *, platform: str | None = None
+    ) -> dict[str, Any]:
         """验证全部 BOM 行后一次性创建 BOM 并扣减库存。
 
         :param data: 用户确认后的 BOM 名称、来源文件和逐行元件选择
@@ -1772,6 +1903,7 @@ class Database:
                     f"BOM: {data.name}",
                     None,
                     "BOM_ISSUE",
+                    platform=platform,
                 )
         return {
             "bom_id": bom_id,
@@ -1854,6 +1986,8 @@ class Database:
         notes: str | None,
         kind: str,
         batch_id: str | None = None,
+        *,
+        platform: str | None = None,
     ) -> int:
         """扣减批次并写入负向流水；调用方必须已经开启写事务。"""
 
@@ -1872,6 +2006,7 @@ class Database:
                 -amount,
                 source,
                 notes,
+                platform=platform,
             )
         return len(used)
 
@@ -1896,13 +2031,15 @@ class Database:
         source: str | None,
         notes: str | None,
         reversal_of: str | None = None,
+        *,
+        platform: str | None = None,
     ) -> None:
         """插入不可变流水；只有冲销记录允许填写 ``reversal_of``。"""
 
         connection.execute(
             """INSERT INTO inventory_transactions(id,group_id,kind,component_id,lot_id,
-            location_id,quantity_delta,source,notes,reversal_of,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            location_id,quantity_delta,source,notes,reversal_of,created_at,operation_platform)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 str(uuid.uuid4()),
                 group_id,
@@ -1915,6 +2052,7 @@ class Database:
                 clean(notes),
                 reversal_of,
                 utc_now(),
+                platform,
             ),
         )
 
@@ -2090,6 +2228,8 @@ CREATE TABLE IF NOT EXISTS idempotency_records(key TEXT PRIMARY KEY,operation TE
 CREATE TABLE IF NOT EXISTS ocr_corrections(id TEXT PRIMARY KEY,field_name TEXT NOT NULL,original_text TEXT NOT NULL,corrected_text TEXT NOT NULL,model_version TEXT NOT NULL,confidence REAL NOT NULL,quality_json TEXT NOT NULL,image_path TEXT,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS web_host_state(host TEXT PRIMARY KEY,last_request_at TEXT,day_key TEXT,day_count INTEGER NOT NULL DEFAULT 0,blocked_until TEXT,robots_text TEXT,robots_expires_at TEXT);
 CREATE TABLE IF NOT EXISTS web_page_cache(url TEXT PRIMARY KEY,metadata_json TEXT NOT NULL,expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS issue_preferences(
+ id INTEGER PRIMARY KEY CHECK(id=1), location_id TEXT REFERENCES locations(id) ON DELETE SET NULL);
 CREATE TABLE IF NOT EXISTS order_import_items(
  order_number TEXT NOT NULL,lcsc_part_number TEXT NOT NULL,
  component_id TEXT NOT NULL REFERENCES components(id),transaction_group_id TEXT NOT NULL,

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 from zipfile import BadZipFile, ZipFile
@@ -19,6 +20,7 @@ from .models import MosfetDetails, OrderImportLine, ResistorDetails
 
 MAX_FILES = 500
 MAX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
+MAX_ORDER_FILE_ITEMS = 10_000
 ORDER_NUMBER = re.compile(r"SO\d{8,16}")
 ORDER_DATE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 LCSC_NUMBER = re.compile(r"C\d{4,10}", re.IGNORECASE)
@@ -128,10 +130,16 @@ def _category_details(
     return None, None
 
 
-def parse_saved_orders(path: Path) -> list[OrderImportLine]:
+def parse_saved_orders(
+    path: Path,
+    progress: Callable[[str], None] | None = None,
+    warning: Callable[[str], None] | None = None,
+) -> list[OrderImportLine]:
     """解析用户保存的静态订单页面并返回去重后的商品行。
 
     :param path: 本地 ZIP、HTML 或 MHTML 订单文件路径
+    :param progress: 可选的线程安全进度回调，内容只包含订单日期和当前元件
+    :param warning: 可选警告回调，用于报告静态文件中不存在的折叠商品
     :return: 可供用户预览和确认的订单商品行列表
     :raises DomainError: 文件不安全、格式损坏或没有可识别商品时抛出
 
@@ -141,8 +149,17 @@ def parse_saved_orders(path: Path) -> list[OrderImportLine]:
 
     ### 安全读取并构建静态 DOM ###
     soup = BeautifulSoup(_read_html(path), "html.parser")
+    collapsed_orders = soup.find_all(
+        string=lambda value: value and "查看全部商品" in value.strip()
+    )
+    if collapsed_orders and warning:
+        warning(
+            f"检测到 {len(collapsed_orders)} 个未展开订单；保存文件只包含网页已加载商品，"
+            "额外商品需要在网页展开后重新保存"
+        )
     output: list[OrderImportLine] = []
     seen: set[tuple[str, str]] = set()
+    last_progress = ""
     ### 定位订单容器并提取商品行 ###
     for label in soup.find_all(string=lambda value: value and value.strip() == "订单编号："):
         header = label.parent.find_parent("section") if label.parent else None
@@ -183,6 +200,16 @@ def parse_saved_orders(path: Path) -> list[OrderImportLine]:
             link = next(
                 (anchor.get("href") for anchor in product.find_all("a") if anchor.get("href")), None
             )
+            if len(output) >= MAX_ORDER_FILE_ITEMS:
+                raise DomainError(
+                    "VALIDATION_ERROR",
+                    f"订单文件超过 {MAX_ORDER_FILE_ITEMS} 条安全上限，请拆分保存订单页面",
+                )
+            last_progress = (
+                f"{date_match.group(0)[:10]} · {model or lcsc} · 已解析 {len(output) + 1} 条"
+            )
+            if progress and (not output or (len(output) + 1) % 25 == 0):
+                progress(last_progress)
             output.append(
                 OrderImportLine(
                     order_number=order_number,
@@ -206,4 +233,6 @@ def parse_saved_orders(path: Path) -> list[OrderImportLine]:
     ### 确认至少得到一条可导入记录 ###
     if not output:
         raise DomainError("VALIDATION_ERROR", "页面中没有找到可导入的订单商品")
+    if progress and last_progress:
+        progress(last_progress)
     return output

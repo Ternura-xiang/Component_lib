@@ -3,6 +3,7 @@ Type=Application
 Name=元件库
 Comment=本地电子元件库存与袋贴文字识别
 Exec=component-library
+Icon=component-library
 Terminal=false
 Categories=Utility;Engineering;
 

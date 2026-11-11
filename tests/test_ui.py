@@ -3,12 +3,23 @@
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtWidgets import QDialog, QLabel, QLineEdit, QMessageBox, QPushButton
+from PySide6.QtWidgets import (
+    QDialog,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QToolButton,
+)
 from test_jlc_product import PRODUCT_HTML
 
+import component_library.ui.main_window as main_window_module
+from component_library import __version__
+from component_library.connection import ConnectionManager
 from component_library.database import Database
 from component_library.jlc_product import parse_jlc_product_page
 from component_library.models import (
+    BomInputRow,
     ComponentCreate,
     JlcParameter,
     JlcParameterGroup,
@@ -25,6 +36,7 @@ from component_library.ui.main_window import (
     InlineEditor,
     MainWindow,
     WheelSafeComboBox,
+    default_debug_mode,
 )
 
 
@@ -39,7 +51,7 @@ def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
     assert "QGroupBox::indicator" in window.styleSheet()
     assert "border: 2px solid #111111" in window.styleSheet()
     assert "checkmark.svg" in window.styleSheet()
-    assert window.stack.count() == 10
+    assert window.stack.count() == 11
     assert [window.navigation.item(index).text() for index in range(window.navigation.count())] == [
         "元件库存",
         "入库",
@@ -66,6 +78,15 @@ def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
     assert window.navigation.currentRow() == 2
     window.bom_page.back_requested.emit()
     assert window.stack.currentWidget() is window.issue_page
+
+
+def test_debug_default_differs_between_source_and_packaged(monkeypatch: Any) -> None:
+    """源码便于诊断而默认开启，打包程序首次运行默认关闭。"""
+
+    monkeypatch.delattr("sys.frozen", raising=False)
+    assert default_debug_mode() is True
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    assert default_debug_mode() is False
 
 
 def test_leaving_receive_scan_stops_camera(
@@ -97,14 +118,120 @@ def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
     assert [
         window.settings_page.tabs.tabText(index)
         for index in range(window.settings_page.tabs.count())
-    ] == ["连接信息", "备份与恢复", "关于"]
+    ] == ["连接信息", "备份与恢复", "调试", "关于"]
     about_labels = {
-        label.text() for label in window.settings_page.tabs.widget(2).findChildren(QLabel)
+        label.text() for label in window.settings_page.tabs.widget(3).findChildren(QLabel)
     }
     assert "Ternura_xiang" in about_labels
-    assert "0.9.0" in about_labels
+    assert __version__ in about_labels
     assert "第三方许可" not in about_labels
     assert isinstance(window.receive_page.category, WheelSafeComboBox)
+
+
+def test_online_android_appears_as_camera_and_bom_rows_are_optional(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    """在线手机应进入摄像头列表；BOM 行可取消并按仓库计算红色缺料。"""
+
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="测试电阻", category="电阻"))
+    position = database.create_warehouse(WarehouseCreate(name="主柜"))
+    location = database.create_location(
+        LocationCreate(warehouse_id=position["id"], name="A01")
+    )
+    database.receive(
+        ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=2)
+    )
+    connection = ConnectionManager(database, tmp_path)
+    code = connection.pairing_payload()["pairing_code"]
+    paired = connection.pair(str(code), "测试手机", "ANDROID_PHONE", "1.0.3")
+    connection.authenticate(paired["device_token"])
+    window = MainWindow(database, RecognitionEngine(), "token", connection)
+    qtbot.addWidget(window)
+    window.issue_page._refresh_camera_choices()
+    assert any(
+        "安卓 · 测试手机" in window.issue_page.camera_choice.itemText(index)
+        for index in range(window.issue_page.camera_choice.count())
+    )
+    remote = window.sessions.create(
+        "ISSUE",
+        {"camera_only": True, "target_device_id": paired["device_id"], "quantity": 1},
+        "desktop",
+    )
+    window.issue_page._refresh_camera_choices()
+    selector = window.issue_page.camera_choice
+    busy_index = next(i for i in range(selector.count()) if "正在出库" in selector.itemText(i))
+    assert not selector.model().flags(selector.model().index(busy_index, 0)) & main_window_module.Qt.ItemFlag.ItemIsEnabled
+    window._show_main_page(2)
+    window.issue_page.remote_session_id = remote["session_id"]
+    window._show_main_page(0)
+    assert window.sessions.get(remote["session_id"])["state"] == "CANCELLED"
+
+    row = BomInputRow(row_number=1, name="测试电阻", quantity=3, raw_fields={})
+    window.bom_page._parsed(([row],))
+    window.bom_page._candidate_changed(0, component["id"])
+    assert window.bom_page.table.cellWidget(0, 0).isChecked()
+    assert window.bom_page.table.item(0, 9).text() == "1"
+    assert window.bom_page.table.item(0, 9).background().color().name() == "#ffd6d6"
+    assert window.bom_page.preview[0]["location_id"] is None
+    assert "主柜 / A01" in window.bom_page.table.item(0, 6).text()
+    window.bom_page.location.setCurrentIndex(
+        window.bom_page.location.findData(location["id"])
+    )
+    window.bom_page._apply_overall_location()
+    assert window.bom_page.preview[0]["location_id"] == location["id"]
+    window.bom_page.table.cellWidget(0, 0).setChecked(False)
+    assert window.bom_page.commit.isEnabled() is False
+
+
+def test_bom_typed_candidate_and_project_name_reach_transaction(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(
+        name="测试电阻", package="0603", manufacturer_part_number="PART-101",
+    ))
+    position = database.create_warehouse(WarehouseCreate(name="主柜"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    database.receive(ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=2))
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    page = window.bom_page
+    window._show_subpage(page)
+    window.show()
+    monkeypatch.setattr(page, "show_info", lambda _message: None)
+    page.source = tmp_path / "BOM_控制板.csv"
+    page._parsed(([BomInputRow(row_number=1, name="未知物料", quantity=1, raw_fields={})],))
+    selector = page.table.cellWidget(0, 4)
+    editor = selector.lineEdit()
+    editor.selectAll()
+    qtbot.keyClicks(editor, "PART-101")
+    assert editor.text() == "PART-101"
+    assert selector.count() == 1
+    completer = selector.completer()
+    popup = completer.popup()
+    index = popup.model().index(0, 0)
+    assert index.isValid()
+    qtbot.mouseClick(popup.viewport(), main_window_module.Qt.MouseButton.LeftButton,
+                     pos=popup.visualRect(index).center())
+    assert page.preview[0]["selected_component_id"] == component["id"]
+    assert page.table.item(0, 2).text() == "0603"
+    assert not page.commit.isEnabled()
+    warehouse = page.table.cellWidget(0, 5)
+    warehouse.setCurrentIndex(warehouse.findData(location["id"]))
+    assert page.commit.isEnabled()
+
+    with qtbot.waitSignal(page.open_pick) as opened:
+        page.commit_bom()
+    session_id = opened.args[0]
+    snapshot = window.sessions.get(session_id)["snapshot"]
+    assert snapshot["name"] == "控制板"
+    item_id = snapshot["groups"][0]["items"][0]["id"]
+    window.sessions.command(session_id, "pick", 0, "CHECK_ITEM", {"item_id": item_id}, "phone")
+    window.sessions.command(session_id, "submit", 1, "COMMIT", {}, "phone")
+    window.transactions_page.refresh()
+    assert window.transactions_page.table.item(0, 3).text() == "控制板"
+    assert window.transactions_page.table.item(0, 6).text() == "安卓BOM 出库"
 
 
 def test_batch_code_scan_dialog_accepts_only_custom_code(qtbot: Any) -> None:
@@ -190,7 +317,7 @@ def test_issue_scan_prefills_batch_without_immediate_mutation(
     issue = window.issue_page
     assert issue.resolve_scan("CL0000000099")
     assert not issue.scan_result.isHidden()
-    assert issue.scan_quantity.value() == 7
+    assert issue.scan_quantity.value() == 1
     assert "识别成功" in issue.scan_status.text()
     assert "主柜 / B04：7" in issue.scan_stock_info.text()
     assert database.resolve_batch_code("CL0000000099")["remaining_quantity"] == 7
@@ -205,6 +332,33 @@ def test_issue_scan_prefills_batch_without_immediate_mutation(
     assert issue.scan_text.text() == ""
     assert not issue.scan_quantity.isEnabled()
     assert not issue.scan_confirm.isEnabled()
+
+
+def test_phone_scan_opens_desktop_issue_and_synchronizes_confirmation(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="手机扫码元件"))
+    position = database.create_warehouse(WarehouseCreate(name="主柜"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    database.receive(ReceiveRequest(
+        component_id=component["id"], location_id=location["id"], quantity=5, batch_code="CL0000000103",
+    ))
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    session_id = window.sessions.create("ISSUE", {"camera_stream": True}, "phone")["session_id"]
+    window.sessions.command(session_id, "scan", 0, "SCAN_CODE", {"raw_text": "CL0000000103"}, "phone")
+    window._follow_mobile_inventory()
+    assert window.stack.currentWidget() is window.issue_page
+    assert window.issue_page.scan_quantity.value() == 1
+    assert not window.issue_page.camera_choice.isEnabled()
+    window.sessions.command(session_id, "confirm", 1, "UPDATE_AND_CONFIRM", {"quantity": 2}, "phone")
+    window.issue_page._poll_remote_camera()
+    assert "出库成功" in window.issue_page.scan_status.text()
+    assert window.transactions_page.table.item(0, 6).text() == "安卓扫码出库"
+    assert database.resolve_batch_code("CL0000000103")["remaining_quantity"] == 3
+    window._show_main_page(0)
+    assert window.sessions.get(session_id)["state"] == "CANCELLED"
 
 
 def test_issue_scan_missing_batch_stays_visible_without_mutating_stock(
@@ -471,8 +625,158 @@ def test_batch_merge_supports_component_and_field_selection(qtbot: Any) -> None:
     qtbot.addWidget(dialog)
     result = dialog.result_data()["component-1"]
     assert result.brand == draft.brand
+    assert dialog.table.horizontalHeaderItem(0).text() == "元件 / 字段"
+    assert all(
+        dialog.table.isRowHidden(row)
+        for row in range(*dialog.ranges["component-1"])
+    )
     dialog.masters["component-1"].setChecked(False)
     assert dialog.result_data() == {}
+
+
+def test_order_preview_never_imports_without_explicit_confirmation(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """解析、折叠和资料预览都不得写库存，确认后已导入行应自动排除。"""
+
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    page = window.order_page
+    page._show_preview(
+        [
+            OrderImportLine(
+                order_number="SO26111000001",
+                purchased_at="2026-11-10 12:00:00",
+                lcsc_part_number="C7654321",
+                name="SAFE-PREVIEW",
+                quantity=2,
+                unit_price=0.1,
+            )
+        ]
+    )
+    assert database.list_components() == []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+    page.commit()
+    assert database.list_components() == []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(page, "show_info", lambda _message: None)
+    page.commit()
+    assert len(database.list_components()) == 1
+    assert page.table.rowCount() == 0
+    assert "均已导入" in page.parse_progress.text()
+
+
+def test_reupload_same_order_file_continues_next_batch(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """完成当前批次后，重新上传同一行集合只显示尚未导入部分。"""
+
+    monkeypatch.setattr(main_window_module, "ORDER_IMPORT_BATCH_SIZE", 2)
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    page = window.order_page
+    lines = [
+        OrderImportLine(
+            order_number=f"SO261110000{index}",
+            purchased_at="2026-11-10 12:00:00",
+            lcsc_part_number=f"C765432{index}",
+            name=f"续导元件{index}",
+            quantity=1,
+            unit_price=0.1,
+        )
+        for index in (1, 2, 3)
+    ]
+    page._show_preview(lines)
+    assert page.table.rowCount() == 2
+    assert "另有 1 条" in page.parse_progress.text()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(page, "show_info", lambda _message: None)
+    page.commit()
+    page._show_preview(lines)
+    assert page.table.rowCount() == 1
+    assert page.lines[0].name == "续导元件3"
+
+
+def test_transactions_merge_group_and_expand_details(qtbot: Any, tmp_path: Path) -> None:
+    """同一原子操作只显示一条摘要，展开后仍可查看原始流水。"""
+
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    first = database.create_component(ComponentCreate(name="元件一"))
+    database.receive(ReceiveRequest(component_id=first["id"], location_id=location["id"], quantity=1))
+    # BOM/订单等批量操作共用 group_id；这里直接通过订单导入构造一组两条流水。
+    lines = [
+        OrderImportLine(
+            order_number="SO26111000002",
+            purchased_at="2026-11-10 12:00:00",
+            lcsc_part_number=f"C900000{index}",
+            name=f"批量元件{index}",
+            quantity=index,
+            unit_price=0.1,
+        )
+        for index in (1, 2)
+    ]
+    database.import_order_lines(lines, location["id"])
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    table = window.transactions_page.table
+    # 两个事务组：一条普通入库摘要 + 一组订单摘要和其两条隐藏详情。
+    assert table.rowCount() == 4
+    grouped_summary = next(
+        row
+        for row in range(table.rowCount())
+        if isinstance(table.cellWidget(row, 0), QToolButton)
+        and not table.cellWidget(row, 0).isHidden()
+    )
+    assert "展开" not in table.item(grouped_summary, 3).text()
+    assert table.item(grouped_summary, 6).text() == "离线订单导入"
+    assert "SO26111000002" in table.item(grouped_summary, 7).text()
+    toggle = table.cellWidget(grouped_summary, 0)
+    assert isinstance(toggle, QToolButton)
+    assert table.isRowHidden(grouped_summary + 1)
+    toggle.setChecked(True)
+    assert not table.isRowHidden(grouped_summary + 1)
+    single_summary = next(
+        row for row in range(table.rowCount()) if table.item(row, 3).text() == "元件一"
+    )
+    assert table.cellWidget(single_summary, 0) is None
+
+
+def test_frame_counts_only_appear_in_debug_mode(qtbot: Any, tmp_path: Path) -> None:
+    window = MainWindow(Database(tmp_path / "inventory.db"), RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    issue = window.issue_page
+    issue.scan_received_frames = 12
+    issue.scan_attempts = 3
+    issue.set_debug_mode(False)
+    issue._barcode_decoded(None)
+    assert "帧" not in issue.scan_status.text()
+    issue.set_debug_mode(True)
+    issue._barcode_decoded(None)
+    assert "12 帧" in issue.scan_status.text()
+    window.settings_page.refresh_debug_output()
+    output = window.settings_page.debug_output.toPlainText()
+    assert f"版本: {__version__}" in output
+    assert "线程池活动数" in output
 
 
 def test_inline_cell_editing_saves_on_finish(qtbot: Any, tmp_path: Path) -> None:

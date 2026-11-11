@@ -21,6 +21,7 @@
 - 所有来源数据要先可视化预览，用户确认后才提交；对可能丢失数据的操作提供错误提示。
 - 扫描页面负责停止与释放摄像头，避免关闭窗口后设备仍被占用。
 - 复选框视觉由全局 Qt Style Sheet 统一；修改资源路径后必须同时验证源码运行和 PyInstaller 产物。
+- 设置页的调试模式使用 `QSettings` 保存。源码运行首次默认开启，PyInstaller 打包版本首次默认关闭；帧计数等诊断不得在关闭调试时混入正常识别状态。
 
 ## 运行环境
 
@@ -31,13 +32,15 @@ Python 要求 `>=3.12,<3.13`。Linux 需要 Qt Multimedia/GStreamer、Qt WebEngi
 项目提供 `packaging/component-library.spec`、`packaging/entry.py`、Windows Inno Setup 脚本及 Linux 桌面入口。PyInstaller 构建命令：
 
 ```bash
-uv sync --extra dev
+uv sync --locked --extra dev
 uv run python tools/build.py
 ```
 
 产物默认位于 `dist/component-library/`。构建目标是**当前宿主平台**的 onedir 产物，不能假定在 Linux 一次构建就得到 Windows 安装程序。发布前检查 OCR 模型、Qt Multimedia/WebEngine、`component_library/assets` 静态资源、启动与退出流程，并在目标系统实际执行一次扫码/导入/备份冒烟测试。
 
 Windows 构建完成后运行 `uv run python tools/smoke_windows.py`，检查真实无控制台 exe 的启动、认证 API 和离线模型校验。脚本使用临时 APPDATA 与 offscreen Qt 平台，结束后回收进程；运行前须关闭占用 17635 端口的实例。此测试不覆盖摄像头及 WebEngine 交互。
+
+桌面和安卓共享 `packaging/assets/icons/component-library.png`。Windows 构建会生成安装器使用的 ICO，安卓构建会把同一 PNG 放入 APK 资源。参见[安卓构建说明](../../android/README.md)。
 
 桌面 API 使用应用统一配置的文件日志（Uvicorn 的 `log_config=None`）。不要恢复默认控制台日志配置：Windows `console=False` 产物的 `sys.stdout` / `sys.stderr` 为 `None`，默认 formatter 会使程序启动失败。
 

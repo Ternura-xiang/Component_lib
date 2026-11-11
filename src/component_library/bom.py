@@ -14,6 +14,15 @@ from typing import Any
 from .database import Database, DomainError
 from .models import BomInputRow
 
+
+def bom_project_name(path: Path) -> str:
+    """从文件名提取项目名称，去除独立的 BOM 前后缀。"""
+
+    stem = path.stem.strip()
+    name = re.sub(r"^BOM[\s_\-–—]+|[\s_\-–—]+BOM$", "", stem, flags=re.IGNORECASE)
+    return name.strip() or "BOM 出库"
+
+
 ALIASES = {
     "名称": "name", "元件名称": "name", "name": "name", "comment": "name", "元件": "name",
     "value": "specification", "规格": "specification", "specification": "specification",

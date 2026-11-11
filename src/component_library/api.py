@@ -6,13 +6,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -29,14 +41,22 @@ from .models import (
     IssueRequest,
     LocationCreate,
     OrderImportLine,
+    PairDeviceRequest,
     ReceiveRequest,
+    SessionCommandRequest,
+    SessionCreateRequest,
     TransferRequest,
     WarehouseCreate,
 )
 from .order_import import parse_saved_orders
 from .recognition import RecognitionEngine
+from .sessions import API_CAPABILITIES, SessionService
 from .web_sources import PublicWebEnricher
 
+if TYPE_CHECKING:
+    from .connection import ConnectionManager
+
+logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
@@ -102,7 +122,14 @@ class WebPreviewRequest(BaseModel):
 class ApiContext:
     """API 路由共享依赖。"""
 
-    def __init__(self, database: Database, token: str, recognition: RecognitionEngine) -> None:
+    def __init__(
+        self,
+        database: Database,
+        token: str,
+        recognition: RecognitionEngine,
+        connection: ConnectionManager | None = None,
+        sessions: SessionService | None = None,
+    ) -> None:
         """保存共享服务并创建写操作锁。
 
         ``token`` 只在内存中用于 Bearer 校验；``recognition`` 延迟加载模型，构造
@@ -112,6 +139,8 @@ class ApiContext:
         self.database = database
         self.token = token
         self.recognition = recognition
+        self.connection = connection
+        self.sessions = sessions or SessionService(database)
         self.web = PublicWebEnricher(database)
         self._mutation_lock = threading.RLock()
 
@@ -170,21 +199,32 @@ def create_api(context: ApiContext) -> FastAPI:
             404
             if error.code == "NOT_FOUND"
             else 409
-            if error.code in {"CONFLICT", "INSUFFICIENT_STOCK"}
+            if error.code in {"CONFLICT", "INSUFFICIENT_STOCK", "REVISION_CONFLICT"}
             else 400
         )
         return JSONResponse(
             status_code=status, content={"error": {"code": error.code, "message": error.message}}
         )
 
-    async def auth(authorization: str | None = Header(default=None)) -> None:
+    async def auth(authorization: str | None = Header(default=None)) -> str:
         """校验本机 API 的 Bearer 令牌；失败时立即终止依赖链。"""
 
-        if authorization != f"Bearer {context.token}":
+        supplied = authorization.removeprefix("Bearer ").strip() if authorization else ""
+        if supplied == context.token:
+            return "desktop"
+        device_id = context.connection.authenticate(supplied) if context.connection and supplied else None
+        if not device_id:
             raise HTTPException(
                 status_code=401,
                 detail={"error": {"code": "UNAUTHORIZED", "message": "API 令牌无效"}},
             )
+        return device_id
+
+    async def admin(authorization: str | None = Header(default=None)) -> None:
+        """设备管理只接受桌面本机令牌。"""
+
+        if authorization != f"Bearer {context.token}":
+            raise HTTPException(status_code=401, detail="需要桌面管理员令牌")
 
     async def key(
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -205,6 +245,148 @@ def create_api(context: ApiContext) -> FastAPI:
             "version": __version__,
             "ocr": context.recognition.status(),
         }
+
+    @app.get("/api/v1/capabilities")
+    async def capabilities() -> dict[str, Any]:
+        """返回同主版本能力协商声明。"""
+
+        return API_CAPABILITIES
+
+    @app.post("/api/v1/pairing")
+    async def pair_device(data: PairDeviceRequest) -> dict[str, Any]:
+        """使用一次性配对码换取设备令牌。"""
+
+        if context.connection is None:
+            raise DomainError("NOT_FOUND", "局域网连接模块未启用")
+        return context.connection.pair(
+            data.pairing_code, data.device_name, data.device_type, data.client_version
+        )
+
+    @app.get("/api/v1/devices", dependencies=[Depends(admin)])
+    async def devices() -> list[dict[str, Any]]:
+        return context.connection.list_devices() if context.connection else []
+
+    @app.delete("/api/v1/devices/{device_id}", dependencies=[Depends(admin)])
+    async def delete_device(device_id: str) -> dict[str, bool]:
+        if context.connection is None:
+            raise DomainError("NOT_FOUND", "局域网连接模块未启用")
+        context.connection.delete(device_id)
+        return {"deleted": True}
+
+    @app.post("/api/v1/devices/heartbeat")
+    async def heartbeat(
+        actor: str = Depends(auth), x_client_version: str | None = Header(default=None),
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        if actor != "desktop" and context.connection and x_client_version:
+            context.connection.update_client_version(actor, x_client_version)
+        if actor != "desktop":
+            context.sessions.report_device_activity(actor, x_session_id)
+        return {"status": "ok", "actor": actor, "capabilities": API_CAPABILITIES}
+
+    def can_access_session(session: dict[str, Any], actor: str) -> bool:
+        snapshot = session["snapshot"]
+        if actor == "desktop" or snapshot["kind"] == "BOM_PICK":
+            return True
+        target = snapshot["form"].get("target_device_id")
+        return (target or session["created_by"]) == actor or (
+            not target and session["created_by"] == "desktop"
+        )
+
+    def authorized_session(session_id: str, actor: str) -> dict[str, Any]:
+        session = context.sessions.get(session_id)
+        if not can_access_session(session, actor):
+            raise DomainError("NOT_FOUND", "操作会话不存在")
+        return session
+
+    @app.get("/api/v1/sessions")
+    async def active_sessions(actor: str = Depends(auth)) -> list[dict[str, Any]]:
+        return [s for s in context.sessions.list_active() if can_access_session(s, actor)]
+
+    @app.post("/api/v1/sessions")
+    async def create_session(
+        data: SessionCreateRequest, actor: str = Depends(auth), request_key: str = Depends(key)
+    ) -> dict[str, Any]:
+        return context.mutate(
+            request_key,
+            "create_session",
+            lambda: context.sessions.create(data.kind, data.payload, actor),
+        )
+
+    @app.get("/api/v1/sessions/{session_id}")
+    async def session_snapshot(session_id: str, actor: str = Depends(auth)) -> dict[str, Any]:
+        return authorized_session(session_id, actor)
+
+    @app.post("/api/v1/sessions/{session_id}/commands")
+    async def session_command(
+        session_id: str, data: SessionCommandRequest, actor: str = Depends(auth)
+    ) -> dict[str, Any]:
+        authorized_session(session_id, actor)
+        return context.sessions.command(
+            session_id,
+            data.command_id,
+            data.expected_revision,
+            data.command,
+            data.payload,
+            actor,
+        )
+
+    @app.post("/api/v1/sessions/{session_id}/image")
+    async def session_image(
+        session_id: str, file: UploadFile = File(...), actor: str = Depends(auth)
+    ) -> dict[str, Any]:
+        import anyio
+
+        authorized_session(session_id, actor)
+        image_bytes = await file.read()
+        started_at = time.perf_counter()
+        draft_model = await anyio.to_thread.run_sync(context.recognition.analyze, image_bytes)
+        logger.info(
+            "Android image OCR completed: session=%s bytes=%d duration_ms=%d",
+            session_id,
+            len(image_bytes),
+            round((time.perf_counter() - started_at) * 1000),
+        )
+        draft = draft_model.model_dump(
+            exclude={"annotated_image_png"}
+        )
+        return context.sessions.apply_recognition(session_id, draft)
+
+    @app.websocket("/api/v1/sessions/{session_id}/events")
+    async def session_events(websocket: WebSocket, session_id: str, token: str = "") -> None:
+        """修订变化时推送快照，并用周期快照保持移动网络连接存活。"""
+
+        import anyio
+
+        authorization = websocket.headers.get("authorization", "")
+        token = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else token
+        actor = "desktop" if token == context.token else (
+            context.connection.authenticate(token) if context.connection else None
+        )
+        if not actor:
+            await websocket.close(code=4401)
+            return
+        try:
+            authorized_session(session_id, actor)
+        except DomainError:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        revision = -1
+        last_sent = 0.0
+        try:
+            while True:
+                current = context.sessions.get(session_id)
+                now = time.monotonic()
+                if current["revision"] != revision or now - last_sent >= 10:
+                    revision = current["revision"]
+                    await websocket.send_json(current)
+                    last_sent = now
+                with anyio.move_on_after(0.35):
+                    if (await websocket.receive())["type"] == "websocket.disconnect":
+                        return
+        except (WebSocketDisconnect, OSError, RuntimeError):
+            return
 
     @app.get("/api/v1/components", dependencies=[Depends(auth)])
     async def components(q: str = Query(default="")) -> list[dict[str, Any]]:
@@ -360,17 +542,27 @@ def create_api(context: ApiContext) -> FastAPI:
 
         return context.database.inventory_statistics()
 
-    @app.post("/api/v1/inventory/receive", dependencies=[Depends(auth)])
-    async def receive(data: ReceiveRequest, request_key: str = Depends(key)) -> dict[str, Any]:
+    @app.post("/api/v1/inventory/receive")
+    async def receive(
+        data: ReceiveRequest, request_key: str = Depends(key), actor: str = Depends(auth)
+    ) -> dict[str, Any]:
         """执行入库事务；数量必须为正，成功后返回事务组信息。"""
 
-        return context.mutate(request_key, "receive", lambda: context.database.receive(data))
+        return context.mutate(
+            request_key, "receive",
+            lambda: context.database.receive(data, platform="PC" if actor == "desktop" else "安卓"),
+        )
 
-    @app.post("/api/v1/inventory/issue", dependencies=[Depends(auth)])
-    async def issue(data: IssueRequest, request_key: str = Depends(key)) -> dict[str, Any]:
+    @app.post("/api/v1/inventory/issue")
+    async def issue(
+        data: IssueRequest, request_key: str = Depends(key), actor: str = Depends(auth)
+    ) -> dict[str, Any]:
         """按数据库层的批次策略扣减库存；库存不足时整个事务回滚。"""
 
-        return context.mutate(request_key, "issue", lambda: context.database.issue(data))
+        return context.mutate(
+            request_key, "issue",
+            lambda: context.database.issue(data, platform="PC" if actor == "desktop" else "安卓"),
+        )
 
     @app.post("/api/v1/inventory/batches/resolve", dependencies=[Depends(auth)])
     async def resolve_batch(data: TextParseRequest) -> dict[str, Any]:
@@ -439,11 +631,16 @@ def create_api(context: ApiContext) -> FastAPI:
         finally:
             temporary.unlink(missing_ok=True)
 
-    @app.post("/api/v1/bom/commit", dependencies=[Depends(auth)])
-    async def bom_commit(data: BomCommitRequest, request_key: str = Depends(key)) -> dict[str, Any]:
+    @app.post("/api/v1/bom/commit")
+    async def bom_commit(
+        data: BomCommitRequest, request_key: str = Depends(key), actor: str = Depends(auth)
+    ) -> dict[str, Any]:
         """提交用户确认后的 BOM 领料方案，并原子扣减相关批次库存。"""
 
-        return context.mutate(request_key, "bom_commit", lambda: context.database.commit_bom(data))
+        return context.mutate(
+            request_key, "bom_commit",
+            lambda: context.database.commit_bom(data, platform="PC" if actor == "desktop" else "安卓"),
+        )
 
     @app.post("/api/v1/order-import/preview", dependencies=[Depends(auth)])
     async def order_import_preview(file: UploadFile = File(...)) -> dict[str, Any]:
@@ -569,7 +766,14 @@ class ApiServer(threading.Thread):
     的竞态窗口。
     """
 
-    def __init__(self, app: FastAPI, host: str = "127.0.0.1", port: int = 17635) -> None:
+    def __init__(
+        self,
+        app: FastAPI,
+        host: str = "127.0.0.1",
+        port: int = 17635,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
+    ) -> None:
         """预绑定 ``host:port`` 并构造后台服务器。
 
         默认只监听回环地址；调用方若改为非回环地址，必须自行评估令牌保管、主机
@@ -597,6 +801,9 @@ class ApiServer(threading.Thread):
                 log_level="warning",
                 access_log=False,
                 log_config=None,
+                ws="wsproto",
+                ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
             )
         )
 

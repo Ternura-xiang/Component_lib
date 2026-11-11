@@ -5,11 +5,20 @@ from PyInstaller.compat import is_win
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 root = Path(SPECPATH).parent
+icon_png = root / "packaging" / "assets" / "icons" / "component-library.png"
+icon_ico = None
+if is_win:
+    from PIL import Image
+
+    icon_ico = Path(WORKPATH) / "component-library.ico"
+    with Image.open(icon_png) as icon:
+        icon.save(icon_ico, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
 
 rapidocr_datas, rapidocr_binaries, rapidocr_hidden = collect_all("rapidocr")
 app_datas = collect_data_files("component_library") + [
     (str(root / "LICENSE"), "."),
     (str(root / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(icon_png), "component_library/assets"),
 ]
 
 a = Analysis(
@@ -22,6 +31,7 @@ a = Analysis(
         "uvicorn.logging",
         "uvicorn.loops.auto",
         "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.websockets.wsproto_impl",
         "PySide6.QtWebEngineCore",
         "PySide6.QtWebEngineWidgets",
     ],
@@ -40,6 +50,7 @@ exe = EXE(
     exclude_binaries=True,
     name="component-library",
     console=False,
+    icon=str(icon_ico) if icon_ico else None,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="component-library")
 

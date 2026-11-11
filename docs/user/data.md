@@ -9,7 +9,7 @@
 | Windows | `%APPDATA%\local.component-library.app` |
 | Linux | `$XDG_DATA_HOME/local.component-library.app`，未设置时为 `~/.local/share/local.component-library.app` |
 
-目录中可能包含数据库、API 令牌、日志及应用辅助数据。程序日志保存在 `logs/component-library.log`（轮换文件）。除用户主动选择单个公开商品页的元数据预览外，库存及识别流程以本机处理为主。
+目录中包含库存数据库、API 令牌和轮换日志 `logs/component-library.log`。局域网证书及私钥存放在 `connection/`，请勿分享。安卓会把操作命令和入库照片发送至已配对电脑，库存和 OCR 均在电脑处理。
 
 ## 创建备份
 
@@ -25,6 +25,7 @@
 | --- | --- |
 | 程序提示已运行 | 检查是否有另一实例；应用使用单实例锁 |
 | 端口 `17635` 被占用 | 关闭占用该端口的程序后重启；程序需要启动本机 API |
+| 安卓无法连接电脑 | 确认两端处于同一局域网，检查桌面防火墙是否允许局域网访问 HTTPS 端口 `17636`，再检查配对状态 |
 | 摄像头打不开 | 检查权限、Qt Multimedia/GStreamer；可暂用照片导入 |
 | OCR 不可用 | 检查随包模型是否存在及模型状态，参考 [识别文档](../developer/recognition.md) |
 | 订单无法解析 | 确认是已保存的受支持文件、内容完整且格式未变化 |

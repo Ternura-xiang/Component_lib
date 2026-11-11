@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -355,13 +356,13 @@ class JlcMergeDialog(QDialog):
             warning.setStyleSheet("color: #a15c00;")
             warning.setWordWrap(True)
             layout.addWidget(warning)
-        layout.addWidget(QLabel("商城资料默认全部应用；如需保留现有值，请取消勾选对应字段。"))
-        self.fields_table = self._make_table(["应用", "字段", "现有值", "商城值", "最终值"])
+        layout.addWidget(QLabel("商城资料默认全部选中；如需保留现有值，请取消勾选对应字段。"))
+        self.fields_table = self._make_table(["选择", "字段", "现有值", "商城值", "最终值"])
         layout.addWidget(self.fields_table)
         self._fill_fields()
         layout.addWidget(QLabel("商品参数（保留商城分组和顺序）"))
         self.parameters_table = self._make_table(
-            ["应用", "分组", "参数", "现有值", "商城值", "最终值"]
+            ["选择", "分组", "参数", "现有值", "商城值", "最终值"]
         )
         layout.addWidget(self.parameters_table, 1)
         self._fill_parameters()
@@ -369,7 +370,7 @@ class JlcMergeDialog(QDialog):
             QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
         )
         self.apply_button = buttons.button(QDialogButtonBox.StandardButton.Apply)
-        self.apply_button.setText("应用到入库表单")
+        self.apply_button.setText("确认资料")
         # Qt 将标准 Apply 按钮归为 ApplyRole，它不会触发 QDialogButtonBox.accepted。
         # 因此必须直接连接 clicked，否则界面看似可点，实际对话框不会返回 Accepted，
         # 入库页也就永远收不到用户确认后的合并结果。
@@ -512,14 +513,19 @@ class JlcBatchMergeDialog(QDialog):
         self.resize(1080, 760)
         layout = QVBoxLayout(self)
         hint = QLabel(
-            "对号用于选择是否应用；三角形只控制详情显示。取消某个元件后，其全部字段均不会写入。"
+            "对号用于选择是否采用；三角形只控制详情显示。折叠状态不影响已选字段。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["应用", "元件 / 字段", "现有值", "商城值", "类型"])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["元件 / 字段", "现有值", "商城值", "类型"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 360)
+        self.table.setColumnWidth(1, 280)
+        self.table.setColumnWidth(2, 280)
+        self.table.setColumnWidth(3, 120)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(False)
         layout.addWidget(self.table, 1)
         for key, name, draft, current_fields, current_parameters in changes:
             self._append_component(key, name, draft, current_fields, current_parameters)
@@ -527,7 +533,7 @@ class JlcBatchMergeDialog(QDialog):
             QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
         )
         apply_button = buttons.button(QDialogButtonBox.StandardButton.Apply)
-        apply_button.setText("应用所选变更")
+        apply_button.setText("确认所选变更")
         apply_button.clicked.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -558,16 +564,28 @@ class JlcBatchMergeDialog(QDialog):
         self.table.insertRow(header)
         master = QCheckBox()
         master.setChecked(True)
-        self.table.setCellWidget(header, 0, master)
         toggle = QToolButton()
         toggle.setText(name)
         toggle.setCheckable(True)
+        toggle.setAutoRaise(True)
+        toggle.setStyleSheet(
+            "QToolButton{border:0;background:transparent;text-align:left;padding:2px;}"
+            "QToolButton:hover,QToolButton:pressed{border:0;background:transparent;}"
+        )
         toggle.setArrowType(Qt.ArrowType.RightArrow)
         toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.table.setCellWidget(header, 1, toggle)
-        self.table.setItem(header, 2, QTableWidgetItem(""))
-        self.table.setItem(header, 3, QTableWidgetItem(""))
-        self.table.setItem(header, 4, QTableWidgetItem("整体"))
+        header_widget = QWidget()
+        header_widget.setStyleSheet("background:#e6eaed")
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(6, 1, 4, 1)
+        header_layout.setSpacing(4)
+        header_layout.addWidget(master)
+        header_layout.addWidget(toggle, 1)
+        self.table.setCellWidget(header, 0, header_widget)
+        for column, value in ((1, ""), (2, ""), (3, "元件")):
+            item = QTableWidgetItem(value)
+            item.setBackground(QColor("#e6eaed"))
+            self.table.setItem(header, column, item)
         rows: list[tuple[str, str, QCheckBox, str, str]] = []
         values = self._draft_fields(draft)
         for field, _label in JlcMergeDialog.FIELD_LABELS:
@@ -594,17 +612,28 @@ class JlcBatchMergeDialog(QDialog):
             check.setChecked(True)
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setCellWidget(row, 0, check)
             label = field
             if kind == "field":
                 label = dict(JlcMergeDialog.FIELD_LABELS).get(field, field)
             else:
                 group_name, _parameter_key, parameter_label = field.split("\x1f", 2)
                 label = f"{group_name} / {parameter_label}"
-            self.table.setItem(row, 1, QTableWidgetItem(label))
-            self.table.setItem(row, 2, QTableWidgetItem(current))
-            self.table.setItem(row, 3, QTableWidgetItem(website))
-            self.table.setItem(row, 4, QTableWidgetItem("基础字段" if kind == "field" else "商品参数"))
+            field_widget = QWidget()
+            field_widget.setStyleSheet("background:#f4f5f6")
+            field_layout = QHBoxLayout(field_widget)
+            field_layout.setContentsMargins(28, 1, 4, 1)
+            field_layout.setSpacing(4)
+            field_layout.addWidget(check)
+            field_layout.addWidget(QLabel(label), 1)
+            self.table.setCellWidget(row, 0, field_widget)
+            for column, value in (
+                (1, current),
+                (2, website),
+                (3, "基础字段" if kind == "field" else "商品参数"),
+            ):
+                item = QTableWidgetItem(value)
+                item.setBackground(QColor("#f4f5f6"))
+                self.table.setItem(row, column, item)
             self.table.setRowHidden(row, True)
         end = self.table.rowCount()
         self.rows[key] = rows

@@ -2,7 +2,7 @@
 
 元件库是一个面向个人和小型实验室的本地电子元件库存管理程序。它把“元件资料”、“实际存放位置”和“每一次库存变动”分开记录，适合管理抽屉、料盒、零件柜中的散装元件。
 
-当前版本为 **0.9.0**，详见 [v0.9.0 发行说明](docs/releases/v0.9.0.md)。主要目标平台是 Windows 10/11 和 Ubuntu 24.04+。项目业务代码使用 Python 3.12，桌面界面使用 PySide6，数据保存在 SQLite；不使用 Rust、Tauri、React 或 Node.js。
+桌面端当前版本为 **0.9.4**，主要目标平台为 Windows 10/11 和 Ubuntu 24.04+。安卓端当前版本为 **1.0.9**，支持 Android 8.0（API 26）及以上。桌面端使用 Python 3.12、PySide6 和 SQLite，安卓端通过局域网连接桌面端。详见 [v0.9.4 发行说明](docs/releases/v0.9.4.md)和[安卓说明](android/README.md)。
 
 ## 项目说明
 
@@ -17,10 +17,11 @@
 - **元件与库存**：名称搜索，类别/品牌/封装过滤，列排序，商品与数据手册链接，整数数量，批次及 FIFO 出库。
 - **位置与仓库**：按“位置 → 仓库”两级管理实物存放点，支持全局及元件类别优先级。
 - **多种入库方式**：手工录入，名称下拉匹配，袋贴摄像头/图片 OCR，立创商品页确认，已保存订单批量导入。
-- **BOM 出库**：读取 CSV/XLSX，根据编号和名称生成匹配预览，显示缺料并原子提交。
+- **BOM 出库**：读取 CSV/XLSX，支持逐行勾选、缺料提示和输入筛选匹配候选。推荐仓库仅供参考，用户逐行或批量选仓后创建取货任务。
+- **移动取货**：设置页显示 Android 在线状态；在线手机可作为入库识别、批次扫码和出库扫码摄像头，并同步 BOM 取货进度。
 - **导出与统计**：把当前筛选的库存导出为 Excel/CSV，并按仓库、元件类别统计数量与库存价值。
-- **流水与数据安全**：禁止负库存，已提交操作使用冲销更正，支持 SQLite 快照备份和重启后恢复。
-- **本机 API**：桌面程序运行时在 `127.0.0.1:17635` 提供 FastAPI 接口，写操作需 Bearer Token 和幂等键。
+- **流水与数据安全**：禁止负库存，同一次入库/出库默认合并显示并可展开，已提交操作使用冲销更正，支持 SQLite 快照备份和重启后恢复。
+- **本机与设备 API**：本机 HTTP 监听 `127.0.0.1:17635`，配对设备通过局域网 HTTPS 端口 `17636` 操作。库存写操作需认证，并通过幂等键或会话命令编号防止重复执行。
 
 识别、商品页、订单和 BOM 首先产生**可编辑预览**，不会在用户确认前改变库存。
 
@@ -29,7 +30,7 @@
 源码运行需要 Python `>=3.12,<3.13` 和 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-uv sync
+uv sync --locked
 uv run component-library
 ```
 
@@ -49,7 +50,7 @@ Linux 还需安装 Qt Multimedia/GStreamer 与 Qt WebEngine 的系统运行库�
 - 已选已有元件时，确认入库会同时保存当前表单对该元件的修改。
 - “类别参数”前的对号用于展开/收起参数区；收起不会删除已填内容。
 - 立创商品资料默认全部勾选应用，包括封装和已有字段；如需保留现有值，应在确认窗口取消相应对号。
-- 订单导入的每一行默认勾选，可独立选择仓库、取消导入或修改单元格。
+- 订单导入显示当前日期/元件解析进度，每批固定最多 1000 条；完成后可重新选择同一文件续导剩余商品。静态页面未保存的折叠商品会明确提示重新展开并保存。
 - 商城价格不会自动当作实际购入单价；单价和购买日期由用户确认或由订单导入提供。
 
 ## 文档导航
@@ -58,21 +59,22 @@ Linux 还需安装 Qt Multimedia/GStreamer 与 Qt WebEngine 的系统运行库�
 | --- | --- | --- |
 | 使用者 | [用户指南](docs/user/README.md) | [元件与库存](docs/user/inventory.md) · [位置与仓库](docs/user/storage.md) · [扫描入库](docs/user/scanning.md) · [商城与订单](docs/user/imports.md) · [BOM](docs/user/bom.md) · [数据与备份](docs/user/data.md) |
 | 开发者 | [开发者指南](docs/developer/README.md) | [架构](docs/developer/architecture.md) · [数据库](docs/developer/database.md) · [OCR](docs/developer/recognition.md) · [导入解析](docs/developer/imports.md) · [API](docs/developer/api.md) · [UI 与打包](docs/developer/ui-build.md) · [测试](docs/developer/testing.md) |
+| 安卓用户与开发者 | [安卓说明](android/README.md) | [局域网配对与扫码](docs/user/scanning.md#使用-android-手机作为移动摄像头) |
 
 ## 数据与隐私
 
 - Windows 数据目录：`%APPDATA%\local.component-library.app`。
 - Linux 数据目录：`$XDG_DATA_HOME/local.component-library.app`，默认为 `~/.local/share/local.component-library.app`。
-- 主数据库为 `inventory.db`，API 令牌为 `api-token`，日志位于 `logs/`。
+- 主数据库为 `inventory.db`，API 令牌为 `api-token`，日志位于 `logs/`，局域网证书及私钥位于 `connection/`。
 - OCR 和订单解析在本机进行；应用不启用遥测，不上传库存、图片、BOM 或订单。
-- 只有用户主动打开商品页或请求公开网页预览时才会访问网络。
+- 桌面和手机通过局域网传输操作数据。用户主动访问商城商品页时，程序会访问对应站点。
 
 ## 开发说明
 
 安装开发依赖：
 
 ```bash
-uv sync --extra dev
+uv sync --locked --extra dev
 ```
 
 常用命令：
@@ -82,7 +84,6 @@ uv sync --extra dev
 uv run component-library
 
 # 格式与静态检查
-uv run ruff format --check src tests
 uv run ruff check src tests
 uv run mypy src
 
@@ -95,9 +96,9 @@ uv run python tools/build.py
 
 构建结果位于 `dist/component-library/`。Windows 安装器定义在 `packaging/windows/component-library.iss`；Linux 与 Windows 必须分别在目标系统构建和验收。
 
-发布目录 `release/<版本号>/` 仅保留 `win-<版本号>.zip` 和 `linux-<版本号>.tar.gz`。当前 Windows 包已通过启动、API 认证及离线模型校验；当前 Linux 包为历史源码归档，尚未完成 Linux 构建与验收。
+安卓构建、安装与诊断见 [Android 移动端](android/README.md)。`dist/`、`release/` 和安卓 `build/` 用于本地生成产物，版本说明在 [docs/releases/](docs/releases/)。
 
-详细模块边界、事务不变量和扩展步骤见 [开发者指南](docs/developer/README.md)。
+详细模块边界与扩展步骤见 [开发者指南](docs/developer/README.md)，提交要求见[参与开发](CONTRIBUTING.md)。
 
 ## 开源协议
 

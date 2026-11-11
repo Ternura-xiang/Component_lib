@@ -13,10 +13,8 @@ ENV/
 build/
 dist/
 packaging/windows/Output/
-release/**/*.zip
-release/**/*.tar.gz
-release/**/*.whl
-release/**/*.exe
+# 本地发布工作目录。已跟踪的历史说明继续保留，新增说明放在 docs/releases/。
+/release/
 *.egg-info/
 *.egg
 *.whl
@@ -53,6 +51,10 @@ Desktop.ini
 *.db-wal
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 backups/
 local-data/
 
@@ -62,6 +64,11 @@ local-data/
 !.env.example
 api-token
 application.lock
+ca-key.pem
+server-key.pem
+ca.pem
+server.pem
+server-id
 *.log
 logs/
 
