@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Iterable
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
@@ -29,6 +29,9 @@ PARAMETER_SECTION_TITLE = "商品参数"
 PARAMETER_SECTION_BOUNDARIES = {"替代料", "买了又买"}
 PARAMETER_HEADER_LABELS = {"属性", "参数", "参数名称", "商品属性"}
 PARAMETER_HEADER_VALUES = {"参数值", "值", "属性值"}
+ACCESS_MESSAGE = re.compile(
+    r"登[录陆]后(?:再)?访问|请(?:完成|进行)安全验证|访问过于频繁|请求过于频繁"
+)
 KNOWN_PARAMETER_KEYS = {
     "阻值": "resistance",
     "电阻值": "resistance",
@@ -75,6 +78,38 @@ def is_jlc_product_url(url: str) -> bool:
         return False
     path = urlparse(url).path
     return any(pattern.fullmatch(path) for pattern in DETAIL_PATHS)
+
+
+def _check_page_access(soup: BeautifulSoup, page_text: str) -> None:
+    if ACCESS_MESSAGE.search(page_text) or (
+        soup.title and re.match(r"^(?:(?:用户)?登[录陆]|安全验证|访问受限)", soup.title.get_text(strip=True))
+    ):
+        raise DomainError("JLC_ACCESS_RESTRICTED", "商城要求登录或验证，已停止读取")
+
+
+def find_jlc_product_link(url: str, html: str, part_number: str) -> str | None:
+    """只接受与目标立创编号明确关联的唯一商品链接。"""
+
+    soup = BeautifulSoup(html, "html.parser")
+    _check_page_access(soup, soup.get_text(" ", strip=True))
+    label_pattern = re.compile(
+        rf"(?:(?:商品|立创)编号\s*[:：]?\s*)?{re.escape(part_number)}", re.IGNORECASE
+    )
+    matches = set()
+    for label in soup.find_all(string=lambda value: bool(value and label_pattern.fullmatch(value.strip()))):
+        for index, container in enumerate(label.parents):
+            if index == 5 or container.name in {"body", "html", "[document]"}:
+                break
+            links = {
+                urlsplit(destination)._replace(query="", fragment="").geturl()
+                for anchor in container.select("a[href]")
+                if is_jlc_product_url(destination := urljoin(url, str(anchor.get("href") or "")))
+            }
+            if links:
+                if len(links) == 1:
+                    matches.update(links)
+                break
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def _clean(value: Any) -> str | None:
@@ -335,7 +370,9 @@ def _datasheet_url(soup: BeautifulSoup, base_url: str) -> str | None:
     return None
 
 
-def parse_jlc_product_page(url: str, html: str) -> JlcProductDraft:
+def parse_jlc_product_page(
+    url: str, html: str, *, require_page_number: bool = False
+) -> JlcProductDraft:
     """解析当前立创商品详情页并生成可编辑的元件草稿。
 
     :param url: 内嵌浏览器当前页面的完整 HTTPS URL
@@ -356,6 +393,8 @@ def parse_jlc_product_page(url: str, html: str) -> JlcProductDraft:
     soup = BeautifulSoup(html, "html.parser")
     product = _json_product(soup)
     page_text = soup.get_text(" ", strip=True)
+    _check_page_access(soup, page_text)
+    number_label = _page_label_value(soup, "商品编号", "立创编号", "商城编号")
     lcsc_match = LCSC_NUMBER.search(
         " ".join(
             filter(
@@ -363,8 +402,9 @@ def parse_jlc_product_page(url: str, html: str) -> JlcProductDraft:
                 [
                     str(product.get("sku") or ""),
                     _meta(soup, "product:retailer_item_id", "sku") or "",
-                    url,
-                    page_text,
+                    number_label or "",
+                    "" if require_page_number else url,
+                    "" if require_page_number else page_text,
                 ],
             )
         )

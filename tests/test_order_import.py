@@ -1,18 +1,21 @@
 """本地订单页面解析和原子入库测试。"""
 
 from pathlib import Path
+from unittest.mock import MagicMock
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+import xlrd
 
 from component_library.database import Database, DomainError
 from component_library.models import (
+    ComponentCreate,
     JlcParameter,
     JlcParameterGroup,
     LocationCreate,
     WarehouseCreate,
 )
-from component_library.order_import import parse_saved_orders
+from component_library.order_import import parse_order_files, parse_saved_orders
 
 HTML = """<!doctype html><html><body><ul><li class="mt-[10px] relative">
 <section><section>2026-10-21 14:07:58 <span>订单编号：</span><a>SO26102118592</a></section></section>
@@ -55,6 +58,71 @@ def test_parse_saved_order_without_session_query(tmp_path: Path) -> None:
     assert line.description == "LED贴片数码管"
     assert line.manufacturer_part_number == "GS2821CR-G"
     assert line.product_url == "https://item.szlcsc.com/29373045.html"
+
+
+def test_statement_merges_by_order_and_part_and_saves_purchase_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "statement.xls"
+    path.touch()
+    values = [
+        ["订单编号", "商品编号", "订购数量", "单价（人民币含税）", "订单状态", "收货人"],
+        ["SO26102118592", "C27636670", 3.0, 1.23456789, "已发货", "收货人字段"],
+        ["SO26102118593", "C27636670", "5.0", "", "已发货", "收货人字段"],
+        ["SO26102118594", "C27636671", 1.0, 0.1, "已取消", "收货人字段"],
+        ["", "", "", 1.0, "", ""],
+    ]
+    sheet = MagicMock(name="明细")
+    sheet.name = "物料明细"
+    sheet.nrows = len(values)
+    sheet.row_values.side_effect = values.__getitem__
+    sheet.cell.side_effect = lambda row, column: xlrd.sheet.Cell(
+        xlrd.XL_CELL_TEXT, values[row][column]
+    )
+    workbook = MagicMock()
+    workbook.__enter__.return_value = workbook
+    workbook.sheets.return_value = [sheet]
+    monkeypatch.setattr(xlrd, "open_workbook", lambda *args, **kwargs: workbook)
+
+    statement = parse_order_files([path])
+    assert len(statement) == 2
+    assert statement[0].unit_price is None and statement[0].product_url is None
+    assert "收货人字段" not in str(statement)
+
+    warnings: list[str] = []
+    lines = parse_order_files([saved_order_zip(tmp_path), path], warning=warnings.append)
+    assert len(lines) == 2
+    matched, unmatched = lines
+    assert (matched.quantity, matched.unit_price, matched.purchase_price) == (3, 3.32, 1.23456789)
+    assert matched.product_url == "https://item.szlcsc.com/29373045.html"
+    assert unmatched.purchased_at is None and unmatched.purchase_price is None
+    assert any("数量不一致" in warning for warning in warnings)
+
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A"))
+    assert database.import_order_lines(lines, location["id"])["imported"] == 2
+    assert database.import_order_lines(lines, location["id"])["skipped"] == 2
+    lots = {row["order_number"]: row for row in database.list_inventory_lots()}
+    assert lots[matched.order_number]["unit_price"] == matched.purchase_price
+    assert lots[unmatched.order_number]["unit_price"] is None
+    component = database.get_component(lots[matched.order_number]["component_id"])
+    assert component["price"] == 3.32
+    assert [(row["label"], row["value"]) for row in component["category_parameters"]] == [
+        ("购入单价", "1.23456789"),
+    ]
+
+    supplement_db = Database(tmp_path / "supplement.db")
+    existing = supplement_db.create_component(
+        ComponentCreate(name="已有元件", lcsc_part_number=matched.lcsc_part_number)
+    )
+    changes = supplement_db.preview_order_supplement(lines)
+    assert len(changes) == 1 and changes[0]["fields"]["purchase_price"] == "1.23456789"
+    assert supplement_db.apply_order_supplement(changes) == 1
+    assert supplement_db.apply_order_supplement(changes) == 0
+    detail = supplement_db.get_component(existing["id"])
+    assert detail["category_parameters"][0]["value"] == "1.23456789"
+    assert detail["price"] is None
 
 
 def test_unrendered_order_page_explains_how_to_save_details(tmp_path: Path) -> None:

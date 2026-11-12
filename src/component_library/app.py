@@ -4,35 +4,32 @@ from __future__ import annotations
 
 import logging
 import sys
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile
+from PySide6.QtCore import QLockFile, QSettings
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .api import ApiContext, ApiServer, create_api
 from .connection import ConnectionManager
 from .database import Database
+from .debug_log import LOG_LEVEL_SETTING, LOG_LEVELS, DebugLogHandler
 from .paths import data_directory, load_or_create_token
 from .recognition import RecognitionEngine
 from .sessions import SessionService
 from .ui.main_window import MainWindow
 
 
-def configure_logging(directory: object) -> None:
+def configure_logging(directory: Path) -> DebugLogHandler:
     """配置只保存在本机的轮换日志，不记录图片或 API 令牌。"""
 
-    path = Path(str(directory)) / "logs"
+    path = directory / "logs"
     path.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        path / "component-library.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
-    )
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[handler],
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    preferences = QSettings("local.component-library.app", "元件库")
+    level = LOG_LEVELS.get(str(preferences.value(LOG_LEVEL_SETTING, "INFO")), logging.INFO)
+    handler = DebugLogHandler(path / "component-library.log", level)
+    logging.basicConfig(level=logging.DEBUG, handlers=[handler], force=True)
+    return handler
 
 
 def main() -> int:
@@ -48,7 +45,7 @@ def main() -> int:
     if icon_path.is_file():
         application.setWindowIcon(QIcon(str(icon_path)))
     directory = data_directory()
-    configure_logging(directory)
+    log_handler = configure_logging(directory)
 
     # QLockFile 在进程异常退出后可以自动判断陈旧锁，比单纯创建 PID 文件可靠。
     lock = QLockFile(str(directory / "application.lock"))
@@ -106,7 +103,7 @@ def main() -> int:
                 "手机仍可使用配对二维码中的地址连接，但桌面 IP 变化后需要重新配对。",
             )
 
-    window = MainWindow(database, recognition, token, connection, sessions)
+    window = MainWindow(database, recognition, token, connection, sessions, log_handler=log_handler)
     window.show()
     exit_code = application.exec()
     api_server.stop()

@@ -1,4 +1,4 @@
-"""离线解析用户从浏览器保存的立创商城订单页面。
+"""离线解析立创商城订单网页和 XLS 物料明细对账单。
 
 解析器绝不执行 HTML 中的脚本、不读取 Cookie，也不访问页面中的网络链接。压缩包只在
 内存中读取一个 HTML/MHTML 文件，并限制文件数和解压后大小以避免恶意压缩包。
@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 from zipfile import BadZipFile, ZipFile
 
+import xlrd
 from bs4 import BeautifulSoup, Tag
+from pydantic import ValidationError
 
 from .database import DomainError
 from .models import MosfetDetails, OrderImportLine, ResistorDetails
@@ -138,12 +142,17 @@ def parse_saved_orders(
     path: Path,
     progress: Callable[[str], None] | None = None,
     warning: Callable[[str], None] | None = None,
+    *,
+    cancelled_orders: set[str] | None = None,
+    allow_empty: bool = False,
 ) -> list[OrderImportLine]:
     """解析用户保存的静态订单页面并返回去重后的商品行。
 
     :param path: 本地 ZIP、HTML 或 MHTML 订单文件路径
     :param progress: 可选的线程安全进度回调，内容只包含订单日期和当前元件
     :param warning: 可选警告回调，用于报告静态文件中不存在的折叠商品
+    :param cancelled_orders: 合并时用于在两种来源之间同步取消状态
+    :param allow_empty: 有对账单补充时，空网页预览仅提示
     :return: 可供用户预览和确认的订单商品行列表
     :raises DomainError: 文件不安全、格式损坏或没有可识别商品时抛出
 
@@ -155,7 +164,7 @@ def parse_saved_orders(
     soup = BeautifulSoup(_read_html(path), "html.parser")
     output: list[OrderImportLine] = []
     seen: set[tuple[str, str]] = set()
-    cancelled: set[str] = set()
+    cancelled = cancelled_orders if cancelled_orders is not None else set()
     collapsed: set[str] = set()
     last_progress = ""
     ### 定位订单容器并提取商品行 ###
@@ -168,9 +177,10 @@ def parse_saved_orders(
         header_text = _text(header)
         order_match = ORDER_NUMBER.search(header_text)
         date_match = ORDER_DATE.search(header_text)
-        if not order_match or not date_match:
+        if not order_match:
             continue
         order_number = order_match.group(0)
+        purchased_at = date_match.group(0) if date_match else None
         order_text = list(order_container.stripped_strings)
         # 仅匹配完整状态文字，仍可执行的「取消订单」按钮属于正常订单。
         if any(CANCELLED_ORDER.fullmatch(value) for value in order_text):
@@ -188,7 +198,7 @@ def parse_saved_orders(
             number = LCSC_NUMBER.search(number_item)
             price = PRICE.search(price_item)
             quantity = QUANTITY.search(quantity_item)
-            if not number or not price or not quantity or len(items) < 4:
+            if not number or not quantity or len(items) < 4:
                 continue
             lcsc = number.group(0).upper()
             key = (order_number, lcsc)
@@ -201,7 +211,7 @@ def parse_saved_orders(
             # 类别已有独立字段，商品描述不再重复显示斜杠前的类别名称。
             description = title_parts[1] if len(title_parts) > 1 else title
             model_parts = [part.strip() for part in items[1].split(" / ", 1)]
-            model = model_parts[0] or lcsc
+            model = _optional_order_text(model_parts[0]) or lcsc
             resistor, mosfet = _category_details(category, description)
             link = next(
                 (anchor.get("href") for anchor in product.find_all("a") if anchor.get("href")), None
@@ -212,24 +222,23 @@ def parse_saved_orders(
                     f"订单文件超过 {MAX_ORDER_FILE_ITEMS} 条安全上限，请拆分保存订单页面",
                 )
             last_progress = (
-                f"{date_match.group(0)[:10]} · {model or lcsc} · 已解析 {len(output) + 1} 条"
+                f"{purchased_at[:10] if purchased_at else '日期缺省'} · "
+                f"{model} · 已解析 {len(output) + 1} 条"
             )
             if progress and (not output or (len(output) + 1) % 25 == 0):
                 progress(last_progress)
             output.append(
                 OrderImportLine(
                     order_number=order_number,
-                    purchased_at=date_match.group(0),
+                    purchased_at=purchased_at,
                     lcsc_part_number=lcsc,
                     name=model,
                     description=description,
                     category=category,
-                    manufacturer_part_number=model_parts[0] or None,
-                    package=model_parts[1]
-                    if len(model_parts) > 1 and model_parts[1] != "-"
-                    else None,
-                    brand=items[2] or None,
-                    unit_price=float(price.group(1)),
+                    manufacturer_part_number=_optional_order_text(model_parts[0]),
+                    package=_optional_order_text(model_parts[1]) if len(model_parts) > 1 else None,
+                    brand=_optional_order_text(items[2]),
+                    unit_price=float(price.group(1)) if price else None,
                     quantity=int(quantity.group(1)),
                     product_url=_clean_url(str(link) if link else None),
                     resistor=resistor,
@@ -241,14 +250,18 @@ def parse_saved_orders(
         output = [line for line in output if line.order_number not in cancelled]
     if not output:
         if cancelled and not collapsed:
-            raise DomainError("VALIDATION_ERROR", "页面中没有可导入的商品，已剔除取消或关闭的订单")
-        if not order_labels and soup.title and "我的订单" in _text(soup.title):
-            raise DomainError(
-                "VALIDATION_ERROR",
+            message = "页面中没有可导入的商品，已剔除取消或关闭的订单"
+        elif not order_labels and soup.title and "我的订单" in _text(soup.title):
+            message = (
                 "保存的“我的订单”页面不含订单明细。请在浏览器登录立创商城，"
-                "检索后等订单和商品明细显示，再以“网页，全部”保存并重新导入。",
+                "检索后等订单和商品明细显示，再以“网页，全部”保存并重新导入。"
             )
-        raise DomainError("VALIDATION_ERROR", "页面中没有找到可导入的订单商品")
+        else:
+            message = "页面中没有找到可导入的订单商品"
+        if not allow_empty:
+            raise DomainError("VALIDATION_ERROR", message)
+        if warning:
+            warning(message)
     if (active_collapsed := collapsed - cancelled) and warning:
         warning(
             f"检测到 {len(active_collapsed)} 个未展开订单；保存文件只包含网页已加载商品，"
@@ -256,4 +269,172 @@ def parse_saved_orders(
         )
     if progress and last_progress:
         progress(last_progress)
+    return output
+
+
+def _optional_order_text(value: object) -> str | None:
+    text = str(value).strip()
+    return text if text not in {"", "-", "—"} else None
+
+
+def _statement_number(value: object) -> Decimal:
+    number = Decimal(str(value).strip().replace(",", "").lstrip("¥￥"))
+    if not number.is_finite():
+        raise ValueError("非有限数值")
+    return number
+
+
+def _statement_row(
+    sheet: xlrd.sheet.Sheet, row: int, columns: dict[str, int], datemode: int
+) -> dict[str, str | None]:
+    fields = (
+        "订单编号", "订单状态", "下单时间", "商品编号", "商品型号", "商品名称", "商品类型",
+        "品牌", "封装格式", "订购数量", "单价（人民币含税）", "单价(人民币含税)",
+    )
+    values = {}
+    for field in fields:
+        if field in columns:
+            cell = sheet.cell(row, columns[field])
+            values[field] = (
+                str(xlrd.xldate_as_datetime(cell.value, datemode))
+                if cell.ctype == xlrd.XL_CELL_DATE else _optional_order_text(cell.value)
+            )
+    return values
+
+
+def _parse_statement(
+    path: Path, warning: Callable[[str], None] | None
+) -> tuple[dict[tuple[str, str], OrderImportLine], set[str]]:
+    """仅从有明细表头的工作表中提取订单字段，排除取消订单和费用行。"""
+
+    if path.stat().st_size > MAX_UNCOMPRESSED_BYTES:
+        raise DomainError("VALIDATION_ERROR", "对账单超过 20 MB 安全上限")
+    lines: dict[tuple[str, str], OrderImportLine] = {}
+    cancelled: set[str] = set()
+    required = {"订单编号", "商品编号", "订购数量"}
+    found_header = False
+    try:
+        with xlrd.open_workbook(path, on_demand=True) as workbook:
+            for sheet in workbook.sheets():
+                if sheet.name == "发票汇总清单" and workbook.nsheets > 1:
+                    continue
+                for index in range(min(20, sheet.nrows)):
+                    columns = {
+                        str(value).strip(): column
+                        for column, value in enumerate(sheet.row_values(index))
+                    }
+                    if required <= columns.keys():
+                        found_header = True
+                        break
+                else:
+                    continue
+                for row in range(index + 1, sheet.nrows):
+                    try:
+                        values = _statement_row(sheet, row, columns, workbook.datemode)
+                        order = values.get("订单编号") or ""
+                        part = (values.get("商品编号") or "").upper()
+                        if not ORDER_NUMBER.fullmatch(order):
+                            continue
+                        if CANCELLED_ORDER.fullmatch(values.get("订单状态") or ""):
+                            cancelled.add(order)
+                            continue
+                        if not LCSC_NUMBER.fullmatch(part):
+                            continue
+                        quantity = _statement_number(values.get("订购数量"))
+                        if quantity != quantity.to_integral_value():
+                            raise ValueError("订购数量须为整数")
+                        price = values.get("单价（人民币含税）") or values.get("单价(人民币含税)")
+                        date = values.get("下单时间")
+                        purchased_at = (
+                            datetime.fromisoformat(date.replace("/", "-")).isoformat(sep=" ")
+                            if date else None
+                        )
+                        model = values.get("商品型号")
+                        description = values.get("商品名称")
+                        category = values.get("商品类型")
+                        resistor, mosfet = _category_details(category, description or "")
+                        line = OrderImportLine(
+                            order_number=order,
+                            purchased_at=purchased_at,
+                            lcsc_part_number=part,
+                            name=model or description or part,
+                            description=description,
+                            category=category,
+                            manufacturer_part_number=model,
+                            brand=values.get("品牌"),
+                            package=values.get("封装格式"),
+                            purchase_price=float(_statement_number(price)) if price else None,
+                            quantity=int(quantity),
+                            resistor=resistor,
+                            mosfet=mosfet,
+                        )
+                    except (InvalidOperation, ValidationError, ValueError, OverflowError) as error:
+                        raise DomainError(
+                            "VALIDATION_ERROR", f"对账单第 {row + 1} 行的数量、单价或日期无效"
+                        ) from error
+                    key = (order, part)
+                    if key in lines and lines[key] != line:
+                        raise DomainError(
+                            "VALIDATION_ERROR", f"对账单第 {row + 1} 行与同一订单商品的明细冲突"
+                        )
+                    lines[key] = line
+                    if len(lines) > MAX_ORDER_FILE_ITEMS:
+                        raise DomainError("VALIDATION_ERROR", "对账单超过 10000 条商品，请拆分后导入")
+    except (xlrd.XLRDError, xlrd.compdoc.CompDocError, OSError) as error:
+        raise DomainError("VALIDATION_ERROR", "无法读取 XLS 物料明细对账单") from error
+    if not found_header:
+        raise DomainError("VALIDATION_ERROR", "XLS 中没有物料明细对账单表头")
+    if cancelled and warning:
+        warning(f"已剔除对账单中 {len(cancelled)} 个取消或关闭的订单")
+    return {key: line for key, line in lines.items() if key[0] not in cancelled}, cancelled
+
+
+def parse_order_files(
+    paths: list[Path],
+    progress: Callable[[str], None] | None = None,
+    warning: Callable[[str], None] | None = None,
+) -> list[OrderImportLine]:
+    """合并一份网页和一份对账单，按订单号及立创商品编号消除重复。"""
+
+    statements = [path for path in paths if path.suffix.casefold() == ".xls"]
+    pages = [path for path in paths if path.suffix.casefold() != ".xls"]
+    if not paths or len(statements) > 1 or len(pages) > 1:
+        raise DomainError("VALIDATION_ERROR", "请选择至多一份订单网页和一份 XLS 对账单")
+    statement, cancelled = _parse_statement(statements[0], warning) if statements else ({}, set())
+    page_lines = (
+        parse_saved_orders(pages[0], progress, warning, cancelled_orders=cancelled, allow_empty=bool(statement))
+        if pages else []
+    )
+    matched = 0
+    quantity_conflicts = 0
+    output: list[OrderImportLine] = []
+    for page in page_lines:
+        detail = statement.pop((page.order_number, page.lcsc_part_number), None)
+        if detail is None:
+            output.append(page)
+            continue
+        matched += 1
+        quantity_conflicts += detail.quantity != page.quantity
+        fields = (
+            "purchased_at", "description", "category", "manufacturer_part_number",
+            "brand", "package", "resistor", "mosfet",
+        )
+        updates = {
+            field: getattr(detail, field) for field in fields if getattr(page, field) is None
+        }
+        if page.name == page.lcsc_part_number and detail.name != detail.lcsc_part_number:
+            updates["name"] = detail.name
+        output.append(page.model_copy(update={
+            **updates, "purchase_price": detail.purchase_price, "quantity": detail.quantity,
+        }))
+    output.extend(line for line in statement.values() if line.order_number not in cancelled)
+    if not output:
+        raise DomainError("VALIDATION_ERROR", "文件中没有可导入的订单商品")
+    if len(output) > MAX_ORDER_FILE_ITEMS:
+        raise DomainError("VALIDATION_ERROR", "合并结果超过 10000 条商品，请拆分后导入")
+    if pages and statements and warning:
+        message = f"两份文件匹配 {matched} 条，仅出现在一份文件中的有 {len(output) - matched} 条"
+        if quantity_conflicts:
+            message += f"；{quantity_conflicts} 条数量不一致，预览采用对账单数量"
+        warning(message)
     return output

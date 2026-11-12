@@ -8,7 +8,7 @@ Component Library 的自有代码使用 [MIT License](LICENSE)。安装包同时
 | --- | --- |
 | PySide6, Shiboken6, Qt 6 | LGPL-3.0-only（也提供 GPL/商业许可选项；本项目按 LGPL 选项使用动态库） |
 | FastAPI, Pydantic, ONNX Runtime, openpyxl, RapidFuzz, AnyIO, Beautiful Soup | MIT |
-| Starlette, Uvicorn, HTTPX, NumPy | BSD/MIT 等宽松许可 |
+| Starlette, Uvicorn, HTTPX, NumPy, xlrd | BSD/MIT 等宽松许可 |
 | python-multipart, OpenCV Python, zxing-cpp, RapidOCR | Apache-2.0 |
 
 PySide6/Qt 的 LGPL-3.0 许可文本及对应源码获取方式可见：

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from math import ceil
+from time import monotonic
 from typing import Any
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -25,7 +27,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..database import DomainError
 from ..jlc_product import (
+    find_jlc_product_link,
     is_blocked_jlc_navigation,
     is_jlc_product_url,
     parse_jlc_product_page,
@@ -217,7 +221,10 @@ class JlcBrowserDialog(QDialog):
 
 
 class JlcBatchBrowserDialog(QDialog):
-    """依次打开指定商品详情页，并收集可供用户确认的结构化草稿。"""
+    """按用户操作逐页读取商品，限速并在访问受限时结束队列。"""
+
+    _next_request_at = 0.0
+    _minimum_interval = 30
 
     def __init__(
         self, targets: list[tuple[str, str, str]], parent: QWidget | None = None
@@ -234,7 +241,9 @@ class JlcBatchBrowserDialog(QDialog):
         self.errors: dict[str, str] = {}
         self._index = -1
         self._closed = False
-        self.setWindowTitle("自动补充立创商品资料")
+        self._loading = False
+        self._stopping = False
+        self.setWindowTitle("补充立创商品资料")
         self.resize(1120, 760)
         layout = QVBoxLayout(self)
         self.status = QLabel("准备打开商品详情页……")
@@ -247,17 +256,29 @@ class JlcBatchBrowserDialog(QDialog):
         self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self.profile.downloadRequested.connect(JlcBrowserDialog._cancel_download)
         self.page = SafeJlcPage(self.profile, self)
+        self.page.navigation_blocked.connect(self._navigation_blocked)
         self.view = QWebEngineView(self)
         self.view.setPage(self.page)
         layout.addWidget(self.view, 1)
         controls = QHBoxLayout()
+        self.next_button = QPushButton("读取下一项")
+        self.next_button.setEnabled(False)
+        self.next_button.clicked.connect(self._load_next)
+        self.review_button = QPushButton("查看已读取资料")
+        self.review_button.setEnabled(False)
+        self.review_button.clicked.connect(self.accept)
         self.cancel_button = QPushButton("取消")
         self.cancel_button.clicked.connect(self.reject)
         controls.addStretch()
+        controls.addWidget(self.next_button)
+        controls.addWidget(self.review_button)
         controls.addWidget(self.cancel_button)
         layout.addLayout(controls)
         self.view.loadProgress.connect(self._show_progress)
         self.view.loadFinished.connect(self._loaded)
+        self.cooldown = QTimer(self)
+        self.cooldown.setInterval(1000)
+        self.cooldown.timeout.connect(self._update_next_button)
 
     def start(self) -> None:
         """从第一项开始遍历；空任务直接完成。"""
@@ -265,16 +286,23 @@ class JlcBatchBrowserDialog(QDialog):
         if not self.targets:
             self.accept()
             return
-        self._load_next()
+        if monotonic() >= type(self)._next_request_at:
+            self._load_next()
+        else:
+            self.cooldown.start()
+            self._update_next_button()
 
     def _show_progress(self, progress: int) -> None:
-        if 0 <= self._index < len(self.targets):
+        if self._loading and 0 <= self._index < len(self.targets):
             _key, name, _url = self.targets[self._index]
             self.status.setText(
                 f"正在读取 {self._index + 1}/{len(self.targets)}：{name}（{progress}%）"
             )
 
     def _load_next(self) -> None:
+        if self._closed or self._stopping or self._loading or monotonic() < type(self)._next_request_at:
+            return
+        self.cooldown.stop()
         self._index += 1
         if self._index >= len(self.targets):
             self.status.setText(
@@ -283,35 +311,252 @@ class JlcBatchBrowserDialog(QDialog):
             self.accept()
             return
         _key, _name, url = self.targets[self._index]
+        if not is_jlc_product_url(url):
+            self._stop_with_warning("商品链接无效")
+            return
+        type(self)._next_request_at = monotonic() + self._minimum_interval
+        self._loading = True
+        self.next_button.setEnabled(False)
+        self.review_button.setEnabled(False)
         self.view.setUrl(QUrl(url))
 
     def _loaded(self, ok: bool) -> None:
-        if self._closed or not (0 <= self._index < len(self.targets)):
+        if self._closed or self._stopping or not self._loading:
             return
-        key, name, url = self.targets[self._index]
+        key, name, _url = self.targets[self._index]
         if not ok:
-            self.errors[key] = f"{name}：页面加载失败"
-            self._load_next()
+            self._stop_with_warning("页面加载失败或访问受限")
+            return
+        url = self.view.url().toString()
+        if not is_jlc_product_url(url):
+            self._stop_with_warning("商城跳转至非商品详情页")
             return
         self.page.toHtml(lambda html, item_key=key, item_name=name, source=url: self._parsed(
             item_key, item_name, source, html
         ))
 
     def _parsed(self, key: str, name: str, url: str, html: str) -> None:
-        if self._closed:
+        if self._closed or self._stopping or not self._loading:
             return
         try:
-            self.drafts[key] = parse_jlc_product_page(url, html)
+            draft = parse_jlc_product_page(url, html)
+            if not (draft.manufacturer_part_number or draft.parameter_groups):
+                self._stop_with_warning("页面未提供可确认的商品资料")
+                return
+            self.drafts[key] = draft
+        except DomainError as error:
+            if error.code == "JLC_ACCESS_RESTRICTED":
+                self._stop_with_warning(str(error))
+                return
+            self.errors[key] = f"{name}：{error}"
         except Exception as error:
             self.errors[key] = f"{name}：{error}"
-        self._load_next()
+        self._loading = False
+        if self._index + 1 == len(self.targets):
+            if self.drafts:
+                self.accept()
+            else:
+                self._stop_with_warning(next(iter(self.errors.values()), "没有可确认的商品资料"))
+            return
+        self.review_button.setEnabled(bool(self.drafts))
+        self.cooldown.start()
+        self._update_next_button()
+
+    def _navigation_blocked(self, _url: str) -> None:
+        if self._loading:
+            self._stop_with_warning("商城要求登录、验证或跳转至受限页面")
+
+    def _stop_with_warning(self, reason: str) -> None:
+        self._stopping = True
+        self._loading = False
+        self.cooldown.stop()
+        if 0 <= self._index < len(self.targets):
+            key, name, _url = self.targets[self._index]
+            self.errors[key] = f"{name}：{reason}"
+        self.next_button.setEnabled(False)
+        self.review_button.setEnabled(False)
+        self.status.setText(f"{reason}。已停止后续读取。")
+        # 阻止导航的信号可能从 WebEngine 导航回调中同步发出，退出安排到下一轮事件。
+        QTimer.singleShot(0, lambda: self._exit_with_warning(reason))
+
+    def _exit_with_warning(self, reason: str) -> None:
+        if self._closed:
+            return
+        parent = self.parentWidget()
+        self.reject()
+        QMessageBox.warning(parent, "已停止商城补充", reason)
+
+    def _update_next_button(self) -> None:
+        if self._closed or self._stopping or self._loading:
+            return
+        remaining = max(0, ceil(type(self)._next_request_at - monotonic()))
+        self.next_button.setEnabled(remaining == 0)
+        summary = f"已读取 {len(self.drafts)} 项，失败 {len(self.errors)} 项"
+        if remaining:
+            self.status.setText(f"{summary}。{remaining} 秒后可读取下一项。")
+        else:
+            self.cooldown.stop()
+            self.status.setText(f"{summary}。点击读取下一项继续。")
 
     def done(self, result: int) -> None:
         self._closed = True
+        self.cooldown.stop()
         self.view.stop()
         self.profile.cookieStore().deleteAllCookies()
         self.profile.clearHttpCache()
         super().done(result)
+
+
+class JlcBackgroundBrowser(QObject):
+    """从单个匿名浏览器页面读取一个明确编号的商品。"""
+
+    succeeded = Signal(object)
+    failed = Signal(str, bool)
+
+    def __init__(self, part_number: str, product_url: str, owner: QWidget) -> None:
+        super().__init__(owner)
+        self.part_number = part_number
+        self.owner = owner
+        self._done = False
+        self._stop_scheduled = False
+        self._window: QDialog | None = None
+        self._render_retry = False
+        self._search_url = f"https://so.szlcsc.com/global.html?k={part_number}"
+        self._detail_requested = is_jlc_product_url(product_url)
+        self._destination = product_url if self._detail_requested else self._search_url
+        self.profile = QWebEngineProfile(self)
+        self.profile.downloadRequested.connect(JlcBrowserDialog._cancel_download)
+        self.page = SafeJlcPage(self.profile, self)
+        self.page.navigation_blocked.connect(self._navigation_blocked)
+        self.page.loadFinished.connect(self._loaded)
+        self.page.loadingChanged.connect(self._loading_changed)
+        self._navigation = QTimer(self)
+        self._navigation.setSingleShot(True)
+        self._navigation.timeout.connect(self._load)
+        self._deadline = QTimer(self)
+        self._deadline.setSingleShot(True)
+        self._deadline.timeout.connect(lambda: self._fail("读取商品资料超时"))
+
+    def start(self) -> None:
+        self._deadline.start(95_000)
+        self._load()
+
+    def _load(self) -> None:
+        if self._done or self._stop_scheduled:
+            return
+        remaining = JlcBatchBrowserDialog._next_request_at - monotonic()
+        if remaining > 0:
+            self._navigation.start(ceil(remaining * 1000))
+            return
+        JlcBatchBrowserDialog._next_request_at = monotonic() + JlcBatchBrowserDialog._minimum_interval
+        self._render_retry = False
+        self.page.setUrl(QUrl(self._destination))
+
+    def _navigation_blocked(self, _url: str) -> None:
+        self._stop_for_access("商城要求登录、验证或跳转至受限页面")
+
+    def _loading_changed(self, info: QWebEngineLoadingInfo) -> None:
+        if info.errorCode() in {401, 403, 429}:
+            self._stop_for_access(f"商城访问受限（{info.errorCode()}）")
+
+    def _stop_for_access(self, message: str) -> None:
+        if not self._done and not self._stop_scheduled:
+            self._stop_scheduled = True
+            QTimer.singleShot(0, lambda: self._fail(message, restricted=True))
+
+    def _loaded(self, ok: bool) -> None:
+        if self._done or self._stop_scheduled or self._navigation.isActive():
+            return
+        if not ok:
+            # 让同一加载周期的 HTTP 状态和导航拦截先处理。
+            QTimer.singleShot(0, self._load_failed)
+            return
+        QTimer.singleShot(500, self._read)
+
+    def _load_failed(self) -> None:
+        if not self._stop_scheduled:
+            self._fail("商城页面加载失败")
+
+    def _read(self) -> None:
+        if not self._done and not self._stop_scheduled and not self._navigation.isActive():
+            url = self.page.url().toString()
+            self.page.toHtml(lambda html: self._parse(url, html))
+
+    def _parse(self, url: str, html: str) -> None:
+        if self._done or self._stop_scheduled or self._navigation.isActive():
+            return
+        try:
+            if is_jlc_product_url(url):
+                draft = parse_jlc_product_page(url, html, require_page_number=True)
+                if draft.lcsc_part_number != self.part_number:
+                    self._fail("商品页编号与库存元件不一致")
+                    return
+                if not (draft.manufacturer_part_number or draft.parameter_groups):
+                    raise DomainError("JLC_EMPTY_PAGE", "商品页未提供可确认的型号或参数")
+                self.cancel()
+                self.succeeded.emit(draft)
+                return
+            if self._detail_requested or QUrl(url).host() != "so.szlcsc.com":
+                self._stop_for_access("商城跳转至非商品页面")
+                return
+            link = find_jlc_product_link(url, html, self.part_number)
+            if link:
+                self._detail_requested = True
+                self._destination = link
+                self._load()
+                return
+            self._retry_with_view("未找到对应立创编号的商品详情")
+        except DomainError as error:
+            if error.code == "JLC_ACCESS_RESTRICTED":
+                self._stop_for_access(str(error))
+            else:
+                self._retry_with_view(str(error))
+        except Exception:
+            self._fail("商品资料解析失败")
+
+    def _retry_with_view(self, message: str) -> None:
+        if self._render_retry:
+            self._fail(message)
+            return
+        self._render_retry = True
+        if self._window is None:
+            window = QDialog(
+                self.owner, Qt.WindowType.Tool | Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+            window.setWindowTitle(f"立创资料匹配 {self.part_number}")
+            window.resize(380, 240)
+            view = QWebEngineView(window)
+            view.setPage(self.page)
+            view.setEnabled(False)
+            layout = QVBoxLayout(window)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(view)
+            screen = self.owner.screen().availableGeometry()
+            window.move(screen.right() - window.width() - 16, screen.bottom() - window.height() - 40)
+            window.rejected.connect(lambda: self._fail("已关闭后台匹配窗口"))
+            self._window = window
+            window.show()
+        # 附加视图后重新读取同一页，避免重复访问。
+        QTimer.singleShot(1200, self._read)
+
+    def cancel(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        self._navigation.stop()
+        self._deadline.stop()
+        self.page.triggerAction(QWebEnginePage.WebAction.Stop)
+        if self._window is not None:
+            self._window.hide()
+            self._window.deleteLater()
+        self.page.deleteLater()
+        self.deleteLater()
+
+    def _fail(self, message: str, *, restricted: bool = False) -> None:
+        if not self._done:
+            self.cancel()
+            self.failed.emit(message, restricted)
 
 
 class JlcMergeDialog(QDialog):

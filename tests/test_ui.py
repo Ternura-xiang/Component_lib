@@ -1,22 +1,29 @@
 """PySide6 主窗口无显示设备烟雾测试。"""
 
+import csv
+import logging
+import os
+import time
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 import pytest
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import QDate, QObject, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QColorDialog,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QToolButton,
 )
 from test_jlc_product import PRODUCT_HTML
@@ -26,6 +33,7 @@ import component_library.ui.main_window as main_window_module
 from component_library import __version__
 from component_library.connection import ConnectionManager
 from component_library.database import Database
+from component_library.debug_log import DebugLogHandler
 from component_library.jlc_product import parse_jlc_product_page
 from component_library.models import (
     BomInputRow,
@@ -46,7 +54,9 @@ from component_library.ui.main_window import (
     InlineEditor,
     InventoryPage,
     MainWindow,
+    OrderFilesDialog,
     OrderImportPage,
+    SettingsPage,
     WheelSafeComboBox,
     default_debug_mode,
 )
@@ -130,9 +140,9 @@ def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
     assert [
         window.settings_page.tabs.tabText(index)
         for index in range(window.settings_page.tabs.count())
-    ] == ["连接信息", "备份与恢复", "调试", "关于"]
+    ] == ["连接信息", "备份与恢复", "资料匹配", "调试", "关于"]
     about_labels = {
-        label.text() for label in window.settings_page.tabs.widget(3).findChildren(QLabel)
+        label.text() for label in window.settings_page.tabs.widget(4).findChildren(QLabel)
     }
     assert "Ternura_xiang" in about_labels
     assert __version__ in about_labels
@@ -602,7 +612,8 @@ def test_inventory_shows_separate_lots_and_moves_ctrl_selected_rows(
     database = Database(tmp_path / "inventory.db")
     position = database.create_warehouse(WarehouseCreate(name="主位置"))
     source = database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
-    target = database.create_location(LocationCreate(warehouse_id=position["id"], name="B01"))
+    target_position = database.create_warehouse(WarehouseCreate(name="目标位置"))
+    target = database.create_location(LocationCreate(warehouse_id=target_position["id"], name="B01"))
     component = database.create_component(ComponentCreate(name="分批元件", lcsc_part_number="C7654321"))
     for index in (1, 2):
         database.receive(
@@ -624,6 +635,9 @@ def test_inventory_shows_separate_lots_and_moves_ctrl_selected_rows(
     }
     assert [page.table.item(row, 21).text() for row in (0, 1)] == ["3", "3"]
     assert not page.table.item(0, 16).icon().isNull()
+    assert page.table.horizontalHeader().visualIndex(16) + 1 == (
+        page.table.horizontalHeader().visualIndex(9)
+    )
     for row, modifier in ((0, Qt.KeyboardModifier.NoModifier), (1, Qt.KeyboardModifier.ControlModifier)):
         item = page.table.item(row, 0)
         qtbot.mouseClick(
@@ -633,8 +647,10 @@ def test_inventory_shows_separate_lots_and_moves_ctrl_selected_rows(
     assert len(page.table.selectionModel().selectedRows()) == 2
 
     def confirm(dialog: QDialog) -> QDialog.DialogCode:
-        location = dialog.findChild(WheelSafeComboBox)
-        assert location is not None
+        position_selector, location = dialog.findChildren(WheelSafeComboBox)
+        assert not location.isEnabled()
+        position_selector.setCurrentIndex(position_selector.findData(target_position["id"]))
+        assert location.findData(source["id"]) == -1
         location.setCurrentIndex(location.findData(target["id"]))
         return QDialog.DialogCode.Accepted
 
@@ -728,6 +744,15 @@ def test_order_file_preview_runs_on_ui_thread(
     page = OrderImportPage(Database(tmp_path / "inventory.db"))
     qtbot.addWidget(page)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_args: (str(path), ""))
+
+    def select_web(dialog: OrderFilesDialog) -> QDialog.DialogCode:
+        browse = next(button for button in dialog.findChildren(QPushButton) if button.text() == "浏览…")
+        browse.click()
+        assert dialog.paths() == [path]
+        dialog.accept()
+        return QDialog.DialogCode(dialog.result())
+
+    monkeypatch.setattr(OrderFilesDialog, "exec", select_web)
     preview = page._show_preview
     called_on_ui_thread: list[bool] = []
 
@@ -748,6 +773,31 @@ def test_order_file_preview_runs_on_ui_thread(
     assert page.lines[0].quantity == 2
     assert page.lines[0].unit_price == 3.32
     assert not page.lines[0].jlc_matched
+
+
+def test_order_import_reuses_matched_component_for_new_batch(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A"))
+    existing = database.create_component(
+        ComponentCreate(name="已有元件", lcsc_part_number="C27636670", jlc_matched=True)
+    )
+    line = OrderImportLine(
+        name="新订单行", lcsc_part_number="C27636670", order_number="SO26102118592", quantity=3
+    )
+    page = OrderImportPage(database)
+    qtbot.addWidget(page)
+    page._show_preview([line])
+    assert page.table.item(0, 5).text() == "已匹配"
+    notices: list[str] = []
+    monkeypatch.setattr(page, "show_info", notices.append)
+    page.enrich_order_lines()
+    assert notices == ["当前范围内没有需要匹配的订单元件"]
+    assert database.import_order_lines([line], location["id"])["imported"] == 1
+    assert database.get_component(existing["id"])["jlc_matched"] == 1
+    assert database.list_inventory_lots()[0]["component_id"] == existing["id"]
 
 
 def test_order_import_cancel_clears_preview(qtbot: Any, tmp_path: Path) -> None:
@@ -882,7 +932,9 @@ def test_reupload_same_order_file_continues_next_batch(
     assert page.lines[0].name == "续导元件3"
 
 
-def test_transactions_merge_group_and_expand_details(qtbot: Any, tmp_path: Path) -> None:
+def test_transactions_merge_group_and_expand_details(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """同一原子操作只显示一条摘要，展开后仍可查看原始流水。"""
 
     database = Database(tmp_path / "inventory.db")
@@ -927,6 +979,126 @@ def test_transactions_merge_group_and_expand_details(qtbot: Any, tmp_path: Path)
     )
     assert table.cellWidget(single_summary, 0) is None
 
+    page = window.transactions_page
+    page.query.setText("C9000002")
+    qtbot.waitUntil(lambda: table.rowCount() == 1)
+    assert table.item(0, 3).text() == "批量元件2"
+    assert page.filtered_rows[0]["quantity_delta"] == 2
+    destination = tmp_path / "流水.csv"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_args: (str(destination), "CSV"))
+    monkeypatch.setattr(page, "show_info", lambda _message: None)
+    page.export_filtered()
+    with destination.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [(row["立创编号"], row["数量变动"]) for row in rows] == [("C9000002", "2")]
+
+
+def test_inventory_facets_and_purchase_dates_filter_batches(qtbot: Any, tmp_path: Path) -> None:
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A"))
+    component = database.create_component(
+        ComponentCreate(name="电阻", category="电阻", brand="品牌 A", package="0603")
+    )
+    database.create_component(
+        ComponentCreate(name="电容", category="电容", brand="品牌 B", package="0805")
+    )
+    for quantity, date in ((1, "2026-10-01"), (2, "2026-11-01")):
+        database.receive(ReceiveRequest(
+            component_id=component["id"], location_id=location["id"],
+            quantity=quantity, purchase_date=date,
+        ))
+    page = InventoryPage(database)
+    qtbot.addWidget(page)
+    page.brand_filter.setCurrentIndex(page.brand_filter.findData("品牌 A"))
+    assert page.category_filter.findData("电容") == -1
+    assert page.package_filter.findData("0805") == -1
+    assert page.table.rowCount() == 2
+    page.date_field.setCurrentIndex(page.date_field.findData("purchase_date"))
+    page.date_range.start.setDate(QDate(2026, 11, 1))
+    page.date_range.end.setDate(QDate(2026, 11, 1))
+    page.date_range.enabled.setChecked(True)
+    assert page.table.rowCount() == 1
+    assert page.table.item(0, 9).text() == "2"
+    assert page.table.item(0, 21).text() == "3"
+    rows = database.inventory_export_rows(page.visible_component_ids, lot_ids=page.visible_lot_ids)
+    assert [row["quantity"] for row in rows] == [2]
+
+
+def test_inventory_supplement_respects_request_limit(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    for index in range(3):
+        database.create_component(ComponentCreate(name=f"元件 {index}", lcsc_part_number=f"C1234{index}"))
+    page = InventoryPage(database)
+    qtbot.addWidget(page)
+    requested: list[tuple[str, str, str]] = []
+
+    def confirm(dialog: QDialog) -> QDialog.DialogCode:
+        labels = {label.text(): label for label in dialog.findChildren(QLabel)}
+        assert labels["自动补充范围"].alignment() == Qt.AlignmentFlag.AlignCenter
+        assert "为避免封IP风险请勿一次进行过多请求。" in labels
+        limit = dialog.findChild(QSpinBox)
+        assert limit is not None
+        limit.setValue(2)
+        return QDialog.DialogCode.Accepted
+
+    class Browser:
+        def __init__(self, targets: list[tuple[str, str, str]], _parent: InventoryPage) -> None:
+            requested.extend(targets)
+
+        def start(self) -> None:
+            pass
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", confirm)
+    monkeypatch.setattr(main_window_module, "JlcBatchBrowserDialog", Browser)
+    menu = page.enrich_button.menu()
+    assert menu is not None
+    next(action for action in menu.actions() if action.text() == "从立创商城…").trigger()
+    assert len(requested) == 2
+
+
+def test_inventory_supplements_existing_component_from_file(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "orders.html"
+    path.write_text(ORDER_HTML, encoding="utf-8")
+    database = Database(tmp_path / "inventory.db")
+    item = database.create_component(
+        ComponentCreate(name="自定义名称", lcsc_part_number="C27636670", brand="已有品牌")
+    )
+    page = InventoryPage(database)
+    qtbot.addWidget(page)
+    notices: list[str] = []
+    monkeypatch.setattr(page, "show_info", notices.append)
+    monkeypatch.setattr(page, "show_error", pytest.fail)
+
+    def confirm(dialog: QDialog) -> QDialog.DialogCode:
+        if isinstance(dialog, OrderFilesDialog):
+            dialog.web.setText(str(path))
+            dialog.accept()
+            return QDialog.DialogCode(dialog.result())
+        assert dialog.windowTitle() == "确认补充资料"
+        assert database.get_component(item["id"])["package"] is None
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", confirm)
+    menu = page.enrich_button.menu()
+    assert menu is not None
+    next(action for action in menu.actions() if action.text() == "从文件…").trigger()
+    qtbot.waitUntil(lambda: bool(notices))
+    detail = database.get_component(item["id"])
+    assert detail["manufacturer_part_number"] == "GS2821CR-G"
+    assert detail["package"] == "SMD,15.2x13mm"
+    assert detail["name"] == "自定义名称" and detail["brand"] == "已有品牌"
+    assert len(database.list_components()) == 1
+    assert database.list_inventory_lots() == []
+    assert database.list_transactions() == []
+
 
 def test_frame_counts_only_appear_in_debug_mode(qtbot: Any, tmp_path: Path) -> None:
     window = MainWindow(Database(tmp_path / "inventory.db"), RecognitionEngine(), "token")
@@ -940,10 +1112,193 @@ def test_frame_counts_only_appear_in_debug_mode(qtbot: Any, tmp_path: Path) -> N
     issue.set_debug_mode(True)
     issue._barcode_decoded(None)
     assert "12 帧" in issue.scan_status.text()
-    window.settings_page.refresh_debug_output()
-    output = window.settings_page.debug_output.toPlainText()
-    assert f"版本: {__version__}" in output
-    assert "线程池活动数" in output
+    window.set_debug_mode(True)
+    window._show_main_page(2)
+    window._refresh_debug_overlay()
+    output = window.debug_overlay.text()
+    assert "frames=12" in output and "[" not in output
+
+
+def test_debug_log_appends_and_follows_only_at_end(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    preferences.setValue("debug_mode", True)
+    monkeypatch.setattr(main_window_module, "QSettings", lambda *_args: preferences)
+    path = tmp_path / "test.log"
+    path.write_text("2026-11-12 08:00:00,000 INFO test.legacy: 旧格式事件\n", encoding="utf-8")
+    handler = DebugLogHandler(path)
+    logger = logging.Logger("test.debug", logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        for index in range(80):
+            logger.info("历史事件 %s", index)
+        page = SettingsPage(Database(tmp_path / "inventory.db"), "token", log_handler=handler)
+        qtbot.addWidget(page)
+        page.resize(700, 420)
+        page.tabs.setCurrentIndex(3)
+        page.show()
+        scrollbar = page.debug_output.verticalScrollBar()
+        qtbot.waitUntil(lambda: scrollbar.maximum() > 5)
+        scrollbar.setValue(5)
+        initial = page.debug_output.toPlainText()
+        assert "[2026-11-12 08:00:00,000][INFO][test.legacy] 旧格式事件" in initial
+        assert initial.count("[INFO][运行环境]") == 1
+        assert f"版本: {__version__}" in initial and "线程池活动数" in initial
+        worker = Thread(target=logger.info, args=("工作线程事件",))
+        worker.start()
+        worker.join()
+        qtbot.waitUntil(lambda: "工作线程事件" in page.debug_output.toPlainText())
+        assert page.debug_output.toPlainText().startswith(initial)
+        assert scrollbar.value() == 5
+
+        scrollbar.setValue(scrollbar.maximum())
+        handler.doRollover()
+        logger.warning("轮换后的事件")
+        qtbot.waitUntil(lambda: "[WARNING][test.debug] 轮换后的事件" in page.debug_output.toPlainText())
+        assert scrollbar.value() == scrollbar.maximum()
+        assert page.debug_output.toPlainText().count("工作线程事件") == 1
+
+        page.debug_toggle.setChecked(False)
+        logger.info("重新启用前的事件")
+        page.debug_toggle.setChecked(True)
+        logger.info("重新启用后的事件")
+        qtbot.waitUntil(lambda: "重新启用后的事件" in page.debug_output.toPlainText())
+        assert page.debug_output.toPlainText().count("重新启用前的事件") == 1
+        assert path.with_suffix(".log.1").read_text(encoding="utf-8").count("[INFO][运行环境]") == 1
+        assert "[INFO][运行环境]" not in path.read_text(encoding="utf-8")
+
+        menu = page.debug_level_button.menu()
+        next(action for action in menu.actions() if action.text() == "WARNING").trigger()
+        logger.info("低于最低等级")
+        logger.error("错误首行\n错误续行")
+        qtbot.waitUntil(lambda: "[ERROR][test.debug] 错误续行" in page.debug_output.toPlainText())
+        assert "重新启用后的事件" not in page.debug_output.toPlainText()
+        assert "低于最低等级" not in path.read_text(encoding="utf-8")
+        assert preferences.value("debug/log_level") == "WARNING"
+        next(action for action in menu.actions() if action.text() == "DEBUG").trigger()
+        logger.debug("调试级事件")
+        qtbot.waitUntil(lambda: "[DEBUG][test.debug] 调试级事件" in page.debug_output.toPlainText())
+    finally:
+        handler.close()
+
+
+def test_maintenance_settings_match_backup_and_require_exact_reset_confirmation(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preferences = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(main_window_module, "QSettings", lambda *_args: preferences)
+    database = Database(tmp_path / "inventory.db")
+    item = database.create_component(ComponentCreate(name="电阻", lcsc_part_number="C270654"))
+    database.save_component_parameter_groups(item["id"], [
+        JlcParameterGroup(name="采购信息", parameters=[
+            JlcParameter(key="purchase_price", label="购入单价", value="0.125"),
+        ]),
+    ])
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    page = window.settings_page
+    inventory_page = window.inventory_page
+    class FakeBrowser(QObject):
+        succeeded = Signal(object)
+        failed = Signal(str, bool)
+
+        def __init__(self, part_number: str, _url: str, owner: QObject) -> None:
+            super().__init__(owner)
+            self.part_number = part_number
+            self.cancelled = False
+            browsers.append(self)
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    browsers: list[FakeBrowser] = []
+    monkeypatch.setattr(main_window_module, "JlcBackgroundBrowser", FakeBrowser)
+    price_column = next(
+        column for column in range(inventory_page.table.columnCount())
+        if inventory_page.table.horizontalHeaderItem(column).text() == "购入价格"
+    )
+    assert inventory_page.table.item(0, price_column).data(Qt.ItemDataRole.DisplayRole) == 0.125
+    assert not page.match_timer.isActive()
+    page.auto_match.setChecked(True)
+    assert 1_000 <= page.match_timer.interval() <= 60_000
+    assert page.match_status.text() == ""
+    monkeypatch.setattr(main_window_module.random, "getrandbits", lambda _bits: 0)
+    page._match_tick()
+    assert database.get_component(item["id"])["jlc_matched"] == 0
+    assert page.match_timer.interval() == 60_000
+    monkeypatch.setattr(main_window_module.random, "getrandbits", lambda _bits: 1)
+    page._match_tick()
+    assert len(browsers) == 1 and browsers[0].part_number == "C270654"
+    page._match_tick()
+    assert len(browsers) == 1
+    browsers[0].succeeded.emit(parse_jlc_product_page("https://item.szlcsc.com/12345.html", PRODUCT_HTML))
+    assert database.get_component(item["id"])["jlc_matched"] == 1
+    page._match_tick()
+    assert page.match_stats.text() == "商城自动匹配次数 1　成功次数 1"
+    assert preferences.value("matching/browser_attempts", type=int) == 1
+    assert preferences.value("matching/browser_successes", type=int) == 1
+
+    database.create_component(ComponentCreate(name="另一元件", lcsc_part_number="C270655"))
+    page._match_tick()
+    assert len(browsers) == 2 and browsers[1].part_number == "C270655"
+    page.jlc_updates.setChecked(False)
+    assert browsers[1].cancelled and not page.match_timer.isActive() and page.auto_match.isHidden()
+    assert page.match_stats.isHidden() and page.match_status.isHidden()
+    for table in (inventory_page.table, window.order_page.table):
+        column = next(
+            index for index in range(table.columnCount())
+            if table.horizontalHeaderItem(index).text() == "资料匹配"
+        )
+        assert table.isColumnHidden(column)
+    assert not preferences.value("matching/jlc_updates", type=bool)
+    assert all(control.isHidden() for control in window.receive_page.jlc_update_controls)
+    assert all(control.isHidden() for control in window.order_page.jlc_update_controls)
+    menu = inventory_page.enrich_button.menu()
+    assert [action.text() for action in menu.actions() if action.isVisible()] == ["从文件…"]
+    page.jlc_updates.setChecked(True)
+    assert page.match_timer.isActive() and not page.auto_match.isHidden()
+    assert not page.match_stats.isHidden() and page.match_status.text() == ""
+    assert not inventory_page.table.isColumnHidden(20)
+    assert not window.order_page.table.isColumnHidden(5)
+    page._match_tick()
+    browsers[-1].failed.emit("商城要求登录", True)
+    assert not page.auto_match.isChecked() and page.match_status.text() == "商城要求登录"
+    page.auto_match.setChecked(False)
+    assert not page.match_timer.isActive()
+
+    page.backup_interval.setValue(10)
+    page.backup_retain.setValue(2)
+    page.auto_backup.setChecked(True)
+    qtbot.waitUntil(lambda: not page._backup_running)
+    assert len(database.automatic_backups()) == 1
+    first = database.automatic_backups()[0]
+    page._check_automatic_backup()
+    assert not page._backup_running
+    assert 0 < page.backup_timer.remainingTime() <= 600_000
+    ten_minutes_ago = time.time() - 601
+    os.utime(first, (ten_minutes_ago, ten_minutes_ago))
+    page._check_automatic_backup()
+    qtbot.waitUntil(lambda: not page._backup_running)
+    assert len(database.automatic_backups()) == 2
+    assert preferences.value("backup/interval_minutes", type=int) == 10
+    assert preferences.value("backup/retain", type=int) == 2
+    page.auto_backup.setChecked(False)
+
+    notices: list[str] = []
+    monkeypatch.setattr(page, "show_info", notices.append)
+    monkeypatch.setattr(page, "show_error", notices.append)
+    pending = database.path.with_suffix(".restore-pending.db")
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args: ("yes", True))
+    page.reset_data()
+    assert not pending.exists()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args: ("YES", True))
+    page.reset_data()
+    assert pending.exists()
+    assert database.get_component(item["id"])["name"] == "电阻"
 
 
 def test_inline_cell_editing_saves_on_finish(qtbot: Any, tmp_path: Path) -> None:

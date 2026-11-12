@@ -311,6 +311,40 @@ def test_backup_is_valid(inventory: tuple[Database, dict, dict, dict], tmp_path:
     assert len(result["sha256"]) == 64
 
 
+def test_automatic_backup_retention_and_reset_recovery(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, component, _, location = inventory
+    database.receive(
+        ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=3)
+    )
+    first = Path(database.automatic_backup(1)["path"])
+    manual = Path(database.backup(database.automatic_backup_directory)["path"])
+    second = Path(database.automatic_backup(1)["path"])
+    assert not first.exists() and not first.with_suffix(".db.sha256").exists()
+    assert database.automatic_backups() == [second]
+    assert manual.exists()
+
+    database.prepare_reset()
+    assert total(database, component["id"]) == 3
+    assert Database.apply_pending_restore(database.path)
+    restored = Database(database.path)
+    assert restored.list_components() == []
+    assert restored.list_transactions() == []
+    previous = Database(database.path.with_suffix(".before-restore.db"))
+    assert total(previous, component["id"]) == 3
+
+    checksum = second.with_suffix(".db.sha256")
+    contents = checksum.read_bytes()
+    checksum.write_text("bad", encoding="ascii")
+    with pytest.raises(DomainError, match="SHA-256"):
+        restored.prepare_restore(second)
+    checksum.write_bytes(contents)
+    restored.prepare_restore(second)
+    assert Database.apply_pending_restore(restored.path)
+    assert total(Database(restored.path), component["id"]) == 3
+
+
 def test_component_procurement_fields_and_integer_quantity(
     inventory: tuple[Database, dict, dict, dict],
 ) -> None:

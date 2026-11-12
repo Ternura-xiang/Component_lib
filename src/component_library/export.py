@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from collections.abc import Collection, Iterable
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from openpyxl import Workbook
@@ -34,6 +35,25 @@ DETAIL_COLUMNS = (
     ("product_url", "商品链接"),
     ("datasheet_url", "数据手册"),
     ("notes", "备注"),
+)
+
+TRANSACTION_COLUMNS = (
+    ("created_at", "时间"),
+    ("kind", "类型"),
+    ("component_name", "元件"),
+    ("lcsc_part_number", "立创编号"),
+    ("manufacturer_part_number", "制造商料号"),
+    ("custom_part_number", "自定义编号"),
+    ("quantity_delta", "数量变动"),
+    ("warehouse_name", "位置"),
+    ("location_name", "仓库"),
+    ("source", "来源"),
+    ("operation_platform", "操作端"),
+    ("notes", "备注"),
+    ("group_id", "事务组"),
+    ("id", "流水编号"),
+    ("lot_id", "批次库存编号"),
+    ("reversal_of", "冲销原流水编号"),
 )
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
@@ -73,11 +93,12 @@ def _append_rows(sheet: Worksheet, headers: Iterable[str], rows: Iterable[Iterab
 
 
 def export_inventory_csv(
-    database: Database, destination: Path, component_ids: Collection[str] | None = None
+    database: Database, destination: Path, component_ids: Collection[str] | None = None,
+    *, lot_ids: Collection[str] | None = None,
 ) -> Path:
     """把库存明细写为带 UTF-8 BOM 的 CSV，兼容 Excel 直接打开。"""
 
-    rows = database.inventory_export_rows(component_ids)
+    rows = database.inventory_export_rows(component_ids, lot_ids=lot_ids)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -90,12 +111,13 @@ def export_inventory_csv(
 
 
 def export_inventory_xlsx(
-    database: Database, destination: Path, component_ids: Collection[str] | None = None
+    database: Database, destination: Path, component_ids: Collection[str] | None = None,
+    *, lot_ids: Collection[str] | None = None,
 ) -> Path:
     """导出概览、库存明细、分库统计和分类统计四张工作表。"""
 
-    rows = database.inventory_export_rows(component_ids)
-    statistics = database.inventory_statistics(component_ids)
+    rows = database.inventory_export_rows(component_ids, lot_ids=lot_ids)
+    statistics = database.inventory_statistics(component_ids, lot_ids=lot_ids)
     workbook = Workbook()
 
     overview = workbook.active
@@ -156,4 +178,42 @@ def export_inventory_xlsx(
     temporary = destination.with_name(f".{destination.stem}.tmp.xlsx")
     workbook.save(temporary)
     temporary.replace(destination)
+    return destination
+
+
+def export_transactions(rows: Iterable[dict[str, Any]], destination: Path) -> Path:
+    """以 CSV 或 Excel 保存筛选后的原始流水，一条库存变动占一行。"""
+
+    headers = [label for _, label in TRANSACTION_COLUMNS]
+    values = ([row.get(key) for key, _ in TRANSACTION_COLUMNS] for row in rows)
+    is_csv = destination.suffix.casefold() == ".csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        if is_csv:
+            with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                for row in values:
+                    writer.writerow([
+                        "'" + value
+                        if isinstance(value, str) and value.lstrip()[:1] in {"=", "+", "-", "@"}
+                        else value
+                        for value in row
+                    ])
+        else:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "库存流水"
+            _append_rows(sheet, headers, values)
+            for row in sheet.iter_rows(min_row=2):
+                for cell in row:
+                    if isinstance(cell.value, str):
+                        cell.data_type = "s"
+            _style_table(sheet)
+            workbook.save(temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination

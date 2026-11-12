@@ -7,6 +7,7 @@ import pytest
 
 from component_library.database import Database, DomainError
 from component_library.jlc_product import (
+    find_jlc_product_link,
     is_blocked_jlc_navigation,
     is_jlc_product_url,
     parse_jlc_product_page,
@@ -64,6 +65,52 @@ def test_parse_rendered_product_page_without_network() -> None:
     assert "页面库存" not in labels
     assert "替代型号" not in labels
     assert "推荐商品" not in labels
+
+
+def test_online_product_matches_exact_component_and_preserves_existing_fields(tmp_path: Path) -> None:
+    draft = parse_jlc_product_page(
+        "https://item.szlcsc.com/12345.html", PRODUCT_HTML, require_page_number=True
+    )
+    database = Database(tmp_path / "inventory.db")
+    item = database.create_component(
+        ComponentCreate(name="我的电阻", brand="已有品牌", lcsc_part_number=draft.lcsc_part_number)
+    )
+    other = database.create_component(ComponentCreate(name="其他电阻", lcsc_part_number="C34567"))
+    database.save_component_parameters(item["id"], {"resistance": ("阻值", "100Ω")})
+    assert database.apply_jlc_product_match(other["id"], draft) is False
+    assert database.apply_jlc_product_match(item["id"], draft) is True
+    detail = database.get_component(item["id"])
+    assert (detail["name"], detail["brand"], detail["package"]) == ("我的电阻", "已有品牌", "0402")
+    parameters = {parameter["parameter_key"]: parameter["value"] for parameter in detail["category_parameters"]}
+    assert parameters["resistance"] == "100Ω" and parameters["tolerance"] == "±1%"
+    assert detail["jlc_matched"] == 1
+    assert database.get_component(other["id"])["jlc_matched"] == 0
+    assert database.apply_jlc_product_match(item["id"], draft) is False
+    assert database.next_unmatched_jlc_component(item["id"])["id"] == other["id"]
+
+
+def test_background_search_requires_exact_link_and_detail_identity() -> None:
+    url = "https://so.szlcsc.com/global.html?k=C270654"
+    html = """
+    <div><a href="https://item.szlcsc.com/1000.html">A</a><span>C270654</span></div>
+    <div><a href="https://item.szlcsc.com/2000.html">B</a><span>C2706540</span></div>
+    """
+    assert find_jlc_product_link(url, html, "C270654") == "https://item.szlcsc.com/1000.html"
+    assert find_jlc_product_link(url, html, "C27065") is None
+    with pytest.raises(DomainError, match="立创编号"):
+        parse_jlc_product_page(
+            "https://item.szlcsc.com/product/C270654.html",
+            "<h1>其他商品</h1><aside>相关推荐 C270654</aside>",
+            require_page_number=True,
+        )
+
+
+def test_product_parser_rejects_login_wall_even_with_product_url() -> None:
+    with pytest.raises(DomainError, match="要求登录或验证"):
+        parse_jlc_product_page(
+            "https://item.szlcsc.com/product/C270654.html",
+            "<html><title>立创商城</title><p>请登录后访问</p></html>",
+        )
 
 
 def test_only_product_parameter_section_is_imported() -> None:

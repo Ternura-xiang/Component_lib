@@ -276,10 +276,10 @@ class MosfetDetails(BaseModel):
 
 
 class OrderImportLine(BaseModel):
-    """从用户保存的订单页面提取的一条待确认商品记录。"""
+    """从订单网页或物料明细对账单提取的一条待确认商品记录。"""
 
     order_number: str = Field(min_length=1)
-    purchased_at: str = Field(min_length=1)
+    purchased_at: str | None = Field(default=None, min_length=1)
     lcsc_part_number: str = Field(pattern=r"^C\d{4,10}$")
     name: str = Field(min_length=1)
     description: str | None = None
@@ -287,7 +287,8 @@ class OrderImportLine(BaseModel):
     manufacturer_part_number: str | None = None
     package: str | None = None
     brand: str | None = None
-    unit_price: float = Field(ge=0)
+    unit_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    purchase_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     quantity: int = Field(gt=0)
     product_url: str | None = None
     datasheet_url: str | None = None

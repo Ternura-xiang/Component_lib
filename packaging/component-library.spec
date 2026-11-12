@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from PyInstaller.compat import is_win
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 root = Path(SPECPATH).parent
 icon_png = root / "packaging" / "assets" / "icons" / "component-library.png"
@@ -25,7 +25,7 @@ a = Analysis(
     [str(root / "packaging" / "entry.py")],
     pathex=[str(root / "src")],
     binaries=rapidocr_binaries,
-    datas=rapidocr_datas + app_datas,
+    datas=rapidocr_datas + app_datas + copy_metadata("xlrd"),
     hiddenimports=rapidocr_hidden
     + [
         "uvicorn.logging",
