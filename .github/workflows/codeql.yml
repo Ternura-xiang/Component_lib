@@ -1,0 +1,57 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # The hosted image includes Android SDK Platform 37 and Build Tools 37.0.0.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            build-mode: none
+          - language: java-kotlin
+            build-mode: manual
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build Android for CodeQL
+        if: matrix.language == 'java-kotlin'
+        working-directory: android
+        run: >-
+          ./gradlew --no-daemon --no-build-cache --rerun-tasks
+          -Pkotlin.compiler.execution.strategy=in-process -Pkotlin.incremental=false
+          :app:assembleDebug
+
+      - name: Analyze and upload results
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:${{ matrix.language }}'

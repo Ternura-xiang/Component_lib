@@ -3,8 +3,10 @@
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from PySide6.QtNetwork import QHostAddress, QNetworkInterface
 
 from component_library.connection import MDNS_SERVICE_TYPE, ConnectionManager
 from component_library.database import Database, DomainError
@@ -23,6 +25,39 @@ def test_mdns_service_type_respects_dns_sd_label_limit() -> None:
 
     service_label = MDNS_SERVICE_TYPE.removeprefix("_").split(".", 1)[0]
     assert len(service_label.encode("ascii")) <= 15
+
+
+def test_pairing_prefers_lan_interfaces_over_tunnel_addresses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    flags = QNetworkInterface.InterfaceFlag
+    types = QNetworkInterface.InterfaceType
+    active = flags.IsUp | flags.IsRunning
+
+    def interface(
+        kind: QNetworkInterface.InterfaceType,
+        state: QNetworkInterface.InterfaceFlag,
+        *addresses: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            type=lambda: kind,
+            flags=lambda: state,
+            addressEntries=lambda: [
+                SimpleNamespace(ip=lambda value=value: QHostAddress(value)) for value in addresses
+            ],
+        )
+
+    monkeypatch.setattr(
+        QNetworkInterface,
+        "allInterfaces",
+        lambda: [
+            interface(types.Virtual, active, "198.18.0.1", "198.19.0.1", "10.1.1.1"),
+            interface(types.Wifi, active, "192.168.1.10", "fe80::1"),
+            interface(types.Ethernet, flags.IsUp, "172.16.0.1"),
+        ],
+    )
+    manager = ConnectionManager(Database(tmp_path / "inventory.db"), tmp_path)
+    assert manager.pairing_payload()["addresses"] == ["192.168.1.10", "10.1.1.1"]
 
 
 def stock_fixture(database: Database, *, second: bool = False) -> dict[str, str]:

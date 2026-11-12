@@ -15,6 +15,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.IOException
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.cert.CertificateFactory
@@ -167,9 +168,7 @@ class ApiClient(private var credential: ServerCredential) {
             val payload = parsePairingPayload(payloadText)
             val protocol = payload.getInt("protocol")
             val addresses = payload.getJSONArray("addresses")
-            val host = addresses.getString(0)
             val port = payload.getInt("port")
-            val baseUrl = "https://$host:$port"
             val payloadCa = payload.optString("ca_pem")
             val pairingClient = if (protocol == 1) {
                 require(payloadCa.isNotBlank()) { "旧版配对载荷缺少 CA 证书" }
@@ -177,16 +176,17 @@ class ApiClient(private var credential: ServerCredential) {
             } else {
                 pinnedClient(payload.getString("server_cert_sha256"))
             }
-            DiagnosticLog.record("PAIRING_CONNECT", "protocol=$protocol host=$host port=$port")
-            val capabilities = execute(
-                pairingClient,
-                Request.Builder().url("$baseUrl/api/v1/capabilities").build(),
-            )
-            require(capabilities.getInt("api_major") == 1) { "桌面端 API 主版本不兼容" }
+            val host = findPairingHost((0 until addresses.length()).map(addresses::getString)) { candidate ->
+                DiagnosticLog.record("PAIRING_CONNECT", "protocol=$protocol host=$candidate port=$port")
+                val capabilities = runCatching {
+                    execute(pairingClient, Request.Builder().url("https://$candidate:$port/api/v1/capabilities").build())
+                }.onFailure { DiagnosticLog.recordFailure("PAIRING_CONNECT_FAILURE", it) }.getOrThrow()
+                require(capabilities.getInt("api_major") == 1) { "桌面端 API 主版本不兼容" }
+            }
             val jsonType = "application/json; charset=utf-8".toMediaType()
             val response = execute(
                 pairingClient,
-                Request.Builder().url("$baseUrl/api/v1/pairing").post(
+                Request.Builder().url("https://$host:$port/api/v1/pairing").post(
                     JSONObject()
                         .put("pairing_code", payload.getString("pairing_code"))
                         .put("device_name", deviceName)
@@ -211,6 +211,22 @@ class ApiClient(private var credential: ServerCredential) {
                 response.getString("device_id"),
                 response.getString("device_token"),
             )
+        }
+
+        internal fun findPairingHost(addresses: List<String>, probe: (String) -> Unit): String {
+            val candidates = addresses.map(String::trim).filter { address ->
+                address.isNotEmpty() && !address.startsWith("198.18.") && !address.startsWith("198.19.")
+            }.distinct()
+            require(candidates.isNotEmpty()) { "配对码中没有可用的局域网地址，请在电脑上重新生成配对码" }
+            for (host in candidates) {
+                try {
+                    probe(host)
+                    return host
+                } catch (_: IOException) {
+                    // 探测不消耗一次性配对码，可继续尝试其他网卡地址。
+                }
+            }
+            throw ApiException("无法连接电脑（${candidates.joinToString()}），请检查电脑防火墙是否允许元件库的 HTTPS 端口")
         }
 
         private fun execute(client: OkHttpClient, request: Request): JSONObject {
@@ -263,7 +279,9 @@ class ApiClient(private var credential: ServerCredential) {
             OkHttpClient.Builder()
                 .sslSocketFactory(context.socketFactory, trustManager)
                 .connectTimeout(5, TimeUnit.SECONDS)
-                .readTimeout(90, TimeUnit.SECONDS)
+                .callTimeout(8, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false)
+                .followRedirects(false)
                 .build()
 
         private fun decodeCertificate(caPem: String): X509Certificate =

@@ -14,11 +14,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
+
 from .database import Database, DomainError, utc_now
 
 # DNS-SD 的服务类型标签（不含开头下划线）最多 15 字节。
 # `component-library` 超出限制，因此协议统一使用较短的 componentlib。
 MDNS_SERVICE_TYPE = "_componentlib._tcp.local."
+BENCHMARK_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
 
 
 def _token_hash(token: str) -> str:
@@ -56,24 +59,30 @@ class ConnectionManager:
 
     @staticmethod
     def addresses() -> list[str]:
-        """返回适合展示和写入证书的非回环 IPv4 地址。"""
+        """枚举活动网卡上的 IPv4 地址，优先使用有线和无线局域网。"""
 
-        found: set[str] = set()
-        try:
-            for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-                address = str(item[4][0])
-                if not ipaddress.ip_address(address).is_loopback:
-                    found.add(address)
-        except OSError:
-            pass
-        try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            probe.connect(("192.0.2.1", 9))
-            found.add(probe.getsockname()[0])
-            probe.close()
-        except OSError:
-            pass
-        return sorted(found)
+        flags = QNetworkInterface.InterfaceFlag
+        lan_types = (QNetworkInterface.InterfaceType.Ethernet, QNetworkInterface.InterfaceType.Wifi)
+        lan: set[ipaddress.IPv4Address] = set()
+        other: set[ipaddress.IPv4Address] = set()
+        for interface in QNetworkInterface.allInterfaces():
+            state = interface.flags()
+            if not (state & flags.IsUp and state & flags.IsRunning) or state & flags.IsLoopBack:
+                continue
+            target = lan if interface.type() in lan_types else other
+            for entry in interface.addressEntries():
+                ip = entry.ip()
+                if ip.protocol() != QAbstractSocket.NetworkLayerProtocol.IPv4Protocol:
+                    continue
+                address = ipaddress.IPv4Address(ip.toIPv4Address())
+                if not (
+                    address.is_unspecified
+                    or address.is_loopback
+                    or address.is_multicast
+                    or address in BENCHMARK_NETWORK
+                ):
+                    target.add(address)
+        return [str(address) for address in sorted(lan) + sorted(other - lan)]
 
     def ensure_certificate(self) -> None:
         """创建持久本地 CA，并为当前局域网地址签发服务器证书。"""
@@ -288,7 +297,7 @@ class ConnectionManager:
             return
         from zeroconf import ServiceInfo, Zeroconf
 
-        self._zeroconf = Zeroconf()
+        self._zeroconf = Zeroconf(interfaces=addresses)
         self._service_info = ServiceInfo(
             MDNS_SERVICE_TYPE,
             f"{self.server_id}.{MDNS_SERVICE_TYPE}",

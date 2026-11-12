@@ -50,6 +50,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,17 +82,33 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     val state = mutableState.asStateFlow()
 
     init {
-        credential?.let { saved ->
-            discovery.start(saved.serverId) { host, port ->
-                if (saved.host != host || saved.port != port) {
-                    credential = saved.copy(host = host, port = port).also(store::save)
-                    api = credential?.let(::ApiClient)
-                }
-                refresh()
-            }
-        }
+        credential?.let(::startDiscovery)
         refresh()
         startDeviceMonitor()
+    }
+
+    private fun startDiscovery(paired: ServerCredential) {
+        discovery.start(paired.serverId) { host, port ->
+            viewModelScope.launch {
+                val current = credential ?: return@launch
+                if (current.deviceId != paired.deviceId || (current.host == host && current.port == port)) return@launch
+                val candidate = current.copy(host = host, port = port)
+                val candidateApi = ApiClient(candidate)
+                try {
+                    withContext(Dispatchers.IO) { candidateApi.heartbeat() }
+                } catch (failure: CancellationException) {
+                    throw failure
+                } catch (failure: Exception) {
+                    DiagnosticLog.recordFailure("DISCOVERY_CONNECT_FAILURE", failure)
+                    return@launch
+                }
+                if (credential === current) {
+                    credential = candidate.also(store::save)
+                    api = candidateApi
+                    refresh()
+                }
+            }
+        }
     }
 
     private fun work(block: suspend () -> Unit) {
@@ -107,14 +124,15 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     fun pair(payload: String) = work {
         val name = Settings.Global.getString(getApplication<Application>().contentResolver, "device_name")
             ?: android.os.Build.MODEL
-        val paired = withContext(Dispatchers.IO) { ApiClient.pair(payload, name) }
+        val paired = withContext(Dispatchers.IO) {
+            runCatching { ApiClient.pair(payload, name) }
+                .onFailure { DiagnosticLog.recordFailure("PAIRING_FAILURE", it) }
+                .getOrThrow()
+        }
         store.save(paired)
         credential = paired
         api = ApiClient(paired)
-        discovery.start(paired.serverId) { host, port ->
-            credential = paired.copy(host = host, port = port).also(store::save)
-            api = credential?.let(::ApiClient)
-        }
+        startDiscovery(paired)
         refreshConnection()
     }
 
