@@ -519,6 +519,8 @@ class JlcBatchMergeDialog(QDialog):
         layout.addWidget(hint)
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["元件 / 字段", "现有值", "商城值", "类型"])
+        if heading := self.table.horizontalHeaderItem(0):
+            heading.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(0, 360)
         self.table.setColumnWidth(1, 280)
@@ -580,7 +582,8 @@ class JlcBatchMergeDialog(QDialog):
         header_layout.setContentsMargins(6, 1, 4, 1)
         header_layout.setSpacing(4)
         header_layout.addWidget(master)
-        header_layout.addWidget(toggle, 1)
+        header_layout.addWidget(toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        header_layout.addStretch(1)
         self.table.setCellWidget(header, 0, header_widget)
         for column, value in ((1, ""), (2, ""), (3, "元件")):
             item = QTableWidgetItem(value)
@@ -624,7 +627,7 @@ class JlcBatchMergeDialog(QDialog):
             field_layout.setContentsMargins(28, 1, 4, 1)
             field_layout.setSpacing(4)
             field_layout.addWidget(check)
-            field_layout.addWidget(QLabel(label), 1)
+            field_layout.addWidget(QLabel(label), 1, Qt.AlignmentFlag.AlignLeft)
             self.table.setCellWidget(row, 0, field_widget)
             for column, value in (
                 (1, current),

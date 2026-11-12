@@ -11,6 +11,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -40,6 +42,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -346,6 +349,11 @@ fun MobileApp(model: MobileViewModel = viewModel()) {
     }
     if (scannerMode == "PAIR" || (scannerMode == "SESSION" && kind == "BOM_PICK")) {
         BarcodeScannerScreen(
+            validateCode = if (scannerMode == "PAIR") {
+                { value ->
+                    runCatching { ApiClient.parsePairingPayload(value) }.exceptionOrNull()?.message
+                }
+            } else null,
             onCode = { value ->
                 val mode = scannerMode
                 scannerMode = null
@@ -615,13 +623,17 @@ private fun InventorySession(
         val source = if (batch.text("source_type").equals("JLC", true)) "立创" else "自定义"
         Text("批次 $label · $source · 原始 ${batch.optInt("initial_quantity")} · 剩余 ${batch.optInt("remaining_quantity")}")
     }
-    val locations = if (receive) snapshot.optJSONArray("locations").objects().map {
+    val storageRows = if (receive) snapshot.optJSONArray("locations").objects() else stock
+    val locations = if (receive) storageRows.map {
         it.text("id") to "${it.text("warehouse_name")} / ${it.text("name")}"
     } else listOf("" to "全部仓库（${batch?.optInt("remaining_quantity")}）") + stock.map {
         it.text("location_id") to "${it.text("warehouse_name")} / ${it.text("location_name")}（${it.optInt("remaining_quantity")}）"
     }
+    val storageColors = storageRows.associate {
+        it.text(if (receive) "id" else "location_id") to it.text("color")
+    }
     Text(if (receive) "位置 / 仓库与数量" else "位置 / 仓库", style = MaterialTheme.typography.titleMedium)
-    InventoryChoice("位置 / 仓库", locationId, locations, !busy) {
+    InventoryChoice("位置 / 仓库", locationId, locations, !busy, storageColors) {
         locationId = it
         if (!receive && form.orEmptyStream()) {
             onCommand("SELECT_ISSUE_LOCATION",
@@ -659,17 +671,29 @@ private fun InventoryText(value: String, label: String, enabled: Boolean, change
 
 @Composable
 private fun InventoryChoice(label: String, value: String, options: List<Pair<String, String>>,
-                            enabled: Boolean, change: (String) -> Unit) {
+                            enabled: Boolean, colors: Map<String, String> = emptyMap(),
+                            change: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         Button(onClick = { expanded = true }, enabled = enabled && options.isNotEmpty()) {
-            Text(options.firstOrNull { it.first == value }?.second ?: "选择$label")
+            StorageLabel(options.firstOrNull { it.first == value }?.second ?: "选择$label", colors[value])
         }
         DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
             for ((id, name) in options) {
-                DropdownMenuItem(text = { Text(name) }, onClick = { change(id); expanded = false })
+                DropdownMenuItem(text = { StorageLabel(name, colors[id]) },
+                    onClick = { change(id); expanded = false })
             }
         }
+    }
+}
+
+@Composable
+private fun StorageLabel(name: String, hex: String?) {
+    val rgb = hex?.takeIf { it.startsWith("#") && it.length == 7 }
+        ?.drop(1)?.toLongOrNull(16)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (rgb != null) Box(Modifier.size(12.dp).background(Color((0xff000000L or rgb).toInt())))
+        Text(name)
     }
 }
 
@@ -715,7 +739,10 @@ private fun PickSession(
     LazyColumn(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         for (groupIndex in 0 until groups.length()) {
             val group = groups.getJSONObject(groupIndex)
-            item { Text("${group.getString("warehouse_name")} / ${group.getString("location_name")}") }
+            item {
+                StorageLabel("${group.getString("warehouse_name")} / ${group.getString("location_name")}",
+                    group.text("color"))
+            }
             val entries = group.getJSONArray("items")
             items((0 until entries.length()).map(entries::getJSONObject), key = { it.getString("id") }) { item ->
                 Card(Modifier.fillMaxWidth()) {

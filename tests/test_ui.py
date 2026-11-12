@@ -3,15 +3,24 @@
 from pathlib import Path
 from typing import Any
 
+import pytest
+from PySide6.QtCore import Qt, QThread
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QColorDialog,
     QDialog,
+    QDialogButtonBox,
+    QFileDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QToolButton,
 )
 from test_jlc_product import PRODUCT_HTML
+from test_order_import import HTML as ORDER_HTML
 
 import component_library.ui.main_window as main_window_module
 from component_library import __version__
@@ -33,8 +42,11 @@ from component_library.ui.jlc_browser import JlcBatchMergeDialog, JlcMergeDialog
 from component_library.ui.main_window import (
     BatchCodeScanDialog,
     CollapsibleSection,
+    ComponentEditDialog,
     InlineEditor,
+    InventoryPage,
     MainWindow,
+    OrderImportPage,
     WheelSafeComboBox,
     default_debug_mode,
 )
@@ -581,6 +593,161 @@ def test_inventory_context_delete_path_uses_safe_delete(
     window.inventory_page.delete_component_at_row(0)
 
     assert database.list_components() == []
+
+
+@pytest.mark.parametrize("entry", ["button", "shortcut", "menu"])
+def test_inventory_shows_separate_lots_and_moves_ctrl_selected_rows(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any, entry: str
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    source = database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    target = database.create_location(LocationCreate(warehouse_id=position["id"], name="B01"))
+    component = database.create_component(ComponentCreate(name="分批元件", lcsc_part_number="C7654321"))
+    for index in (1, 2):
+        database.receive(
+            ReceiveRequest(
+                component_id=component["id"], location_id=source["id"], quantity=index,
+                order_number=f"SO2611100000{index}",
+            )
+        )
+    page = InventoryPage(database)
+    qtbot.addWidget(page)
+    page.resize(1200, 500)
+    page.show()
+    page.activateWindow()
+    page.table.setFocus()
+    qtbot.waitUntil(page.table.hasFocus)
+    assert page.table.rowCount() == 2
+    assert {page.table.item(row, 12).text() for row in (0, 1)} == {
+        "SO26111000001", "SO26111000002",
+    }
+    assert [page.table.item(row, 21).text() for row in (0, 1)] == ["3", "3"]
+    assert not page.table.item(0, 16).icon().isNull()
+    for row, modifier in ((0, Qt.KeyboardModifier.NoModifier), (1, Qt.KeyboardModifier.ControlModifier)):
+        item = page.table.item(row, 0)
+        qtbot.mouseClick(
+            page.table.viewport(), Qt.MouseButton.LeftButton, modifier,
+            page.table.visualItemRect(item).center(),
+        )
+    assert len(page.table.selectionModel().selectedRows()) == 2
+
+    def confirm(dialog: QDialog) -> QDialog.DialogCode:
+        location = dialog.findChild(WheelSafeComboBox)
+        assert location is not None
+        location.setCurrentIndex(location.findData(target["id"]))
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", confirm)
+    monkeypatch.setattr(page, "show_error", lambda message: pytest.fail(message))
+    if entry == "shortcut":
+        qtbot.keyClick(page.table, Qt.Key.Key_M, Qt.KeyboardModifier.ControlModifier)
+    elif entry == "menu":
+        class SelectTransferMenu(QMenu):
+            def exec(self, *_args: Any) -> Any:
+                return next(action for action in self.actions() if action.text() == "变更仓库…")
+
+        monkeypatch.setattr(main_window_module, "QMenu", SelectTransferMenu)
+        page.open_context_menu(page.table.visualItemRect(page.table.item(0, 0)).center())
+    else:
+        next(button for button in page.findChildren(QPushButton) if button.text() == "变更仓库").click()
+    assert page.table.rowCount() == 2
+    assert {lot["location_id"] for lot in database.list_inventory_lots()} == {target["id"]}
+
+
+def test_component_dialog_scrolls_parameters_and_recovers_on_collapse(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="多参数元件"))
+    database.save_component_parameter_groups(
+        component["id"],
+        [JlcParameterGroup(
+            name="商品参数",
+            parameters=[JlcParameter(key=f"param_{i}", label=f"参数 {i}", value="1") for i in range(35)],
+        )],
+    )
+    parent = InventoryPage(database)
+    qtbot.addWidget(parent)
+    dialog = ComponentEditDialog(database, component["id"], parent)
+    qtbot.addWidget(dialog)
+    dialog.resize(460, 320)
+    dialog.show()
+    scroll = dialog.findChild(QScrollArea)
+    buttons = dialog.findChild(QDialogButtonBox)
+    assert scroll is not None and buttons is not None
+    qtbot.waitUntil(lambda: scroll.verticalScrollBar().maximum() > 0)
+    collapsed_maximum = scroll.verticalScrollBar().maximum()
+    size = dialog.size()
+    dialog.parameter_group.setChecked(True)
+    qtbot.waitUntil(lambda: scroll.verticalScrollBar().maximum() > collapsed_maximum)
+    assert dialog.size() == size
+    assert dialog.rect().contains(buttons.geometry())
+    dialog.parameter_group.setChecked(False)
+    qtbot.waitUntil(lambda: scroll.verticalScrollBar().maximum() == collapsed_maximum)
+
+    details = ComponentEditDialog(database, component["id"], parent, read_only=True)
+    qtbot.addWidget(details)
+    assert details.name.isReadOnly()
+    assert all(field.isReadOnly() for _, field in details.parameter_fields.values())
+    assert details.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save) is None
+
+
+def test_warehouse_color_change_refreshes_inventory_and_receive(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    position = database.create_warehouse(WarehouseCreate(name="主位置"))
+    location = database.create_location(LocationCreate(warehouse_id=position["id"], name="A01"))
+    component = database.create_component(ComponentCreate(name="有库存元件"))
+    database.receive(
+        ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=2)
+    )
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    monkeypatch.setattr(QColorDialog, "getColor", lambda *_args: QColor("#ab328c"))
+    page = window.locations_page
+    page.change_storage_color(page.table.item(0, 1))
+    icons = (
+        page.table.item(0, 1).icon(),
+        window.inventory_page.table.item(0, 16).icon(),
+        window.receive_page.location.itemIcon(window.receive_page.location.findData(location["id"])),
+    )
+    assert [icon.pixmap(12, 12).toImage().pixelColor(5, 5).name() for icon in icons] == [
+        "#ab328c", "#ab328c", "#ab328c",
+    ]
+
+
+def test_order_file_preview_runs_on_ui_thread(
+    qtbot: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """通过文件选择入口验证订单 HTML 直接生成界面预览。"""
+
+    path = tmp_path / "orders.html"
+    path.write_text(ORDER_HTML, encoding="utf-8")
+    page = OrderImportPage(Database(tmp_path / "inventory.db"))
+    qtbot.addWidget(page)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_args: (str(path), ""))
+    preview = page._show_preview
+    called_on_ui_thread: list[bool] = []
+
+    def show_preview(*args: Any) -> None:
+        on_ui_thread = QThread.currentThread() == page.thread()
+        called_on_ui_thread.append(on_ui_thread)
+        if on_ui_thread:
+            preview(*args)
+
+    monkeypatch.setattr(page, "_show_preview", show_preview)
+    page.choose_file()
+    qtbot.waitUntil(lambda: bool(called_on_ui_thread))
+
+    assert called_on_ui_thread == [True]
+    assert page.table.rowCount() == 1
+    assert page.confirm.isEnabled()
+    assert page.lines[0].lcsc_part_number == "C27636670"
+    assert page.lines[0].quantity == 2
+    assert page.lines[0].unit_price == 3.32
+    assert not page.lines[0].jlc_matched
 
 
 def test_order_import_cancel_clears_preview(qtbot: Any, tmp_path: Path) -> None:

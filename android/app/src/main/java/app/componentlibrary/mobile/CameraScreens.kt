@@ -168,9 +168,11 @@ fun CameraCaptureScreen(
 fun BarcodeScannerScreen(
     onCode: (String) -> Unit, onCancel: (() -> Unit)?,
     modifier: Modifier = Modifier.fillMaxSize(), continuous: Boolean = false, enabled: Boolean = true,
+    validateCode: ((String) -> String?)? = null,
 ) {
     val submitCode by rememberUpdatedState(onCode)
     val scanEnabled by rememberUpdatedState(enabled)
+    val validate by rememberUpdatedState(validateCode)
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current
     val previewView = remember { cameraPreviewView(context) }
@@ -178,6 +180,7 @@ fun BarcodeScannerScreen(
     val mainExecutor = remember { ContextCompat.getMainExecutor(context) }
     val delivered = remember { AtomicBoolean(false) }
     var lastCode by remember { mutableStateOf<String?>(null) }
+    var lastRejectedCode by remember { mutableStateOf<String?>(null) }
     var clearFrames by remember { mutableStateOf(0) }
     val processing = remember { AtomicBoolean(false) }
     val receivedFrame = remember { AtomicBoolean(false) }
@@ -294,9 +297,25 @@ fun BarcodeScannerScreen(
                             }
                             val value = codes.asSequence()
                                 .mapNotNull { it.rawValue ?: it.displayValue }
-                                .firstOrNull { it.isNotBlank() }
-                            if (value == null && ++clearFrames >= 5) lastCode = null
-                            if (value != null) clearFrames = 0
+                                .filter { it.isNotBlank() }
+                                .firstOrNull { candidate ->
+                                    // 配对码通过校验后才占用单次提交机会，扫错时继续取景。
+                                    if (validate == null) {
+                                        true
+                                    } else if (!scanEnabled || delivered.get() || candidate == lastRejectedCode) {
+                                        false
+                                    } else {
+                                        val rejection = validate?.invoke(candidate)
+                                        if (rejection != null) {
+                                            lastRejectedCode = candidate
+                                            status = rejection
+                                            DiagnosticLog.record("BARCODE_REJECTED", "reason=invalid_pairing_code")
+                                        }
+                                        rejection == null
+                                    }
+                                }
+                            if (codes.isEmpty() && ++clearFrames >= 5) lastCode = null
+                            if (codes.isNotEmpty()) clearFrames = 0
                             if (value != null && scanEnabled && (
                                     if (continuous) value != lastCode else delivered.compareAndSet(false, true)
                                 )
@@ -308,7 +327,9 @@ fun BarcodeScannerScreen(
                                 )
                                 status = if (continuous) "已识别，可继续扫描" else "已识别，正在处理……"
                                 submitCode(value)
-                            } else if (codes.isNotEmpty() && value == null) {
+                            } else if (codes.isNotEmpty() && codes.all {
+                                    (it.rawValue ?: it.displayValue).isNullOrBlank()
+                                }) {
                                 DiagnosticLog.record("BARCODE_WITHOUT_TEXT", "count=${codes.size}")
                             }
                         }

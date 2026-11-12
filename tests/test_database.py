@@ -139,6 +139,63 @@ def test_transfer_preserves_batch_identity(
     assert {item["location_name"] for item in batch["locations"]} == {"A01", "A02"}
 
 
+def test_bulk_transfer_moves_exact_lots_atomically(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, component, warehouse, source = inventory
+    target = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="A02"))
+    for index in (1, 2):
+        database.receive(
+            ReceiveRequest(
+                component_id=component["id"], location_id=source["id"], quantity=index,
+                purchase_date=f"2026-10-0{index}", unit_price=index / 10,
+                order_number=f"SO2610010000{index}",
+            )
+        )
+    lots = database.list_inventory_lots()
+    quantities = {lot["id"]: lot["quantity"] for lot in lots}
+    stale = dict(quantities)
+    stale[lots[-1]["id"]] += 1
+
+    with pytest.raises(DomainError, match="库存已变动"):
+        database.transfer_lots(stale, target["id"])
+    assert database.list_inventory_lots() == lots
+
+    result = database.transfer_lots(quantities, target["id"])
+    moved = database.list_inventory_lots()
+    assert {lot["location_id"] for lot in moved} == {target["id"]}
+    preserved = ("quantity", "purchase_date", "received_at", "order_number", "unit_price")
+    assert sorted(tuple(lot[key] for key in preserved) for lot in moved) == sorted(
+        tuple(lot[key] for key in preserved) for lot in lots
+    )
+    assert result["moved_lots"] == 2
+    transactions = [
+        row for row in database.list_transactions()
+        if row["group_id"] == result["transaction_group_id"]
+    ]
+    assert sorted(row["quantity_delta"] for row in transactions) == [-2, -1, 1, 2]
+
+
+def test_warehouse_colors_backfill_existing_database_and_persist(
+    inventory: tuple[Database, dict, dict, dict],
+) -> None:
+    database, _, warehouse, first = inventory
+    second = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="A02"))
+    with database.write() as connection:
+        connection.execute("ALTER TABLE locations DROP COLUMN color")
+
+    database = Database(database.path)
+    colors = {item["id"]: item["color"] for item in database.list_locations()}
+    assert len(set(colors.values())) == 2
+    assert all(color.startswith("#") and len(color) == 7 for color in colors.values())
+    database.set_location_color(first["id"], "#ABC123")
+    colors[first["id"]] = "#abc123"
+    assert {
+        item["id"]: item["color"] for item in Database(database.path).list_locations()
+    } == colors
+    assert second["id"] in colors
+
+
 def test_batch_code_validation_and_component_conflict(
     inventory: tuple[Database, dict, dict, dict],
 ) -> None:

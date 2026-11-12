@@ -11,6 +11,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
+from html import escape
 from pathlib import Path
 from typing import Any
 from weakref import WeakMethod
@@ -26,14 +27,18 @@ from PySide6.QtCore import (
     QTimer,
     QUrl,
     Signal,
+    Slot,
 )
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
+    QIcon,
     QImage,
+    QKeySequence,
     QPainter,
     QPen,
     QPixmap,
+    QShortcut,
     QStandardItemModel,
 )
 from PySide6.QtMultimedia import (
@@ -47,6 +52,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QCompleter,
     QDialog,
@@ -148,6 +154,33 @@ def fill_table(table: QTableWidget, rows: list[list[Any]]) -> None:
                 item.setText("" if value is None else str(value))
             table.setItem(row_index, column, item)
     table.setSortingEnabled(sorting)
+
+
+def storage_icon(*colors: str | None) -> QIcon:
+    """用色块标识仓库，保留原有名称、文本颜色和选中样式。"""
+
+    valid_colors = list(dict.fromkeys(color for color in colors if color))
+    if not valid_colors:
+        return QIcon()
+    swatch = QPixmap(12 * len(valid_colors), 12)
+    painter = QPainter(swatch)
+    for index, color in enumerate(valid_colors):
+        painter.fillRect(index * 12, 0, 12, 12, QColor(color))
+    painter.end()
+    return QIcon(swatch)
+
+
+def add_storage_option(
+    combo: QComboBox, label: str, location_id: str, color: str | None
+) -> None:
+    combo.addItem(storage_icon(color), label, location_id)
+
+
+def storage_label(text: str, color: str | None) -> str:
+    """给同时展示多个仓库的富文本标签加入独立色块。"""
+
+    prefix = f'<span style="color:{escape(color)}">■</span> ' if color else ""
+    return prefix + escape(text)
 
 
 def default_debug_mode() -> bool:
@@ -434,7 +467,9 @@ def category_parameter_entries(detail: dict[str, Any]) -> list[tuple[str, str, s
 class ComponentEditDialog(QDialog):
     """双击库存行时编辑元件主数据和类别参数。"""
 
-    def __init__(self, database: Database, component_id: str, parent: QWidget) -> None:
+    def __init__(
+        self, database: Database, component_id: str, parent: QWidget, *, read_only: bool = False
+    ) -> None:
         """读取 ``component_id`` 的完整详情并构造可编辑表单。
 
         参数字段会保留数据库中的稳定键与分组；对话框确认前不写入数据。
@@ -444,11 +479,20 @@ class ComponentEditDialog(QDialog):
         self.database = database
         self.component_id = component_id
         self.detail = database.get_component(component_id)
+        self.read_only = read_only
         self.parameter_fields: dict[str, tuple[str, QLineEdit]] = {}
         self.parameter_groups: dict[str, str] = {}
-        self.setWindowTitle("修改元件")
-        self.resize(620, 720)
+        self.setWindowTitle("元件详情" if read_only else "修改元件")
+        available = self.screen().availableGeometry()
+        self.resize(min(620, available.width()), min(720, max(200, available.height() - 80)))
         layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        fields = QVBoxLayout(content)
+        scroll.setWidget(content)
+        # 展开类别参数时只增加滚动内容高度，底部操作按钮不随表单滚动。
+        layout.addWidget(scroll, 1)
         form = QFormLayout()
         self.name = QLineEdit(str(self.detail.get("name") or ""))
         self.aliases = QLineEdit(", ".join(self.detail.get("aliases") or []))
@@ -481,12 +525,12 @@ class ComponentEditDialog(QDialog):
             ("类别", self.category),
         ):
             form.addRow(label, main_widget)
-        layout.addLayout(form)
+        fields.addLayout(form)
         self.parameter_group = CollapsibleSection("类别参数")
         parameter_content = QWidget()
         self.parameter_form = QFormLayout(parameter_content)
         self.parameter_group.setContentWidget(parameter_content)
-        layout.addWidget(self.parameter_group)
+        fields.addWidget(self.parameter_group)
         trailing = QFormLayout()
         for label, trailing_widget in (
             ("单价", self.price),
@@ -496,8 +540,10 @@ class ComponentEditDialog(QDialog):
             ("备注", self.notes),
         ):
             trailing.addRow(label, trailing_widget)
-        layout.addLayout(trailing)
+        fields.addLayout(trailing)
+        fields.addStretch()
         buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close if read_only else
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.save)
@@ -510,6 +556,11 @@ class ComponentEditDialog(QDialog):
             or category_parameter_values(self.detail),
             [(key, label, group) for key, label, _value, group in entries] or None,
         )
+        if read_only:
+            for field in content.findChildren(QLineEdit):
+                field.setReadOnly(True)
+            self.category.setEnabled(False)
+            self.price.setReadOnly(True)
 
     def _rebuild_parameters(
         self,
@@ -545,6 +596,7 @@ class ComponentEditDialog(QDialog):
                 self.parameter_form.addRow(heading)
                 last_group = group_name
             field = QLineEdit(preserved.get(key, ""))
+            field.setReadOnly(self.read_only)
             self.parameter_form.addRow(label, field)
             self.parameter_fields[key] = (label, field)
             self.parameter_groups[key] = group_name
@@ -734,12 +786,16 @@ class InventoryPage(BasePage):
         button.clicked.connect(self.refresh)
         delete_button = QPushButton("删除所选元件")
         delete_button.clicked.connect(self.delete_selected)
+        transfer_button = QPushButton("变更仓库")
+        transfer_button.setToolTip("按住 Ctrl 点击可多选批次；Ctrl+M 打开变更仓库")
+        transfer_button.clicked.connect(self.transfer_selected)
         self.query.returnPressed.connect(self.refresh)
         search_row.addWidget(self.query)
         search_row.addWidget(self.category_filter)
         search_row.addWidget(self.brand_filter)
         search_row.addWidget(self.package_filter)
         search_row.addWidget(button)
+        search_row.addWidget(transfer_button)
         search_row.addWidget(delete_button)
         layout.addLayout(search_row)
         export_row = QHBoxLayout()
@@ -764,7 +820,7 @@ class InventoryPage(BasePage):
                 "品牌",
                 "封装",
                 "类别参数",
-                "库存",
+                "批次库存",
                 "单价",
                 "购买日期",
                 "订单号",
@@ -776,6 +832,8 @@ class InventoryPage(BasePage):
                 "数据手册",
                 "备注",
                 "资料匹配",
+                "总库存",
+                "批次号",
             ]
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -802,10 +860,20 @@ class InventoryPage(BasePage):
                 70,
                 80,
                 220,
+                90,
+                125,
             )
         ):
             self.table.setColumnWidth(column, width)
         self.table.cellDoubleClicked.connect(self.edit_component)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        header = self.table.horizontalHeader()
+        # 调整视觉顺序，保持已有字段列号及其原位编辑、链接操作映射。
+        header.moveSection(header.visualIndex(21), header.visualIndex(9) + 1)
+        header.moveSection(header.visualIndex(22), header.visualIndex(12) + 1)
+        self.transfer_shortcut = QShortcut(QKeySequence("Ctrl+M"), self.table)
+        self.transfer_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.transfer_shortcut.activated.connect(self.transfer_selected)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.open_context_menu)
         layout.addWidget(self.table)
@@ -827,46 +895,54 @@ class InventoryPage(BasePage):
             and (not package or item.get("package") == package)
         ]
         self.visible_component_ids = [str(item["id"]) for item in components]
-        stock = self.database.list_stock()
-        rows = []
+        lots_by_component: dict[str, list[dict[str, Any]]] = {}
+        for lot in self.database.list_inventory_lots():
+            lots_by_component.setdefault(lot["component_id"], []).append(lot)
+        rows: list[list[Any]] = []
+        row_details = []
         for component in components:
-            locations = [item for item in stock if item["component_id"] == component["id"]]
-            total = sum(float(item["quantity"]) for item in locations)
-            position = "; ".join(
-                f"{item['warehouse_name']}/{item['location_name']}: {int(item['quantity'])}"
-                for item in locations
-            )
-            rows.append(
-                [
-                    component["name"],
-                    ", ".join(component.get("aliases") or []) or "—",
-                    component.get("lcsc_part_number") or "—",
-                    component.get("manufacturer_part_number") or "—",
-                    component.get("custom_part_number") or "—",
-                    component.get("category") or "—",
-                    component.get("brand") or "—",
-                    component.get("package") or "—",
-                    component.get("specification") or "—",
-                    int(total),
-                    component.get("price"),
-                    component.get("purchase_date") or "—",
-                    component.get("order_numbers") or "—",
-                    component.get("created_at") or "—",
-                    component.get("last_received_at") or "—",
-                    component.get("updated_at") or "—",
-                    position or "—",
-                    "打开" if component.get("product_url") else "—",
-                    "打开" if component.get("datasheet_url") else "—",
-                    component.get("notes") or "—",
-                    "已匹配" if component.get("jlc_matched") else "未匹配",
-                ]
-            )
+            lots = lots_by_component.get(component["id"], [])
+            total = sum(int(lot["quantity"]) for lot in lots)
+            for lot in lots or [{}]:
+                row_details.append((component, lot))
+                rows.append(
+                    [
+                        component["name"],
+                        ", ".join(component.get("aliases") or []) or "—",
+                        component.get("lcsc_part_number") or "—",
+                        component.get("manufacturer_part_number") or "—",
+                        component.get("custom_part_number") or "—",
+                        component.get("category") or "—",
+                        component.get("brand") or "—",
+                        component.get("package") or "—",
+                        component.get("specification") or "—",
+                        int(lot.get("quantity", 0)),
+                        lot.get("unit_price") if lot else component.get("price"),
+                        (lot.get("purchase_date") if lot else component.get("purchase_date")) or "—",
+                        (lot.get("order_number") if lot else component.get("order_numbers")) or "—",
+                        component.get("created_at") or "—",
+                        (lot.get("received_at") if lot else component.get("last_received_at")) or "—",
+                        component.get("updated_at") or "—",
+                        f"{lot['warehouse_name']} / {lot['location_name']}" if lot else "—",
+                        "打开" if component.get("product_url") else "—",
+                        "打开" if component.get("datasheet_url") else "—",
+                        component.get("notes") or "—",
+                        "已匹配" if component.get("jlc_matched") else "未匹配",
+                        total,
+                        (lot.get("custom_code") or lot["id"][:8]) if lot else "—",
+                    ]
+                )
         self.table.setSortingEnabled(False)
         fill_table(self.table, rows)
-        for row, component in enumerate(components):
+        for row, (component, lot) in enumerate(row_details):
             name_item = self.table.item(row, 0)
             if name_item is not None:
                 name_item.setData(Qt.ItemDataRole.UserRole, component["id"])
+            if lot:
+                if batch_cell := self.table.item(row, 9):
+                    batch_cell.setData(Qt.ItemDataRole.UserRole, lot)
+                if location_cell := self.table.item(row, 16):
+                    location_cell.setIcon(storage_icon(lot.get("color")))
             for column, key in ((17, "product_url"), (18, "datasheet_url")):
                 url = component.get(key)
                 if url:
@@ -876,6 +952,57 @@ class InventoryPage(BasePage):
                         item.setForeground(QColor("#1769aa"))
                         item.setToolTip("双击在默认浏览器中打开")
         self.table.setSortingEnabled(True)
+
+    def transfer_selected(self) -> None:
+        """从所选库存行提取批次，一次性移入同一个目标仓库。"""
+
+        selection = self.table.selectionModel().selectedRows(9)
+        lots = [lot for index in selection if (lot := index.data(Qt.ItemDataRole.UserRole))]
+        if not lots:
+            self.show_error("请先选择有库存的批次；按住 Ctrl 点击可多选")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("变更仓库")
+        form = QFormLayout(dialog)
+        destination = WheelSafeComboBox()
+        destination.addItem("请选择目标仓库", None)
+        for location in self.database.storage_priority_rows():
+            add_storage_option(
+                destination, f"{location['warehouse_name']} / {location['location_name']}",
+                location["location_id"], location.get("color"),
+            )
+        summary = QLabel()
+        form.addRow(summary)
+        form.addRow("目标仓库", destination)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        confirm = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        confirm.setText("确认移库")
+
+        def update_summary() -> None:
+            target = destination.currentData()
+            moving = [lot for lot in lots if lot["location_id"] != target]
+            quantity = sum(int(lot["quantity"]) for lot in moving)
+            summary.setText(f"将移动 {len(moving)} 个批次，共 {quantity} 件")
+            confirm.setEnabled(bool(target and moving))
+
+        destination.currentIndexChanged.connect(update_summary)
+        update_summary()
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            quantities = {lot["id"]: int(lot["quantity"]) for lot in lots}
+            self.database.transfer_lots(quantities, str(destination.currentData()))
+        except Exception as error:
+            self.show_error(str(error))
+            self.refresh()
+            return
+        self.refresh()
+        self.changed.emit()
 
     def export_excel(self) -> None:
         """选择目标文件并导出当前筛选结果及配套统计工作表。"""
@@ -914,6 +1041,10 @@ class InventoryPage(BasePage):
     def delete_selected(self) -> None:
         """删除当前选中元件；有库存时由业务层拒绝并说明原因。"""
 
+        selected = self.table.selectionModel().selectedRows(0)
+        if len({index.data(Qt.ItemDataRole.UserRole) for index in selected}) > 1:
+            self.show_error("请一次选择一个元件进行删除")
+            return
         self.delete_component_at_row(self.table.currentRow())
 
     def delete_component_at_row(self, row: int) -> None:
@@ -979,6 +1110,9 @@ class InventoryPage(BasePage):
             19: "notes",
         }
         field = field_by_column.get(column)
+        batch_cell = self.table.item(row, 9)
+        if column in (10, 11) and batch_cell and batch_cell.data(Qt.ItemDataRole.UserRole):
+            return
         identity = self.table.item(row, 0)
         component_id = identity.data(Qt.ItemDataRole.UserRole) if identity else None
         if not field or not component_id:
@@ -1064,14 +1198,26 @@ class InventoryPage(BasePage):
             self.refresh()
             self.changed.emit()
 
+    def open_component_details(self, row: int) -> None:
+        """打开只读的元件详情和类别参数。"""
+
+        item = self.table.item(row, 0)
+        component_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if component_id:
+            ComponentEditDialog(self.database, str(component_id), self, read_only=True).exec()
+
     def open_context_menu(self, position: Any) -> None:
         """库存右键菜单提供完整编辑和外部链接入口。"""
 
         row = self.table.rowAt(position.y())
         if row < 0:
             return
+        if not self.table.selectionModel().isRowSelected(row, QModelIndex()):
+            self.table.selectRow(row)
         menu = QMenu(self)
+        details = menu.addAction("查看详细信息…")
         edit = menu.addAction("完整编辑…")
+        transfer = menu.addAction("变更仓库…")
         enrich = menu.addAction("从立创商城补充资料…")
         delete = menu.addAction("删除元件")
         menu.addSeparator()
@@ -1082,6 +1228,12 @@ class InventoryPage(BasePage):
         product.setEnabled(bool(product_item and product_item.data(Qt.ItemDataRole.UserRole)))
         datasheet.setEnabled(bool(datasheet_item and datasheet_item.data(Qt.ItemDataRole.UserRole)))
         selected = menu.exec(self.table.viewport().mapToGlobal(position))
+        if selected == details:
+            self.open_component_details(row)
+            return
+        if selected == transfer:
+            self.transfer_selected()
+            return
         if selected == edit:
             self.open_full_component_editor(row)
             return
@@ -1646,7 +1798,7 @@ class ReceivePage(BasePage):
         self.location.clear()
         for item in self.database.list_locations():
             if item["warehouse_id"] == position_id:
-                self.location.addItem(item["name"], item["id"])
+                add_storage_option(self.location, item["name"], item["id"], item.get("color"))
         location_index = self.location.findData(preferred_location_id)
         if location_index >= 0:
             self.location.setCurrentIndex(location_index)
@@ -1662,23 +1814,37 @@ class ReceivePage(BasePage):
         self._selected_component_id = None
         matches = self.database.list_components(text) if text.strip() else []
         self._components = {item["id"]: item for item in matches}
-        stock_by_component: dict[str, list[str]] = {}
+        stock_by_component: dict[str, list[dict[str, Any]]] = {}
         for stock_item in self.database.list_stock():
             quantity = int(stock_item["quantity"])
             if quantity <= 0:
                 continue
-            stock_by_component.setdefault(str(stock_item["component_id"]), []).append(
-                f"{stock_item['warehouse_name']}/{stock_item['location_name']}({quantity})"
-            )
+            stock_by_component.setdefault(str(stock_item["component_id"]), []).append(stock_item)
         self.name.blockSignals(True)
         self.name.clear()
         for item in matches:
-            stock_text = "；".join(stock_by_component.get(str(item["id"]), [])) or "无库存"
+            stock = stock_by_component.get(str(item["id"]), [])
+            labels = [
+                f"{lot['warehouse_name']}/{lot['location_name']}({lot['quantity']})" for lot in stock
+            ]
+            stock_text = "；".join(labels) or "无库存"
             self.name.addItem(
                 f"{item['name']} · {item.get('brand') or '无品牌'} · "
                 f"{item.get('package') or '无封装'} · {stock_text}",
                 item["id"],
             )
+            if stock:
+                self.name.setItemIcon(
+                    self.name.count() - 1, storage_icon(*(lot.get("color") for lot in stock))
+                )
+                self.name.setItemData(
+                    self.name.count() - 1,
+                    "<qt>" + "<br>".join(
+                        storage_label(label, lot.get("color"))
+                        for label, lot in zip(labels, stock, strict=True)
+                    ) + "</qt>",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         self.name.setCurrentIndex(-1)
         self.name.setEditText(text)
         self.name.blockSignals(False)
@@ -2166,11 +2332,9 @@ class StoragePriorityDialog(QDialog):
         rows = database.storage_priority_rows(category)
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
-            self.table.setItem(
-                row_index,
-                0,
-                QTableWidgetItem(f"{row['warehouse_name']} / {row['location_name']}"),
-            )
+            location = QTableWidgetItem(f"{row['warehouse_name']} / {row['location_name']}")
+            location.setIcon(storage_icon(row.get("color")))
+            self.table.setItem(row_index, 0, location)
             priority = WheelSafeSpinBox()
             priority.setRange(0, 100_000)
             priority.setSpecialValueText("未设置")
@@ -2202,6 +2366,8 @@ class OrderImportPage(BasePage):
 
     back_requested = Signal()
     parse_progress_changed = Signal(int, str)
+    parse_succeeded = Signal(object, int)
+    parse_failed = Signal(str, int)
 
     def __init__(self, database: Database) -> None:
         """构建订单文件选择、异步预览、逐行编辑和提交控件。"""
@@ -2242,7 +2408,15 @@ class OrderImportPage(BasePage):
         self.summary = QLabel("尚未选择订单文件")
         self.parse_progress = QLabel()
         self.parse_progress.setStyleSheet("color:#657786")
-        self.parse_progress_changed.connect(self._show_parse_progress_if_current)
+        self.parse_progress_changed.connect(
+            self._show_parse_progress_if_current, Qt.ConnectionType.QueuedConnection
+        )
+        self.parse_succeeded.connect(
+            self._show_preview_if_current, Qt.ConnectionType.QueuedConnection
+        )
+        self.parse_failed.connect(
+            self._show_parse_error_if_current, Qt.ConnectionType.QueuedConnection
+        )
         summary_row = QHBoxLayout()
         summary_row.addWidget(self.summary)
         summary_row.addWidget(self.parse_progress)
@@ -2275,7 +2449,16 @@ class OrderImportPage(BasePage):
         """仓库变化后重新计算订单草稿的推荐位置。"""
 
         if self.lines:
+            checked, locations = self._preview_state()
+            checked_by_key = {
+                (line.order_number, line.lcsc_part_number): selected
+                for line, selected in zip(self.lines, checked, strict=True)
+            }
             self._show_preview(self.lines)
+            self._restore_preview_state(
+                [checked_by_key[(line.order_number, line.lcsc_part_number)] for line in self.lines],
+                locations,
+            )
 
     def choose_file(self) -> None:
         """选择本地订单文件，并在工作线程中完成安全解析。"""
@@ -2290,9 +2473,13 @@ class OrderImportPage(BasePage):
             return
         self.preview_generation += 1
         generation = self.preview_generation
+        self.lines.clear()
+        self.location_boxes.clear()
+        self.table.setRowCount(0)
         self.summary.setText("正在离线解析订单……")
         self.parse_progress.setText("准备读取订单日期和商品……")
         self.confirm.setEnabled(False)
+
         def parse_job() -> tuple[list[OrderImportLine], list[str]]:
             warnings: list[str] = []
             lines = parse_saved_orders(
@@ -2303,20 +2490,25 @@ class OrderImportPage(BasePage):
             return lines, warnings
 
         worker = Worker(parse_job)
+        # Worker 回调只转发带文件代次的信号，队列连接负责在主线程更新控件。
         worker.signals.succeeded.connect(
-            lambda result, current=generation: self._show_preview_if_current(result, current)
+            lambda result: self.parse_succeeded.emit(result, generation),
+            Qt.ConnectionType.DirectConnection,
         )
         worker.signals.failed.connect(
-            lambda message, current=generation: self._show_parse_error_if_current(message, current)
+            lambda message: self.parse_failed.emit(message, generation),
+            Qt.ConnectionType.DirectConnection,
         )
         self.pool.start(worker)
 
+    @Slot(int, str)
     def _show_parse_progress_if_current(self, generation: int, message: str) -> None:
         """仅显示当前文件进度，忽略取消后迟到的工作线程信号。"""
 
         if generation == self.preview_generation:
             self.parse_progress.setText(message)
 
+    @Slot(object, int)
     def _show_preview_if_current(self, result: Any, generation: int) -> None:
         """忽略用户点击取消后才返回的后台解析结果。"""
 
@@ -2324,11 +2516,13 @@ class OrderImportPage(BasePage):
             lines, warnings = result
             self._show_preview(lines, warnings)
 
+    @Slot(str, int)
     def _show_parse_error_if_current(self, message: str, generation: int) -> None:
         """取消后不再弹出已经失效的解析任务错误。"""
 
         if generation == self.preview_generation:
             self.confirm.setEnabled(bool(self.lines))
+            self.summary.setText("当前文件未能生成订单预览")
             self.parse_progress.clear()
             self.show_error(message)
 
@@ -2419,9 +2613,11 @@ class OrderImportPage(BasePage):
             recommendation = recommendations[category_key]
             location = WheelSafeComboBox()
             for candidate in locations:
-                location.addItem(
+                add_storage_option(
+                    location,
                     f"{candidate['warehouse_name']} / {candidate['location_name']}",
                     candidate["location_id"],
+                    candidate.get("color"),
                 )
             if recommendation:
                 index = location.findData(recommendation["location_id"])
@@ -3252,22 +3448,25 @@ class IssuePage(BasePage):
         active_locations = [
             item for item in batch["locations"] if int(item["remaining_quantity"]) > 0
         ]
-        self.scan_stock_info.setText(
-            "；".join(
+        locations = "；".join(
+            storage_label(
                 f"{item['warehouse_name']} / {item['location_name']}："
-                f"{int(item['remaining_quantity'])}"
-                for item in active_locations
+                f"{int(item['remaining_quantity'])}",
+                item.get("color"),
             )
-            or "无可用库存"
+            for item in active_locations
         )
+        self.scan_stock_info.setText(f"<qt>{locations}</qt>" if locations else "无可用库存")
         self.scan_location.blockSignals(True)
         self.scan_location.clear()
         self.scan_location.addItem(f"全部仓库（批次总余量 {remaining}）", None)
         for item in active_locations:
-            self.scan_location.addItem(
+            add_storage_option(
+                self.scan_location,
                 f"{item['warehouse_name']} / {item['location_name']}"
                 f"（{int(item['remaining_quantity'])}）",
                 item["location_id"],
+                item.get("color"),
             )
         preferred = self.scan_location.findData(self.database.last_issue_location())
         self.scan_location.setCurrentIndex(max(0, preferred))
@@ -3327,6 +3526,21 @@ class IssuePage(BasePage):
         """刷新选择数据。"""
 
         self._reload_components()
+        if self.selected_batch:
+            location = self.scan_location.currentData()
+            quantity = self.scan_quantity.value()
+            try:
+                self.selected_batch = self.database.get_batch(self.selected_batch["id"])
+            except DomainError as error:
+                self.selected_batch = None
+                self._show_scan_error(str(error))
+                return
+            self._show_scan_batch(self.selected_batch, self.scan_status.text())
+            self.scan_location.blockSignals(True)
+            self.scan_location.setCurrentIndex(max(0, self.scan_location.findData(location)))
+            self.scan_location.blockSignals(False)
+            self._scan_location_changed()
+            self.scan_quantity.setValue(quantity)
 
     def _reload_components(self) -> None:
         """根据输入内容即时搜索匹配元件。"""
@@ -3363,9 +3577,11 @@ class IssuePage(BasePage):
         self.location.addItem("", None)
         self.location.setToolTip(f"留空时自动跨仓库 FIFO（共 {total}）")
         for item in stock:
-            self.location.addItem(
+            add_storage_option(
+                self.location,
                 f"{item['warehouse_name']} / {item['location_name']}（{int(item['quantity'])}）",
                 item["location_id"],
+                item.get("color"),
             )
         preferred = self.location.findData(self.database.last_issue_location())
         self.location.setCurrentIndex(max(0, preferred))
@@ -3524,6 +3740,8 @@ class LocationsPage(BasePage):
                 position_cell.setData(Qt.ItemDataRole.UserRole, item["warehouse_id"])
             if storage_cell:
                 storage_cell.setData(Qt.ItemDataRole.UserRole, item["id"])
+                storage_cell.setData(Qt.ItemDataRole.UserRole + 1, item.get("color"))
+                storage_cell.setIcon(storage_icon(item.get("color")))
         self.table.setSortingEnabled(True)
 
     def add_warehouse(self) -> None:
@@ -3720,6 +3938,7 @@ class LocationsPage(BasePage):
         menu = QMenu(self)
         edit_position = menu.addAction("完整编辑位置…")
         edit_storage = menu.addAction("完整编辑仓库…")
+        change_color = menu.addAction("更改仓库颜色…")
         menu.addSeparator()
         action = menu.addAction("配置元件类别仓库优先级…")
         menu.addSeparator()
@@ -3729,12 +3948,15 @@ class LocationsPage(BasePage):
         position_cell = self.table.item(row, 0) if row >= 0 else None
         edit_position.setEnabled(position_cell is not None)
         edit_storage.setEnabled(storage_cell is not None)
+        change_color.setEnabled(storage_cell is not None)
         delete_storage.setEnabled(storage_cell is not None)
         selected = menu.exec(self.table.viewport().mapToGlobal(position))
         if selected == edit_position and row >= 0:
             self.open_full_item_editor(row, 0)
         elif selected == edit_storage and row >= 0:
             self.open_full_item_editor(row, 1)
+        elif selected == change_color and storage_cell:
+            self.change_storage_color(storage_cell)
         elif selected == action:
             category, accepted = QInputDialog.getText(self, "类别优先级", "元件类别名称：")
             if accepted and category.strip():
@@ -3750,6 +3972,19 @@ class LocationsPage(BasePage):
                 else str(self.warehouse.currentData() or "")
             )
             self.delete_warehouse(position_id)
+
+    def change_storage_color(self, cell: QTableWidgetItem) -> None:
+        """选择并保存仓库色标，随后通知其他页面刷新。"""
+
+        current = QColor(cell.data(Qt.ItemDataRole.UserRole + 1) or "#2563eb")
+        chosen = QColorDialog.getColor(current, self, f"更改仓库颜色 · {cell.text()}")
+        if chosen.isValid():
+            try:
+                self.database.set_location_color(str(cell.data(Qt.ItemDataRole.UserRole)), chosen.name())
+                self.refresh()
+                self.changed.emit()
+            except Exception as error:
+                self.show_error(str(error))
 
     def open_priority_dialog(self, category: str | None) -> None:
         """打开整体或类别仓库优先级配置。"""
@@ -3896,7 +4131,21 @@ class BomPage(BasePage):
         position_id = self.position.currentData()
         for location in self.database.list_locations():
             if location["warehouse_id"] == position_id:
-                self.location.addItem(location["name"], location["id"])
+                add_storage_option(
+                    self.location, location["name"], location["id"], location.get("color")
+                )
+
+    def reload(self) -> None:
+        """刷新仓库色标与推荐信息，保留 BOM 中已选的出库仓库。"""
+
+        colors = {location["id"]: location.get("color") for location in self.database.list_locations()}
+        for combo in (self.location, *(self.table.cellWidget(row, 5) for row in range(self.table.rowCount()))):
+            if isinstance(combo, QComboBox):
+                for index in range(combo.count()):
+                    combo.setItemIcon(index, storage_icon(colors.get(combo.itemData(index))))
+        self._warehouse_priorities.clear()
+        if self.preview:
+            self._refresh_bom_ready()
 
     def _apply_overall_location(self) -> None:
         """把整体仓库应用到当前勾选行，未勾选行保持原设置。"""
@@ -4004,6 +4253,7 @@ class BomPage(BasePage):
             str(warehouse["id"]): str(warehouse["name"])
             for warehouse in self.database.list_warehouses()
         }
+        storage_options = self.database.list_locations()
         for row_index, item in enumerate(self.preview):
             enabled = QCheckBox()
             enabled.setChecked(True)
@@ -4048,11 +4298,13 @@ class BomPage(BasePage):
             self.table.setCellWidget(row_index, 4, selector)
             location = WheelSafeComboBox()
             location.addItem("请选择仓库", None)
-            for storage in self.database.list_locations():
-                location.addItem(
+            for storage in storage_options:
+                add_storage_option(
+                    location,
                     f"{warehouse_names.get(str(storage['warehouse_id']), '未知位置')} / "
                     f"{storage['name']}",
                     storage["id"],
+                    storage.get("color"),
                 )
             location.currentIndexChanged.connect(
                 lambda _index, row=row_index, widget=location: self._location_changed(
@@ -4212,6 +4464,7 @@ class BomPage(BasePage):
                     f"{best[0]['warehouse_name']} / {best[0]['location_name']}（{best[1]}）"
                     if best and enabled else "—"
                 )
+                recommendation.setIcon(storage_icon(best[0].get("color") if best and enabled else None))
                 recommendation.setToolTip("按类别和整体优先级推荐，需手动选择出库仓库")
             color = QColor("#ffd6d6") if enabled and shortage > 0 else QColor("#eeeeee") if not enabled else QColor("#ffffff")
             for column in range(self.table.columnCount()):
@@ -4325,7 +4578,7 @@ class BomPickPage(BasePage):
         except Exception as error:
             self.title.setText(f"取货任务刷新失败：{error}")
             return
-        if self.current and self.current["revision"] == current["revision"]:
+        if self.current == current:
             return
         self.current = current
         snapshot = current["snapshot"]
@@ -4335,6 +4588,7 @@ class BomPickPage(BasePage):
         )
         display: list[list[Any]] = []
         indexed: list[dict[str, Any]] = []
+        colors: list[str | None] = []
         for group in snapshot.get("groups", []):
             location = f"{group['warehouse_name']} / {group['location_name']}"
             for item in group["items"]:
@@ -4355,8 +4609,12 @@ class BomPickPage(BasePage):
                     ]
                 )
                 indexed.append(item)
+                colors.append(group.get("color"))
+        self.table.setSortingEnabled(False)
         fill_table(self.table, display)
         for row, item in enumerate(indexed):
+            if location_cell := self.table.item(row, 0):
+                location_cell.setIcon(storage_icon(colors[row]))
             controls = QWidget()
             controls_layout = QHBoxLayout(controls)
             controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -4371,6 +4629,7 @@ class BomPickPage(BasePage):
                 )
                 controls_layout.addWidget(undo)
             self.table.setCellWidget(row, 6, controls)
+        self.table.setSortingEnabled(True)
         self.commit.setEnabled(current["state"] == "READY")
 
     def _command(self, command: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -4839,7 +5098,8 @@ class TransactionsPage(BasePage):
                 source for item in items if (source := self._transaction_source(item))
             ))
             locations = {
-                f"{item['warehouse_name']} / {item['location_name']}" for item in items
+                f"{item['warehouse_name']} / {item['location_name']}": item.get("color")
+                for item in items
             }
             notes = list(dict.fromkeys(
                 note for item in items if (note := self._transaction_notes(item))
@@ -4886,6 +5146,13 @@ class TransactionsPage(BasePage):
                 else:
                     cell.setText(str(value))
                 cell.setBackground(QColor("#dceadf"))
+                if column == 5:
+                    if len(locations) == 1:
+                        cell.setIcon(storage_icon(next(iter(locations.values()))))
+                    else:
+                        cell.setToolTip("<qt>" + "<br>".join(
+                            storage_label(name, color) for name, color in locations.items()
+                        ) + "</qt>")
                 self.table.setItem(summary_row, column, cell)
             detail_start = self.table.rowCount()
             for item in items if len(items) > 1 else []:
@@ -4908,6 +5175,8 @@ class TransactionsPage(BasePage):
                     else:
                         cell.setText(str(value))
                     cell.setBackground(QColor("#f7fbf8"))
+                    if column == 5:
+                        cell.setIcon(storage_icon(item.get("color")))
                     self.table.setItem(row, column, cell)
                 self.table.setRowHidden(row, True)
             detail_end = self.table.rowCount()
@@ -4976,6 +5245,7 @@ class StatisticsPage(BasePage):
             (self.location_table, "by_location"),
             (self.category_table, "by_category"),
         ):
+            table.setSortingEnabled(False)
             fill_table(
                 table,
                 [
@@ -4989,6 +5259,11 @@ class StatisticsPage(BasePage):
                     for item in statistics[key]
                 ],
             )
+            if key == "by_location":
+                for row, item in enumerate(statistics[key]):
+                    if location_cell := table.item(row, 0):
+                        location_cell.setIcon(storage_icon(item.get("color")))
+            table.setSortingEnabled(True)
 
 
 class SettingsPage(BasePage):

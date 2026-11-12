@@ -11,6 +11,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -71,7 +72,7 @@ class ApiClient(private var credential: ServerCredential) {
 
     fun heartbeat(sessionId: String = ""): JSONObject = execute(
         authenticated("/api/v1/devices/heartbeat", "POST")
-            .newBuilder().header("X-Client-Version", "1.0.9")
+            .newBuilder().header("X-Client-Version", "1.0.10")
             .header("X-Session-Id", sessionId).build(),
     ).also {
         val major = it.getJSONObject("capabilities").getInt("api_major")
@@ -138,12 +139,34 @@ class ApiClient(private var credential: ServerCredential) {
     }
 
     companion object {
-        fun pair(payloadText: String, deviceName: String): ServerCredential {
-            val payload = JSONObject(payloadText)
-            val protocol = payload.getInt("protocol")
+        internal fun parsePairingPayload(text: String): JSONObject {
+            val wrongCode = "这不是元件库配对二维码，请扫描电脑「设置 → 连接信息」中的配对码"
+            val payload = try {
+                JSONObject(text.trim())
+            } catch (_: JSONException) {
+                throw IllegalArgumentException(wrongCode)
+            }
+            val scheme = payload.optString("scheme")
+            val protocol = payload.optInt("protocol", -1)
+            require(scheme == "component-library-pairing" || (scheme.isEmpty() && protocol == 1)) {
+                wrongCode
+            }
             require(protocol == 1 || protocol == 2) { "不支持的配对协议版本 $protocol" }
+            require(payload.optJSONArray("addresses")?.optString(0)?.isNotBlank() == true) {
+                "配对信息中没有局域网地址"
+            }
+            val fields = listOf("server_id", "service_name", "pairing_code") +
+                if (protocol == 1) listOf("ca_pem") else listOf("ca_sha256", "server_cert_sha256")
+            require(payload.optInt("port") in 1..65535 && fields.all { payload.optString(it).isNotBlank() }) {
+                "配对二维码信息不完整，请在电脑上重新生成"
+            }
+            return payload
+        }
+
+        fun pair(payloadText: String, deviceName: String): ServerCredential {
+            val payload = parsePairingPayload(payloadText)
+            val protocol = payload.getInt("protocol")
             val addresses = payload.getJSONArray("addresses")
-            require(addresses.length() > 0) { "配对信息中没有局域网地址" }
             val host = addresses.getString(0)
             val port = payload.getInt("port")
             val baseUrl = "https://$host:$port"
@@ -168,7 +191,7 @@ class ApiClient(private var credential: ServerCredential) {
                         .put("pairing_code", payload.getString("pairing_code"))
                         .put("device_name", deviceName)
                         .put("device_type", "ANDROID_PHONE")
-                        .put("client_version", "1.0.9")
+                        .put("client_version", "1.0.10")
                         .toString().toRequestBody(jsonType),
                 ).build(),
             )

@@ -168,6 +168,19 @@ class SessionService:
             snapshot = json.loads(row["snapshot_json"])
             if row["kind"] == "BOM_PICK":
                 snapshot = self._pick_snapshot(connection, session_id)
+            else:
+                # 仓库颜色来自当前设置，已打开的会话无需更改库存命令修订号。
+                storage = snapshot.get("locations") or []
+                batch_storage = (snapshot.get("batch") or {}).get("locations") or []
+                if storage or batch_storage:
+                    colors = {
+                        location["id"]: location["color"]
+                        for location in connection.execute("SELECT id,color FROM locations")
+                    }
+                    for location in storage:
+                        location["color"] = colors.get(location["id"])
+                    for location in batch_storage:
+                        location["color"] = colors.get(location["location_id"])
             result = json.loads(row["result_json"]) if row["result_json"] else None
         return self._envelope(row, snapshot, result)
 
@@ -788,6 +801,7 @@ class SessionService:
                     "warehouse_name": primary["warehouse_name"],
                     "location_id": primary["location_id"],
                     "location_name": primary["location_name"],
+                    "color": primary.get("color"),
                     "items": [],
                 },
             )
@@ -830,7 +844,7 @@ class SessionService:
     ) -> list[dict[str, Any]]:
         rows = connection.execute(
             """SELECT s.batch_id,s.location_id,s.remaining_quantity,l.name location_name,
-            w.id warehouse_id,w.name warehouse_name,b.custom_code,b.order_number
+            w.id warehouse_id,w.name warehouse_name,l.color,b.custom_code,b.order_number
             FROM stock_lots s JOIN locations l ON l.id=s.location_id
             JOIN warehouses w ON w.id=l.warehouse_id
             LEFT JOIN inventory_batches b ON b.id=s.batch_id

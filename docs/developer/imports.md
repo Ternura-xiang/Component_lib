@@ -4,13 +4,13 @@
 
 ## 1. BOM：`bom.py`
 
-`parse_bom()` 解析 CSV/XLSX 并映射中英文表头；`preview_bom()` 在现有元件中生成候选，编号精确匹配优先于名称模糊匹配。预览不得直接扣库存；用户确认后由 `Database.commit_bom()` 原子出库。
+`parse_bom()` 解析 CSV/XLSX 并映射中英文表头。`preview_bom()` 在现有元件中生成候选，编号精确匹配优先于名称模糊匹配。桌面端先创建取货会话，由 `SessionService` 在最终确认时原子扣库。直接提交的本机 BOM API 仍使用 `Database.commit_bom()`。
 
 新增列名或格式时同步更新 `tests/test_bom.py`，特别验证重名、歧义、缺数量和错误文件格式。
 
 ## 2. 离线订单：`order_import.py`
 
-`parse_saved_orders()` 从用户保存的 ZIP/HTML/MHTML 静态内容提取商品。它不会执行页面脚本；订单数据经 `preview_order_import()` 标注创建/匹配/跳过，再由 `import_order_lines()` 在事务中入库。通过订单号与立创编号形成重复导入约束。
+`parse_saved_orders()` 从用户保存的静态页面提取商品，按页面上的订单状态剔除已取消或关闭的订单。桌面端在线程池解析文件，通过带文件代次的 Qt 信号在主线程更新进度、预览或错误。商品资料补全由用户主动点击匹配按钮触发。最终确认后，`import_order_lines()` 在事务中入库，并按订单号与立创编号去重。
 
 修改解析器需覆盖页面结构变化、编码、安全输入、相同行去重与事务失败等场景，见 `tests/test_order_import.py`。
 

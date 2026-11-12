@@ -36,6 +36,10 @@ from .models import (
 
 EPSILON = 1e-9
 CUSTOM_BATCH_CODE = re.compile(r"^CL\d{10}$")
+LOCATION_COLORS = (
+    "#2563eb", "#c2410c", "#15803d", "#9333ea", "#be123c", "#0e7490",
+    "#a16207", "#4338ca", "#047857", "#a21caf", "#b91c1c", "#0369a1",
+)
 
 
 class DomainError(RuntimeError):
@@ -184,6 +188,34 @@ class Database:
             self._migrate_v11(connection)
             self._migrate_v12(connection)
             self._migrate_v13(connection)
+            self._migrate_v14(connection)
+
+    @staticmethod
+    def _next_location_color(used: set[str]) -> str:
+        for color in LOCATION_COLORS:
+            if color not in used:
+                return color
+        color = f"#{uuid.uuid4().hex[:6]}"
+        while color in used:
+            color = f"#{uuid.uuid4().hex[:6]}"
+        return color
+
+    def _migrate_v14(self, connection: sqlite3.Connection) -> None:
+        """为已有仓库补齐持久化的默认颜色。"""
+
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        if not any(row["name"] == "color" for row in connection.execute("PRAGMA table_info(locations)")):
+            connection.execute("ALTER TABLE locations ADD COLUMN color TEXT")
+        used = {row[0] for row in connection.execute("SELECT color FROM locations WHERE color IS NOT NULL")}
+        missing = connection.execute(
+            "SELECT id FROM locations WHERE color IS NULL ORDER BY created_at,id"
+        ).fetchall()
+        for row in missing:
+            color = self._next_location_color(used)
+            connection.execute("UPDATE locations SET color=? WHERE id=?", (color, row["id"]))
+            used.add(color)
+        connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(14,datetime('now'))")
 
     @staticmethod
     def _migrate_v3(connection: sqlite3.Connection) -> None:
@@ -752,13 +784,27 @@ class Database:
         }
         try:
             with self.write() as connection:
+                used = {row[0] for row in connection.execute("SELECT color FROM locations")}
+                item["color"] = self._next_location_color(used)
                 connection.execute(
-                    "INSERT INTO locations(id,warehouse_id,name,notes,created_at) VALUES(:id,:warehouse_id,:name,:notes,:created_at)",
+                    """INSERT INTO locations(id,warehouse_id,name,notes,created_at,color)
+                    VALUES(:id,:warehouse_id,:name,:notes,:created_at,:color)""",
                     item,
                 )
         except sqlite3.IntegrityError as error:
             raise DomainError("CONFLICT", "仓库名称重复，或上级位置不存在") from error
         return item
+
+    def set_location_color(self, location_id: str, color: str) -> None:
+        """保存具体仓库的显示颜色。"""
+
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            raise DomainError("VALIDATION_ERROR", "颜色应为六位十六进制 RGB 值")
+        with self.write() as connection:
+            self._require(connection, "locations", location_id, "仓库")
+            connection.execute(
+                "UPDATE locations SET color=? WHERE id=?", (color.lower(), location_id)
+            )
 
     def list_locations(self) -> list[dict[str, Any]]:
         """列出全部具体仓库。"""
@@ -809,7 +855,7 @@ class Database:
         with self.read() as connection:
             if category:
                 rows = connection.execute(
-                    """SELECT l.id location_id,l.name location_name,w.name warehouse_name,
+                    """SELECT l.id location_id,l.name location_name,w.name warehouse_name,l.color,
                     cp.priority,
                     (SELECT priority FROM storage_location_priorities gp
                      WHERE gp.location_id=l.id) global_priority
@@ -822,7 +868,7 @@ class Database:
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    """SELECT l.id location_id,l.name location_name,w.name warehouse_name,
+                    """SELECT l.id location_id,l.name location_name,w.name warehouse_name,l.color,
                     gp.priority,NULL global_priority
                     FROM locations l JOIN warehouses w ON w.id=l.warehouse_id
                     LEFT JOIN storage_location_priorities gp ON gp.location_id=l.id
@@ -931,11 +977,26 @@ class Database:
         with self.read() as connection:
             rows = connection.execute(
                 """SELECT c.id component_id,c.name component_name,w.id warehouse_id,
-                w.name warehouse_name,l.id location_id,l.name location_name,
+                w.name warehouse_name,l.id location_id,l.name location_name,l.color,
                 COALESCE(SUM(s.remaining_quantity),0) quantity
                 FROM stock_lots s JOIN components c ON c.id=s.component_id
                 JOIN locations l ON l.id=s.location_id JOIN warehouses w ON w.id=l.warehouse_id
                 GROUP BY c.id,l.id HAVING quantity>0 ORDER BY c.name,w.name,l.name"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_inventory_lots(self) -> list[dict[str, Any]]:
+        """按实际入库批次返回有余量的库存明细，供库存页展示和移库。"""
+
+        with self.read() as connection:
+            rows = connection.execute(
+                """SELECT s.id,s.component_id,s.location_id,s.remaining_quantity quantity,
+                s.unit_price,s.received_at,s.purchase_date,w.name warehouse_name,
+                l.name location_name,l.color,b.order_number,b.custom_code
+                FROM stock_lots s JOIN locations l ON l.id=s.location_id
+                JOIN warehouses w ON w.id=l.warehouse_id
+                LEFT JOIN inventory_batches b ON b.id=s.batch_id
+                WHERE s.remaining_quantity>0 ORDER BY s.received_at DESC,s.rowid DESC"""
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -966,7 +1027,7 @@ class Database:
                 c.lcsc_part_number,c.manufacturer_part_number,c.custom_part_number,
                 c.category,c.brand,c.package,c.specification,c.price component_price,
                 c.purchase_date,c.product_url,c.datasheet_url,c.notes,
-                w.name warehouse_name,l.name location_name,
+                w.name warehouse_name,l.name location_name,l.color,
                 COALESCE(SUM(s.remaining_quantity),0) quantity,
                 COALESCE(SUM(CASE WHEN COALESCE(s.unit_price,c.price) IS NOT NULL
                     THEN s.remaining_quantity*COALESCE(s.unit_price,c.price) ELSE 0 END),0) value,
@@ -1041,6 +1102,7 @@ class Database:
                 label,
                 {
                     "name": label,
+                    "color": row["color"],
                     "component_ids": set(),
                     "quantity": 0,
                     "value": 0.0,
@@ -1054,6 +1116,7 @@ class Database:
         by_location = [
             {
                 "name": group["name"],
+                "color": group["color"],
                 "component_types": len(group["component_ids"]),
                 "quantity": group["quantity"],
                 "value": group["value"],
@@ -1152,7 +1215,7 @@ class Database:
                 raise DomainError("NOT_FOUND", "批次不存在")
             locations = connection.execute(
                 """SELECT l.id location_id,l.name location_name,w.id warehouse_id,
-                w.name warehouse_name,SUM(s.remaining_quantity) remaining_quantity
+                w.name warehouse_name,l.color,SUM(s.remaining_quantity) remaining_quantity
                 FROM stock_lots s JOIN locations l ON l.id=s.location_id
                 JOIN warehouses w ON w.id=l.warehouse_id
                 WHERE s.batch_id=? GROUP BY l.id ORDER BY w.name,l.name""",
@@ -1630,53 +1693,72 @@ class Database:
             used = self._consume_lots(
                 connection, data.component_id, data.from_location_id, data.quantity
             )
-            affected = 0
-            for source_lot, quantity, unit_price in used:
-                source_batch = connection.execute(
-                    "SELECT batch_id FROM stock_lots WHERE id=?", (source_lot,)
-                ).fetchone()[0]
-                self._insert_transaction(
-                    connection,
-                    group_id,
-                    "TRANSFER_OUT",
-                    data.component_id,
-                    source_lot,
-                    data.from_location_id,
-                    -quantity,
-                    "移库",
-                    data.notes,
+            for lot_id, quantity, _ in used:
+                source_lot = connection.execute(
+                    "SELECT * FROM stock_lots WHERE id=?", (lot_id,)
+                ).fetchone()
+                self._record_lot_transfer(
+                    connection, group_id, source_lot, data.to_location_id, quantity, data.notes
                 )
-                target_lot = str(uuid.uuid4())
+        return {"transaction_group_id": group_id, "affected_transactions": len(used) * 2}
+
+    def transfer_lots(self, quantities: dict[str, int], target_id: str) -> dict[str, Any]:
+        """原子移动所选批次的当前余量，库存与预览不符时回滚整组。"""
+
+        group_id = str(uuid.uuid4())
+        moved = 0
+        with self.write() as connection:
+            self._require(connection, "locations", target_id, "目标仓库")
+            for lot_id, quantity in quantities.items():
+                lot = connection.execute(
+                    "SELECT * FROM stock_lots WHERE id=?", (lot_id,)
+                ).fetchone()
+                # 任一批次余量与预览不符时，回滚本组已经执行的移库。
+                if not lot or quantity <= 0 or lot["remaining_quantity"] != quantity:
+                    raise DomainError("CONFLICT", "所选批次库存已变动，请刷新后重试")
+                if lot["location_id"] == target_id:
+                    continue
                 connection.execute(
-                    """INSERT INTO stock_lots(id,component_id,location_id,initial_quantity,
-                    remaining_quantity,source,unit_price,notes,received_at,batch_id)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        target_lot,
-                        data.component_id,
-                        data.to_location_id,
-                        quantity,
-                        quantity,
-                        "移库",
-                        unit_price,
-                        clean(data.notes),
-                        utc_now(),
-                        source_batch,
-                    ),
+                    "UPDATE stock_lots SET remaining_quantity=0 WHERE id=?", (lot_id,)
                 )
-                self._insert_transaction(
-                    connection,
-                    group_id,
-                    "TRANSFER_IN",
-                    data.component_id,
-                    target_lot,
-                    data.to_location_id,
-                    quantity,
-                    "移库",
-                    data.notes,
-                )
-                affected += 2
-        return {"transaction_group_id": group_id, "affected_transactions": affected}
+                self._record_lot_transfer(connection, group_id, lot, target_id, quantity)
+                moved += 1
+            if not moved:
+                raise DomainError("VALIDATION_ERROR", "请选择至少一个不在目标仓库的库存批次")
+        return {"transaction_group_id": group_id, "moved_lots": moved}
+
+    def _record_lot_transfer(
+        self,
+        connection: sqlite3.Connection,
+        group_id: str,
+        source: sqlite3.Row,
+        target_id: str,
+        quantity: float,
+        notes: str | None = None,
+    ) -> None:
+        """创建目标库存，保留源批次采购信息并写入成对流水。"""
+
+        target_lot_id = str(uuid.uuid4())
+        component_id = source["component_id"]
+        # 批次保留原入库时间供 FIFO 排序。实际换库时间由两条移库流水记录。
+        connection.execute(
+            """INSERT INTO stock_lots(id,component_id,location_id,initial_quantity,
+            remaining_quantity,source,unit_price,supplier_part_id,notes,received_at,
+            purchase_date,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                target_lot_id, component_id, target_id, quantity, quantity, "移库",
+                source["unit_price"], source["supplier_part_id"], clean(notes) or source["notes"],
+                source["received_at"], source["purchase_date"], source["batch_id"],
+            ),
+        )
+        self._insert_transaction(
+            connection, group_id, "TRANSFER_OUT", component_id, source["id"],
+            source["location_id"], -quantity, "移库", notes,
+        )
+        self._insert_transaction(
+            connection, group_id, "TRANSFER_IN", component_id, target_lot_id,
+            target_id, quantity, "移库", notes,
+        )
 
     def adjust(self, data: AdjustRequest) -> dict[str, Any]:
         """把仓库库存调整到目标值，差额仍通过批次流水表达。
@@ -1751,7 +1833,7 @@ class Database:
 
         with self.read() as connection:
             rows = connection.execute(
-                """SELECT t.*,c.name component_name,w.name warehouse_name,l.name location_name
+                """SELECT t.*,c.name component_name,w.name warehouse_name,l.name location_name,l.color
                 FROM inventory_transactions t JOIN components c ON c.id=t.component_id
                 JOIN locations l ON l.id=t.location_id JOIN warehouses w ON w.id=l.warehouse_id
                 ORDER BY t.created_at DESC,t.rowid DESC"""

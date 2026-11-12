@@ -57,6 +57,34 @@ def test_parse_saved_order_without_session_query(tmp_path: Path) -> None:
     assert line.product_url == "https://item.szlcsc.com/29373045.html"
 
 
+def test_unrendered_order_page_explains_how_to_save_details(tmp_path: Path) -> None:
+    path = tmp_path / "orders.html"
+    path.write_text(
+        "<html><head><title>我的订单-立创商城</title></head>"
+        "<body><main><span>元器件订单 (0)</span></main></body></html>",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DomainError, match="页面不含订单明细.*等订单和商品明细显示"):
+        parse_saved_orders(path)
+
+
+def test_cancelled_order_is_excluded_but_cancel_button_is_not_status(tmp_path: Path) -> None:
+    path = tmp_path / "mixed-orders.html"
+    cancelled = HTML.replace("</a></section></section>", "</a></section><span>已取消</span></section>", 1)
+    active = (
+        HTML.replace("SO26102118592", "SO26102118593")
+        .replace("</a></section></section>", "</a></section><button>取消订单</button></section>", 1)
+    )
+    path.write_text(cancelled + active, encoding="utf-8")
+
+    assert [line.order_number for line in parse_saved_orders(path)] == ["SO26102118593"]
+
+    path.write_text(cancelled, encoding="utf-8")
+    with pytest.raises(DomainError, match="已剔除取消或关闭的订单"):
+        parse_saved_orders(path)
+
+
 def test_parse_resistor_category_details(tmp_path: Path) -> None:
     path = tmp_path / "resistor.html"
     path.write_text(RESISTOR_HTML, encoding="utf-8")

@@ -23,6 +23,10 @@ MAX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
 MAX_ORDER_FILE_ITEMS = 10_000
 ORDER_NUMBER = re.compile(r"SO\d{8,16}")
 ORDER_DATE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+CANCELLED_ORDER = re.compile(
+    r"(?:订单状态\s*[:：]\s*)?(?:"
+    r"(?:订单\s*)?(?:已取消|已撤销|已关闭)|(?:交易|订单)\s*关闭|交易已关闭)"
+)
 LCSC_NUMBER = re.compile(r"C\d{4,10}", re.IGNORECASE)
 PRICE = re.compile(r"￥\s*(\d+(?:\.\d+)?)")
 QUANTITY = re.compile(r"(\d+)\s*个")
@@ -149,19 +153,14 @@ def parse_saved_orders(
 
     ### 安全读取并构建静态 DOM ###
     soup = BeautifulSoup(_read_html(path), "html.parser")
-    collapsed_orders = soup.find_all(
-        string=lambda value: value and "查看全部商品" in value.strip()
-    )
-    if collapsed_orders and warning:
-        warning(
-            f"检测到 {len(collapsed_orders)} 个未展开订单；保存文件只包含网页已加载商品，"
-            "额外商品需要在网页展开后重新保存"
-        )
     output: list[OrderImportLine] = []
     seen: set[tuple[str, str]] = set()
+    cancelled: set[str] = set()
+    collapsed: set[str] = set()
     last_progress = ""
     ### 定位订单容器并提取商品行 ###
-    for label in soup.find_all(string=lambda value: value and value.strip() == "订单编号："):
+    order_labels = soup.find_all(string=lambda value: value and value.strip() == "订单编号：")
+    for label in order_labels:
         header = label.parent.find_parent("section") if label.parent else None
         order_container = header.find_parent("li") if header else None
         if not isinstance(header, Tag) or not isinstance(order_container, Tag):
@@ -172,6 +171,13 @@ def parse_saved_orders(
         if not order_match or not date_match:
             continue
         order_number = order_match.group(0)
+        order_text = list(order_container.stripped_strings)
+        # 仅匹配完整状态文字，仍可执行的「取消订单」按钮属于正常订单。
+        if any(CANCELLED_ORDER.fullmatch(value) for value in order_text):
+            cancelled.add(order_number)
+            continue
+        if any("查看全部商品" in value for value in order_text):
+            collapsed.add(order_number)
         for product in order_container.find_all(
             "section", class_=lambda value: value and "justify-between" in value
         ):
@@ -231,8 +237,23 @@ def parse_saved_orders(
                 )
             )
     ### 确认至少得到一条可导入记录 ###
+    if cancelled:
+        output = [line for line in output if line.order_number not in cancelled]
     if not output:
+        if cancelled and not collapsed:
+            raise DomainError("VALIDATION_ERROR", "页面中没有可导入的商品，已剔除取消或关闭的订单")
+        if not order_labels and soup.title and "我的订单" in _text(soup.title):
+            raise DomainError(
+                "VALIDATION_ERROR",
+                "保存的“我的订单”页面不含订单明细。请在浏览器登录立创商城，"
+                "检索后等订单和商品明细显示，再以“网页，全部”保存并重新导入。",
+            )
         raise DomainError("VALIDATION_ERROR", "页面中没有找到可导入的订单商品")
+    if (active_collapsed := collapsed - cancelled) and warning:
+        warning(
+            f"检测到 {len(active_collapsed)} 个未展开订单；保存文件只包含网页已加载商品，"
+            "额外商品需要在网页展开后重新保存"
+        )
     if progress and last_progress:
         progress(last_progress)
     return output
