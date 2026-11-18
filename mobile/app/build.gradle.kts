@@ -40,7 +40,7 @@ android {
 androidComponents {
     onVariants { variant ->
         val prepareIcon = tasks.register<PrepareLauncherIcon>("prepare${variant.name.replaceFirstChar { it.uppercase() }}LauncherIcon") {
-            source.set(rootProject.layout.projectDirectory.file("../packaging/assets/icons/component-library.png"))
+            source.set(rootProject.layout.projectDirectory.file("../desktop/packaging/assets/icons/component-library.png"))
         }
         variant.sources.res?.addGeneratedSourceDirectory(prepareIcon, PrepareLauncherIcon::outputDirectory)
     }

@@ -12,9 +12,17 @@ ENV/
 # 构建、打包与发布产物
 build/
 dist/
-packaging/windows/Output/
-# 本地发布工作目录。已跟踪的历史说明继续保留，新增说明放在 docs/releases/。
-/release/
+desktop/packaging/windows/Output/
+# 本地发布工作目录。已跟踪的历史说明继续保留，新增说明放在 desktop/docs/releases/。
+/desktop/release/*
+!/desktop/release/0.8.8/
+/desktop/release/0.8.8/*
+!/desktop/release/0.8.8/LICENSE
+!/desktop/release/0.8.8/README.md
+!/desktop/release/0.8.8/RELEASE_NOTES.md
+!/desktop/release/0.8.8/SHA256SUMS
+/mobile/release/
+/hardware/release/
 *.egg-info/
 *.egg
 *.whl
@@ -34,6 +42,9 @@ coverage.xml
 htmlcov/
 
 # IDE 与编辑器的本机项目配置
+.codex/
+.aws/
+.agents/
 .idea/
 .vscode/
 *.code-workspace
@@ -73,8 +84,8 @@ server-id
 logs/
 
 # OCR 私有纠错/评估样本；脱敏回归 fixture 应明确放入 tests/fixtures
-tools/ocr_training/samples/
-tools/ocr_training/evaluation*.jsonl
+desktop/tools/ocr_training/samples/
+desktop/tools/ocr_training/evaluation*.jsonl
 
 # 临时文件
 *.tmp

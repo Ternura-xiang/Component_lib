@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY = ROOT.parent
 MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
 
@@ -15,8 +16,12 @@ def documentation_files() -> list[Path]:
 
     return [
         ROOT / "README.md",
-        ROOT / "CONTRIBUTING.md",
-        ROOT / "android" / "README.md",
+        REPOSITORY / "README.md",
+        REPOSITORY / "CONTRIBUTING.md",
+        REPOSITORY / "mobile" / "README.md",
+        REPOSITORY / "hardware" / "README.md",
+        REPOSITORY / "THIRD_PARTY_NOTICES.md",
+        ROOT / "THIRD_PARTY_NOTICES.md",
         *(ROOT / "docs").rglob("*.md"),
         *(ROOT / "tools").rglob("README.md"),
     ]
@@ -59,5 +64,5 @@ def test_relative_documentation_links_exist() -> None:
                 continue
             resolved = (source.parent / target).resolve()
             if not resolved.exists():
-                missing.append(f"{source.relative_to(ROOT)} -> {raw_target}")
+                missing.append(f"{source.relative_to(REPOSITORY)} -> {raw_target}")
     assert not missing, "\n".join(missing)

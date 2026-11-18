@@ -10,7 +10,7 @@
 | [BOM / 订单 / 商品页](imports.md) | 文件解析、匹配、网页访问合规边界 | `bom.py`、`order_import.py`、`jlc_product.py`、`web_sources.py` |
 | [本机与局域网 API](api.md) | 认证、幂等、设备配对、REST 和 WebSocket | `api.py`、`connection.py`、`sessions.py` |
 | [桌面界面和打包](ui-build.md) | 页面、后台任务、跨平台运行、构建 | `ui/`、`packaging/` |
-| [安卓构建与诊断](../../android/README.md) | 移动端、取景、构建与扫码诊断 | `android/` |
+| [安卓构建与诊断](../../../mobile/README.md) | 移动端、取景、构建与扫码诊断 | `mobile/` |
 | [测试与贡献](testing.md) | 开发流程、回归测试、发布检查 | `tests/` |
 
 ## 准备环境

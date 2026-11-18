@@ -2,6 +2,8 @@
 
 ## 本地工作流
 
+以下 Python 命令均在 `desktop/` 目录运行。
+
 ```bash
 uv sync --locked --extra dev
 uv run ruff check src tests
@@ -19,7 +21,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest
 | 库存、批次、迁移、冲销 | `tests/test_database.py` |
 | API 认证、幂等、错误 | `tests/test_api.py` |
 | 配对、共享会话和 BOM 取货 | `tests/test_sessions.py`、`tests/test_api.py` |
-| 安卓协议兼容 | `android/app/src/test/`，运行 `./gradlew :app:testDebugUnitTest` |
+| 安卓协议兼容 | `mobile/app/src/test/`，运行 `./gradlew :app:testDebugUnitTest` |
 | OCR 字段规则 | `tests/test_label_parser.py` |
 | 立创标签/商品页 | `tests/test_jlc_import.py`、`tests/test_jlc_product.py` |
 | 离线订单 | `tests/test_order_import.py` |
@@ -46,6 +48,6 @@ QT_QPA_PLATFORM=offscreen uv run pytest
 uv run python tools/build.py
 ```
 
-套件包含回环 HTTP、TLS 和 WebSocket 测试，运行环境需允许创建本机套接字。安卓打包和单元测试见[安卓说明](../../android/README.md)。相机画面、局域网配对与掉线恢复需要真机验证。
+套件包含回环 HTTP、TLS 和 WebSocket 测试，运行环境需允许创建本机套接字。安卓打包和单元测试见[安卓说明](../../../mobile/README.md)。相机画面、局域网配对与掉线恢复需要真机验证。
 
-发布前在目标系统检查新库入出库、BOM 缺料回滚、订单预览、扫码草稿、备份恢复及打包程序启动。提交检查见[参与开发](../../CONTRIBUTING.md)。
+发布前在目标系统检查新库入出库、BOM 缺料回滚、订单预览、扫码草稿、备份恢复及打包程序启动。提交检查见[参与开发](../../../CONTRIBUTING.md)。
