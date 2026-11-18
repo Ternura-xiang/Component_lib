@@ -8,19 +8,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Collection, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from .catalogs import (
+    CATALOGS,
+    SNAPSHOT_TABLE,
+    Catalog,
+    catalog_path,
+    initialize_catalog,
+    store_catalog_entry,
+)
+from .datasheet import (
+    can_match_jlc_component,
+    jlc_datasheet_url,
+    jlc_product_key,
+    normalize_datasheet_url,
+)
+from .label_parser import parse_qr_payload
 from .models import (
     ORDER_IMPORT_BATCH_SIZE,
     AdjustRequest,
@@ -30,13 +47,24 @@ from .models import (
     JlcParameterGroup,
     JlcProductDraft,
     LocationCreate,
+    MosfetDetails,
     OrderImportLine,
     ReceiveRequest,
+    ResistorDetails,
+    TransactionDetails,
     TransferRequest,
     WarehouseCreate,
 )
+from .operation_log import log_operation
+
+logger = logging.getLogger(__name__)
 
 EPSILON = 1e-9
+EDITABLE_TRANSACTION_QUANTITY = {
+    "RECEIVE", "ISSUE", "ADJUST_IN", "ADJUST_OUT", "TRANSFER_IN", "TRANSFER_OUT",
+}
+TRANSACTION_RECEIPT_KINDS = {"RECEIVE", "ADJUST_IN"}
+TRANSACTION_MERGE_SECONDS = 60
 CUSTOM_BATCH_CODE = re.compile(r"^CL\d{10}$")
 LOCATION_COLORS = (
     "#2563eb", "#c2410c", "#15803d", "#9333ea", "#be123c", "#0e7490",
@@ -86,6 +114,24 @@ def clean(value: str | None) -> str | None:
     return normalized or None
 
 
+def _datasheet_for_save(
+    url: str | None, product_url: str | None, manufacturer_part_number: str | None
+) -> str | None:
+    return normalize_datasheet_url(url) or jlc_datasheet_url(product_url, manufacturer_part_number)
+
+
+def _clean_aliases(aliases: list[str]) -> list[str]:
+    return [alias for value in aliases if (alias := clean(value)) is not None]
+
+
+def _transaction_kind(kind: str, source: str | None) -> str:
+    if kind.startswith(("TRANSFER_", "ADJUST_")):
+        return kind.partition("_")[0]
+    if kind == "RECEIVE" and source == "离线订单导入":
+        return "ORDER_IMPORT"
+    return kind
+
+
 def _storage_tokens(category: str | None) -> list[str]:
     """把商城类别转换成可用于仓库名称推荐的保守关键字集合。"""
 
@@ -111,7 +157,7 @@ def _order_specification(line: OrderImportLine) -> str | None:
 
     if line.resistor:
         values = [
-            line.resistor.resistance,
+            clean(line.resistor.resistance),
             f"±{line.resistor.tolerance_percent:g}%"
             if line.resistor.tolerance_percent is not None
             else None,
@@ -120,7 +166,7 @@ def _order_specification(line: OrderImportLine) -> str | None:
         return " ".join(value for value in values if value) or None
     if line.mosfet:
         values = [
-            f"{line.mosfet.channel_type}沟道" if line.mosfet.channel_type else None,
+            f"{channel}沟道" if (channel := clean(line.mosfet.channel_type)) else None,
             f"{line.mosfet.mosfet_count}个MOS" if line.mosfet.mosfet_count else None,
             f"{line.mosfet.voltage_v:g}V" if line.mosfet.voltage_v is not None else None,
             f"{line.mosfet.current_a:g}A" if line.mosfet.current_a is not None else None,
@@ -147,6 +193,10 @@ class Database:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
+        # 回滚日志模式支持主库和两个 ATTACH 资料库一起原子提交。
+        with closing(sqlite3.connect(self.path)) as setup:
+            if setup.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                raise DomainError("CONFLICT", "无法为元件资料库启用原子提交，请关闭其他实例")
         self.migrate()
 
     def connect(self) -> sqlite3.Connection:
@@ -155,9 +205,16 @@ class Database:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=5000")
+        self._attach_catalogs(connection, self.path)
         return connection
+
+    @staticmethod
+    def _attach_catalogs(connection: sqlite3.Connection, inventory_path: Path) -> None:
+        for catalog in CATALOGS:
+            connection.execute(
+                f"ATTACH DATABASE ? AS {catalog}", (str(catalog_path(inventory_path, catalog)),)
+            )
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
@@ -179,16 +236,24 @@ class Database:
 
         with self._write_lock:
             connection = self.connect()
+            started = time.perf_counter()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                logger.debug("库存写事务已开始")
                 yield connection
                 connection.commit()
+                logger.debug(
+                    "库存写事务已提交；耗时=%d 毫秒",
+                    round((time.perf_counter() - started) * 1000),
+                )
             except Exception:
                 connection.rollback()
+                logger.debug("库存写事务已回滚；本次更改未提交", exc_info=True)
                 raise
             finally:
                 connection.close()
 
+    @log_operation("检查并升级库存数据库")
     def migrate(self) -> None:
         """创建或升级数据库；所有迁移均设计为可重复执行。"""
 
@@ -203,6 +268,258 @@ class Database:
             self._migrate_v12(connection)
             self._migrate_v13(connection)
             self._migrate_v14(connection)
+            if not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            self._migrate_transaction_associations(connection)
+            self._migrate_order_transaction_notes(connection)
+            self._initialize_catalogs(connection)
+
+    @staticmethod
+    def _migrate_order_transaction_notes(connection: sqlite3.Connection) -> None:
+        if not connection.execute("SELECT 1 FROM schema_migrations WHERE version=16").fetchone():
+            connection.execute(
+                """UPDATE inventory_transactions SET notes=NULL
+                WHERE kind='RECEIVE' AND (
+                    (source='离线订单导入' AND notes='立创订单 ' || (
+                        SELECT b.order_number FROM stock_lots s JOIN inventory_batches b ON b.id=s.batch_id
+                        WHERE s.id=inventory_transactions.lot_id
+                    ))
+                    OR (source LIKE '立创订单 %' AND notes IN ('离线订单导入',source))
+                )"""
+            )
+            connection.execute("INSERT INTO schema_migrations VALUES(16,datetime('now'))")
+
+    @staticmethod
+    def _migrate_transaction_associations(connection: sqlite3.Connection) -> None:
+        if connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=15"
+        ).fetchone():
+            return
+        groups = connection.execute(
+            """SELECT t.group_id,t.kind,t.source,span.started,span.ended
+            FROM (
+                SELECT min(rowid) first_row,min(julianday(created_at)) started,
+                max(julianday(created_at)) ended FROM inventory_transactions GROUP BY group_id
+            ) span JOIN inventory_transactions t ON t.rowid=span.first_row
+            ORDER BY span.first_row"""
+        )
+        anchor = ""
+        previous_end: float | None = None
+        previous_kind = ""
+        for group_id, kind, source, started, ended in groups:
+            operation = _transaction_kind(kind, source)
+            if (
+                previous_end is not None and started is not None
+                and operation == previous_kind
+                and 0 <= round((started - previous_end) * 86400) <= TRANSACTION_MERGE_SECONDS
+            ):
+                connection.execute(
+                    """INSERT OR IGNORE INTO transaction_group_associations(group_id,display_group_id)
+                    VALUES(?,?)""", (group_id, anchor)
+                )
+            else:
+                anchor = group_id
+            previous_kind, previous_end = operation, ended
+        connection.execute("INSERT INTO schema_migrations VALUES(15,datetime('now'))")
+
+    def _initialize_catalogs(self, connection: sqlite3.Connection) -> None:
+        for catalog in CATALOGS:
+            initialize_catalog(connection, catalog)
+        connection.execute("UPDATE components SET price=NULL WHERE price=0")
+        connection.execute("UPDATE stock_lots SET unit_price=NULL WHERE unit_price=0")
+        connection.execute(
+            """DELETE FROM component_category_parameters WHERE parameter_key='purchase_price'
+            AND trim(value) IN ('0','0.0','0.00','0.000','0.0000','0.00000','0.000000')"""
+        )
+        has_snapshot = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (SNAPSHOT_TABLE,)
+        ).fetchone()
+        if has_snapshot:
+            for catalog in CATALOGS:
+                connection.execute(f"DELETE FROM {catalog}.catalog_components")
+                connection.execute(
+                    f"""INSERT INTO {catalog}.catalog_components(id,category,name,payload)
+                    SELECT id,category,name,payload FROM {SNAPSHOT_TABLE} WHERE kind=?""", (catalog,)
+                )
+            connection.execute(f"DROP TABLE {SNAPSHOT_TABLE}")
+        for row in connection.execute(
+            """SELECT c.id,c.jlc_matched,EXISTS(
+                SELECT 1 FROM order_import_items oi WHERE oi.component_id=c.id
+            ) from_order FROM components c
+            WHERE NOT EXISTS (SELECT 1 FROM marketplace.catalog_components m WHERE m.id=c.id)
+            AND NOT EXISTS (SELECT 1 FROM user.catalog_components u WHERE u.id=c.id)"""
+        ).fetchall():
+            self._save_catalog_snapshot(
+                connection, row["id"], "marketplace" if row["jlc_matched"] or row["from_order"] else "user"
+            )
+
+    def _catalog_snapshot(self, connection: sqlite3.Connection, component_id: str) -> dict[str, Any]:
+        row = connection.execute("SELECT * FROM components WHERE id=?", (component_id,)).fetchone()
+        component = self._component(row)
+        for key in ("id", "created_at", "updated_at", "archived_at"):
+            component.pop(key, None)
+        parameters = [dict(item) for item in connection.execute(
+            """SELECT parameter_key,label,value,group_name,sort_order FROM component_category_parameters
+            WHERE component_id=? ORDER BY sort_order,parameter_key""", (component_id,)
+        )]
+        details = {}
+        for table in ("resistor_details", "mosfet_details"):
+            detail = connection.execute(
+                f"SELECT * FROM {table} WHERE component_id=?", (component_id,)
+            ).fetchone()
+            if detail:
+                details[table] = dict(detail)
+                details[table].pop("component_id")
+        return {"component": component, "parameters": parameters, **details}
+
+    def _save_catalog_snapshot(
+        self, connection: sqlite3.Connection, component_id: str, catalog: Catalog,
+        *, replace_user: bool = False,
+    ) -> None:
+        store_catalog_entry(connection, catalog, component_id, self._catalog_snapshot(connection, component_id))
+        if replace_user:
+            connection.execute("DELETE FROM user.catalog_components WHERE id=?", (component_id,))
+
+    def list_catalog(self, catalog: Catalog) -> list[dict[str, Any]]:
+        if catalog not in CATALOGS:
+            raise ValueError("未知元件资料库")
+        with self.read() as connection:
+            return [dict(row) for row in connection.execute(
+                f"SELECT id,category,name FROM {catalog}.catalog_components "
+                "ORDER BY category COLLATE NOCASE,name COLLATE NOCASE,id"
+            )]
+
+    def get_catalog_component(self, catalog: Catalog, component_id: str) -> dict[str, Any]:
+        if catalog not in CATALOGS:
+            raise ValueError("未知元件资料库")
+        with self.read() as connection:
+            row = connection.execute(
+                f"SELECT payload FROM {catalog}.catalog_components WHERE id=?", (component_id,)
+            ).fetchone()
+        if row is None:
+            raise DomainError("NOT_FOUND", "元件资料不存在，请刷新")
+        payload = json.loads(row["payload"])
+        return {
+            **payload["component"],
+            "category_parameters": payload.get("parameters", []),
+            "resistor_details": payload.get("resistor_details"),
+            "mosfet_details": payload.get("mosfet_details"),
+        }
+
+    @log_operation("导出元件资料库")
+    def export_catalog(self, catalog: Catalog, destination: Path) -> int:
+        """导出指定资料库的独立 SQLite 文件，保留库存数据库的内部编号。"""
+
+        if catalog not in CATALOGS:
+            raise ValueError("未知元件资料库")
+        managed = [self.path, *(catalog_path(self.path, kind) for kind in CATALOGS)]
+        if destination.resolve() in {path.resolve() for path in managed}:
+            raise DomainError("VALIDATION_ERROR", "请选择独立的导出文件")
+        with TemporaryDirectory(dir=destination.parent) as directory, self.read() as source:
+            path = Path(directory) / "catalog.db"
+            with closing(sqlite3.connect(path)) as target:
+                source.backup(target, name=catalog)
+                count = int(target.execute("SELECT count(*) FROM catalog_components").fetchone()[0])
+            path.replace(destination)
+            return count
+
+    @log_operation("导入元件资料库")
+    def import_catalog(self, catalog: Catalog, source: Path) -> int:
+        """合并资料库，以稳定编号或精确的立创/自定义编号对齐现有库存元件。"""
+
+        if catalog not in CATALOGS:
+            raise ValueError("未知元件资料库")
+        try:
+            with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as file:
+                if file.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise ValueError("资料库没有通过完整性检查")
+                metadata = file.execute("SELECT kind,version FROM catalog_metadata").fetchall()
+                if metadata != [(catalog, 1)]:
+                    raise ValueError("资料库类型或版本不匹配")
+                rows = file.execute("SELECT id,payload FROM catalog_components").fetchall()
+            with self.write() as connection:
+                seen: set[str] = set()
+                for source_id, raw in rows:
+                    payload = json.loads(raw)
+                    data = ComponentCreate.model_validate(payload["component"])
+                    component_id = self._catalog_component_id(connection, source_id, data)
+                    if component_id in seen:
+                        raise ValueError("多个导入元件指向同一库存元件")
+                    seen.add(component_id)
+                    values = data.model_dump()
+                    values["name"] = clean(data.name)
+                    values["aliases"] = _clean_aliases(data.aliases)
+                    for field, value in values.items():
+                        if isinstance(value, str):
+                            values[field] = clean(value)
+                    values["datasheet_url"] = _datasheet_for_save(
+                        data.datasheet_url, data.product_url, data.manufacturer_part_number
+                    )
+                    payload["component"] = values
+                    if catalog == "user" or not connection.execute(
+                        "SELECT 1 FROM user.catalog_components WHERE id=?", (component_id,)
+                    ).fetchone():
+                        self._apply_catalog_entry(connection, component_id, payload)
+                        payload = self._catalog_snapshot(connection, component_id)
+                    store_catalog_entry(connection, catalog, component_id, payload)
+            return len(rows)
+        except (sqlite3.Error, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise DomainError("VALIDATION_ERROR", f"无法导入元件资料库：{error}") from error
+
+    @staticmethod
+    def _catalog_component_id(
+        connection: sqlite3.Connection, source_id: str, data: ComponentCreate
+    ) -> str:
+        identifier = str(uuid.UUID(source_id))
+        matches = connection.execute(
+            """SELECT id FROM components WHERE id=?
+            OR upper(lcsc_part_number)=upper(?) OR custom_part_number=?""",
+            (identifier, clean(data.lcsc_part_number), clean(data.custom_part_number)),
+        ).fetchall()
+        if len(matches) > 1:
+            raise ValueError("元件编号存在冲突")
+        return str(matches[0][0]) if matches else identifier
+
+    @staticmethod
+    def _apply_catalog_entry(
+        connection: sqlite3.Connection, component_id: str, payload: dict[str, Any]
+    ) -> None:
+        values = dict(payload["component"])
+        values["aliases"] = json.dumps(values["aliases"], ensure_ascii=False)
+        values["jlc_matched"] = int(bool(values["jlc_matched"]))
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        assignments = ", ".join(f"{field}=excluded.{field}" for field in values)
+        timestamp = utc_now()
+        connection.execute(
+            f"""INSERT INTO components(id,created_at,updated_at,{columns})
+            VALUES(?,?,?,{placeholders}) ON CONFLICT(id) DO UPDATE SET
+            updated_at=excluded.updated_at,{assignments}""",
+            (component_id, timestamp, timestamp, *values.values()),
+        )
+        connection.execute("DELETE FROM component_category_parameters WHERE component_id=?", (component_id,))
+        parameters = [
+            (component_id, str(item["parameter_key"]), str(item["label"]).strip(),
+             str(item["value"]).strip(), str(item.get("group_name") or "").strip() or "类别参数", index)
+            for index, item in enumerate(payload.get("parameters", []))
+            if str(item["label"]).strip() and str(item["value"]).strip()
+        ]
+        connection.executemany(
+            """INSERT INTO component_category_parameters
+            (component_id,parameter_key,label,value,group_name,sort_order) VALUES(?,?,?,?,?,?)""",
+            parameters,
+        )
+        for table, model in (("resistor_details", ResistorDetails), ("mosfet_details", MosfetDetails)):
+            connection.execute(f"DELETE FROM {table} WHERE component_id=?", (component_id,))
+            if detail := payload.get(table):
+                fields = model.model_validate(detail).model_dump()
+                fields["source_description"] = clean(detail.get("source_description"))
+                names = ", ".join(fields)
+                placeholders = ", ".join("?" for _ in fields)
+                connection.execute(
+                    f"INSERT INTO {table}(component_id,{names}) VALUES(?,{placeholders})",
+                    (component_id, *fields.values()),
+                )
 
     @staticmethod
     def _next_location_color(used: set[str]) -> str:
@@ -419,14 +736,17 @@ class Database:
             )
         connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(9,datetime('now'))")
 
+    @log_operation("检查数据库完整性")
     def integrity_check(self) -> None:
         """验证数据库物理完整性，不通过时抛出业务错误。"""
 
         with self.read() as connection:
-            result = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if result != "ok":
-            raise DomainError("DATABASE_CORRUPT", f"数据库完整性检查失败：{result}")
+            for schema in ("main", *CATALOGS):
+                result = connection.execute(f"PRAGMA {schema}.integrity_check").fetchone()[0]
+                if result != "ok":
+                    raise DomainError("DATABASE_CORRUPT", f"{schema} 数据库完整性检查失败：{result}")
 
+    @log_operation("创建元件")
     def create_component(self, data: ComponentCreate) -> dict[str, Any]:
         """创建元件并返回完整记录。"""
 
@@ -435,7 +755,7 @@ class Database:
         values = (
             component_id,
             data.name.strip(),
-            json.dumps(data.aliases, ensure_ascii=False),
+            json.dumps(_clean_aliases(data.aliases), ensure_ascii=False),
             clean(data.lcsc_part_number),
             clean(data.manufacturer_part_number),
             clean(data.custom_part_number),
@@ -446,7 +766,7 @@ class Database:
             data.price,
             clean(data.purchase_date),
             clean(data.product_url),
-            clean(data.datasheet_url),
+            _datasheet_for_save(data.datasheet_url, data.product_url, data.manufacturer_part_number),
             clean(data.notes),
             int(bool(data.jlc_matched)),
             timestamp,
@@ -460,6 +780,9 @@ class Database:
                     purchase_date,product_url,datasheet_url,notes,jlc_matched,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (*values, timestamp),
+                )
+                self._save_catalog_snapshot(
+                    connection, component_id, "marketplace" if data.jlc_matched else "user"
                 )
         except sqlite3.IntegrityError as error:
             raise DomainError("CONFLICT", "元件名称或编号与现有记录冲突") from error
@@ -539,6 +862,7 @@ class Database:
             )
         return definitions
 
+    @log_operation("保存元件参数")
     def save_component_parameters(
         self, component_id: str, parameters: dict[str, tuple[str, str]]
     ) -> list[dict[str, str]]:
@@ -555,6 +879,7 @@ class Database:
         ]
         with self.write() as connection:
             self._require(connection, "components", component_id, "元件")
+            previous = self._catalog_snapshot(connection, component_id)
             connection.execute(
                 "DELETE FROM component_category_parameters WHERE component_id=?", (component_id,)
             )
@@ -569,12 +894,15 @@ class Database:
                 "UPDATE components SET specification=?,updated_at=? WHERE id=?",
                 (summary, utc_now(), component_id),
             )
+            if self._catalog_snapshot(connection, component_id) != previous:
+                self._save_catalog_snapshot(connection, component_id, "user")
         return [
             {"parameter_key": key, "label": label, "value": value} for key, label, value in cleaned
         ]
 
+    @log_operation("保存元件参数分组")
     def save_component_parameter_groups(
-        self, component_id: str, groups: list[JlcParameterGroup]
+        self, component_id: str, groups: list[JlcParameterGroup], *, marketplace: bool = False
     ) -> list[dict[str, str]]:
         """保存带页面分组的动态参数，并同步派生规格摘要。
 
@@ -582,29 +910,14 @@ class Database:
         从而避免已删除的表单字段残留在数据库中。
         """
 
-        cleaned = [
-            (parameter.key, parameter.label.strip(), parameter.value.strip(), group.name.strip())
-            for group in groups
-            for parameter in group.parameters
-            if parameter.label.strip() and parameter.value.strip()
-        ]
         with self.write() as connection:
             self._require(connection, "components", component_id, "元件")
-            connection.execute(
-                "DELETE FROM component_category_parameters WHERE component_id=?", (component_id,)
-            )
-            for order, (key, label, value, group_name) in enumerate(cleaned):
-                connection.execute(
-                    """INSERT INTO component_category_parameters(
-                    component_id,parameter_key,label,value,sort_order,group_name)
-                    VALUES(?,?,?,?,?,?)""",
-                    (component_id, key, label, value, order, group_name or "类别参数"),
-                )
-            summary = "；".join(f"{label}: {value}" for _, label, value, _ in cleaned) or None
-            connection.execute(
-                "UPDATE components SET specification=?,updated_at=? WHERE id=?",
-                (summary, utc_now(), component_id),
-            )
+            previous = self._catalog_snapshot(connection, component_id)
+            cleaned = self._replace_component_parameter_groups(connection, component_id, groups)
+            if marketplace:
+                self._save_catalog_snapshot(connection, component_id, "marketplace", replace_user=True)
+            elif self._catalog_snapshot(connection, component_id) != previous:
+                self._save_catalog_snapshot(connection, component_id, "user")
         return [
             {
                 "parameter_key": key,
@@ -615,6 +928,34 @@ class Database:
             for key, label, value, group_name in cleaned
         ]
 
+    @staticmethod
+    def _replace_component_parameter_groups(
+        connection: sqlite3.Connection, component_id: str, groups: list[JlcParameterGroup]
+    ) -> list[tuple[str, str, str, str]]:
+        cleaned = [
+            (parameter.key, parameter.label.strip(), value, group.name.strip() or "类别参数")
+            for group in groups
+            for parameter in group.parameters
+            if parameter.label.strip() and (value := clean(parameter.value)) is not None
+        ]
+        connection.execute(
+            "DELETE FROM component_category_parameters WHERE component_id=?", (component_id,)
+        )
+        connection.executemany(
+            """INSERT INTO component_category_parameters(
+            component_id,parameter_key,label,value,sort_order,group_name) VALUES(?,?,?,?,?,?)""",
+            [(component_id, key, label, value, index, group_name)
+             for index, (key, label, value, group_name) in enumerate(cleaned)],
+        )
+        summary = "；".join(f"{label}: {value}" for key, label, value, _ in cleaned
+                           if key != "purchase_price") or None
+        connection.execute(
+            "UPDATE components SET specification=?,updated_at=? WHERE id=?",
+            (summary, utc_now(), component_id),
+        )
+        return cleaned
+
+    @log_operation("删除或归档元件")
     def delete_component(self, component_id: str) -> dict[str, Any]:
         """删除未使用元件，或安全归档库存为零但已有历史的元件。
 
@@ -657,43 +998,176 @@ class Database:
             connection.execute("DELETE FROM resistor_details WHERE component_id=?", (component_id,))
             connection.execute("DELETE FROM mosfet_details WHERE component_id=?", (component_id,))
             connection.execute("DELETE FROM components WHERE id=?", (component_id,))
+            for catalog in CATALOGS:
+                connection.execute(f"DELETE FROM {catalog}.catalog_components WHERE id=?", (component_id,))
             return {"id": component_id, "deleted": True, "mode": "deleted"}
 
-    def update_component(self, component_id: str, data: ComponentCreate) -> dict[str, Any]:
+    @log_operation("保存元件资料")
+    def update_component(
+        self, component_id: str, data: ComponentCreate,
+        *, parameter_groups: list[JlcParameterGroup] | None = None, force_user_copy: bool = False,
+    ) -> dict[str, Any]:
         """保存用户确认后的元件主数据，并刷新最后更改时间。"""
 
         try:
             with self.write() as connection:
-                self._require(connection, "components", component_id, "元件")
-                connection.execute(
-                    """UPDATE components SET name=?,aliases=?,lcsc_part_number=?,
-                    manufacturer_part_number=?,custom_part_number=?,brand=?,package=?,category=?,
-                    specification=?,price=?,purchase_date=?,product_url=?,datasheet_url=?,notes=?,
-                    jlc_matched=COALESCE(?,jlc_matched),
-                    updated_at=? WHERE id=?""",
-                    (
-                        data.name.strip(),
-                        json.dumps(data.aliases, ensure_ascii=False),
-                        clean(data.lcsc_part_number),
-                        clean(data.manufacturer_part_number),
-                        clean(data.custom_part_number),
-                        clean(data.brand),
-                        clean(data.package),
-                        clean(data.category),
-                        clean(data.specification),
-                        data.price,
-                        clean(data.purchase_date),
-                        clean(data.product_url),
-                        clean(data.datasheet_url),
-                        clean(data.notes),
-                        int(data.jlc_matched) if data.jlc_matched is not None else None,
-                        utc_now(),
-                        component_id,
-                    ),
+                self._update_component_fields(
+                    connection, component_id, data, parameter_groups, force_user_copy=force_user_copy
                 )
         except sqlite3.IntegrityError as error:
             raise DomainError("CONFLICT", "元件名称或编号与现有记录冲突") from error
         return self.get_component(component_id)
+
+    def _update_component_fields(
+        self, connection: sqlite3.Connection, component_id: str, data: ComponentCreate,
+        parameter_groups: list[JlcParameterGroup] | None, *, force_user_copy: bool = False,
+    ) -> None:
+        self._require(connection, "components", component_id, "元件")
+        previous = self._catalog_snapshot(connection, component_id)
+        old_part = previous["component"].get("lcsc_part_number")
+        new_part = clean(data.lcsc_part_number)
+        if (old_part or "").upper() != (new_part or "").upper():
+            self._rekey_component_orders(connection, component_id, new_part)
+        connection.execute(
+            """UPDATE components SET name=?,aliases=?,lcsc_part_number=?,
+            manufacturer_part_number=?,custom_part_number=?,brand=?,package=?,category=?,
+            specification=?,price=?,purchase_date=?,product_url=?,datasheet_url=?,notes=?,
+            jlc_matched=COALESCE(?,jlc_matched),
+            updated_at=? WHERE id=?""",
+            (
+                data.name.strip(),
+                json.dumps(_clean_aliases(data.aliases), ensure_ascii=False),
+                clean(data.lcsc_part_number),
+                clean(data.manufacturer_part_number),
+                clean(data.custom_part_number),
+                clean(data.brand),
+                clean(data.package),
+                clean(data.category),
+                clean(data.specification),
+                data.price,
+                clean(data.purchase_date),
+                clean(data.product_url),
+                _datasheet_for_save(
+                    data.datasheet_url, data.product_url, data.manufacturer_part_number
+                ),
+                clean(data.notes),
+                int(data.jlc_matched) if data.jlc_matched is not None else None,
+                utc_now(),
+                component_id,
+            ),
+        )
+        if parameter_groups is not None:
+            self._replace_component_parameter_groups(connection, component_id, parameter_groups)
+        if data.jlc_matched:
+            self._save_catalog_snapshot(connection, component_id, "marketplace", replace_user=True)
+        elif force_user_copy or self._catalog_snapshot(connection, component_id) != previous:
+            self._save_catalog_snapshot(connection, component_id, "user")
+
+    @staticmethod
+    def _rekey_component_orders(
+        connection: sqlite3.Connection, component_id: str, part_number: str | None
+    ) -> None:
+        linked_batch = connection.execute(
+            "SELECT 1 FROM inventory_batches WHERE component_id=? AND source_type='JLC' LIMIT 1",
+            (component_id,),
+        ).fetchone()
+        if not linked_batch:
+            return
+        if part_number is None or not re.fullmatch(r"C[0-9]{4,10}", part_number, re.I):
+            raise DomainError("CONFLICT", "已有立创订单批次，必须保留有效的立创编号")
+        part = part_number.upper()
+        connection.execute(
+            """UPDATE inventory_batches SET lcsc_part_number=?,
+            external_key='JLC:' || order_number || ':' || ? WHERE component_id=? AND source_type='JLC'""",
+            (part, part, component_id),
+        )
+        connection.execute(
+            "UPDATE order_import_items SET lcsc_part_number=? WHERE component_id=?",
+            (part, component_id),
+        )
+
+    @log_operation("规格化旧版元件资料")
+    def normalize_component_data(self) -> int:
+        """在同一事务内规格化旧版元件主资料、别名及类别参数，返回更新的元件数。"""
+
+        component_fields = (
+            "name", "lcsc_part_number", "manufacturer_part_number", "custom_part_number",
+            "brand", "package", "category", "specification", "purchase_date", "product_url",
+            "notes",
+        )
+        parameter_tables = (
+            ("component_category_parameters", ("label", "value", "group_name")),
+            ("resistor_details", ("resistance", "technology", "source_description")),
+            ("mosfet_details", ("channel_type", "source_description")),
+        )
+        updated: set[str] = set()
+        try:
+            with self.write() as connection:
+                for row in connection.execute("SELECT * FROM components").fetchall():
+                    fields = {field: clean(row[field]) for field in component_fields}
+                    fields["datasheet_url"] = _datasheet_for_save(
+                        row["datasheet_url"], fields["product_url"], fields["manufacturer_part_number"]
+                    )
+                    aliases = self._component(row)["aliases"]
+                    if isinstance(aliases, list) and all(isinstance(alias, str) for alias in aliases):
+                        cleaned_aliases = _clean_aliases(aliases)
+                        if cleaned_aliases != aliases:
+                            fields["aliases"] = json.dumps(cleaned_aliases, ensure_ascii=False)
+                    changes = {field: value for field, value in fields.items() if value != row[field]}
+                    if changes:
+                        assignments = ", ".join(f"{field}=?" for field in changes)
+                        connection.execute(
+                            f"UPDATE components SET {assignments} WHERE id=?",
+                            (*changes.values(), row["id"]),
+                        )
+                        updated.add(row["id"])
+                for table, fields_to_trim in parameter_tables:
+                    assignments = ", ".join(f"{field}=?" for field in fields_to_trim)
+                    for row in connection.execute(f"SELECT rowid,* FROM {table}").fetchall():
+                        values = tuple(
+                            row[field].strip() if row[field] is not None else None
+                            for field in fields_to_trim
+                        )
+                        if values != tuple(row[field] for field in fields_to_trim):
+                            connection.execute(
+                                f"UPDATE {table} SET {assignments} WHERE rowid=?",
+                                (*values, row["rowid"]),
+                            )
+                            updated.add(row["component_id"])
+                timestamp = utc_now()
+                connection.executemany(
+                    "UPDATE components SET updated_at=? WHERE id=?",
+                    [(timestamp, component_id) for component_id in updated],
+                )
+                for catalog in CATALOGS:
+                    for entry in connection.execute(
+                        f"SELECT id,payload FROM {catalog}.catalog_components"
+                    ).fetchall():
+                        payload = json.loads(entry["payload"])
+                        component = payload["component"]
+                        for field in component_fields:
+                            component[field] = clean(component.get(field))
+                        if isinstance(component.get("aliases"), list):
+                            component["aliases"] = _clean_aliases(component["aliases"])
+                        for parameter in payload.get("parameters", []):
+                            for field in ("label", "value", "group_name"):
+                                if isinstance(parameter.get(field), str):
+                                    parameter[field] = parameter[field].strip()
+                        for table, fields_to_trim in parameter_tables[1:]:
+                            if detail := payload.get(table):
+                                for field in fields_to_trim:
+                                    detail[field] = clean(detail.get(field))
+                        datasheet = _datasheet_for_save(
+                            component.get("datasheet_url"), component.get("product_url"),
+                            component.get("manufacturer_part_number"),
+                        )
+                        component["datasheet_url"] = datasheet
+                        if payload != json.loads(entry["payload"]):
+                            store_catalog_entry(connection, catalog, entry["id"], payload)
+                            updated.add(entry["id"])
+        except sqlite3.IntegrityError as error:
+            raise DomainError("CONFLICT", "旧版元件清理后有空名称或重复编号，规格化已回滚") from error
+        return len(updated)
 
     def list_components(
         self, query: str = "", *, include_purchase_price: bool = False
@@ -709,6 +1183,7 @@ class Database:
         with self.read() as connection:
             rows = connection.execute(
                 f"""SELECT c.*, {price_column}
+                EXISTS(SELECT 1 FROM user.catalog_components u WHERE u.id=c.id) user_catalog,
                 (SELECT GROUP_CONCAT(DISTINCT oi.order_number)
                  FROM order_import_items oi WHERE oi.component_id=c.id) order_numbers,
                 (SELECT MAX(received_at) FROM stock_lots s WHERE s.component_id=c.id) last_received_at
@@ -733,29 +1208,56 @@ class Database:
         """轮换待匹配元件，使暂时查不到的商品不会挡住队列。"""
 
         with self.read() as connection:
-            item = connection.execute(
-                """SELECT id,lcsc_part_number,product_url FROM components
+            items = connection.execute(
+                """SELECT id,name,lcsc_part_number,product_url FROM components
                 WHERE archived_at IS NULL AND jlc_matched=0
-                AND upper(lcsc_part_number) GLOB 'C[0-9]*'
-                AND length(lcsc_part_number) BETWEEN 5 AND 11
-                AND substr(lcsc_part_number,2) NOT GLOB '*[^0-9]*'
-                ORDER BY (id<=?),id LIMIT 1""",
+                ORDER BY (id<=?),id""",
                 (after_id,),
-            ).fetchone()
-        return dict(item) if item is not None else None
+            ).fetchall()
+        return next(
+            (dict(item) for item in items
+             if can_match_jlc_component(item["lcsc_part_number"], item["product_url"])),
+            None,
+        )
 
+    def jlc_match_counts(self) -> tuple[int, int]:
+        with self.read() as connection:
+            rows = connection.execute(
+                "SELECT lcsc_part_number,product_url FROM components WHERE archived_at IS NULL AND jlc_matched=0"
+            ).fetchall()
+        return len(rows), sum(can_match_jlc_component(row[0], row[1]) for row in rows)
+
+    @log_operation("保存立创商城匹配资料")
     def apply_jlc_product_match(self, component_id: str, draft: JlcProductDraft) -> bool:
-        """写入同编号且仍未匹配的元件，避免覆盖浏览期间的手工更新。"""
+        """按已保存商品链接或立创编号校验后，补齐仍未匹配的元件资料。"""
 
         with self.write() as connection:
             item = connection.execute(
-                """SELECT * FROM components WHERE id=? AND upper(lcsc_part_number)=?
+                """SELECT * FROM components WHERE id=?
                 AND archived_at IS NULL AND jlc_matched=0""",
-                (component_id, draft.lcsc_part_number),
+                (component_id,),
             ).fetchone()
             if item is None:
                 return False
+            part_number = (item["lcsc_part_number"] or "").strip().upper()
+            product_key = jlc_product_key(item["product_url"])
+            if product_key:
+                draft_key = jlc_product_key(draft.product_url)
+                if product_key != draft_key and product_key != draft.lcsc_part_number:
+                    return False
+            if re.fullmatch(r"C[0-9]{4,10}", part_number):
+                if part_number != draft.lcsc_part_number:
+                    return False
+            elif not product_key:
+                return False
+            else:
+                self._rekey_component_orders(connection, component_id, draft.lcsc_part_number)
+                connection.execute(
+                    "UPDATE components SET lcsc_part_number=? WHERE id=?",
+                    (draft.lcsc_part_number, component_id),
+                )
             self._apply_jlc_draft(connection, item, draft)
+            self._save_catalog_snapshot(connection, component_id, "marketplace", replace_user=True)
             return True
 
     @staticmethod
@@ -763,16 +1265,23 @@ class Database:
         connection: sqlite3.Connection, item: sqlite3.Row, draft: JlcProductDraft
     ) -> None:
         component_id = str(item["id"])
-        fields = {
-            field: getattr(draft, field) for field in (
+        fields: dict[str, str | int] = {
+            field: value for field in (
                 "manufacturer_part_number", "brand", "package", "category",
-                "product_url", "datasheet_url",
+                "product_url",
             )
-            if not clean(item[field]) and getattr(draft, field)
+            if not clean(item[field]) and (value := clean(getattr(draft, field))) is not None
         }
+        if not clean(item["datasheet_url"]):
+            datasheet = _datasheet_for_save(
+                draft.datasheet_url, draft.product_url, draft.manufacturer_part_number
+            )
+            if datasheet:
+                fields["datasheet_url"] = datasheet
         parameters = [
-            (parameter.key, parameter.label, parameter.value, group.name)
+            (parameter.key, parameter.label.strip(), parameter.value.strip(), group.name.strip() or "类别参数")
             for group in draft.parameter_groups for parameter in group.parameters
+            if parameter.label.strip() and parameter.value.strip()
         ]
         connection.executemany(
             """INSERT OR IGNORE INTO component_category_parameters(
@@ -804,6 +1313,7 @@ class Database:
             item["aliases"] = []
         return item
 
+    @log_operation("创建库存位置")
     def create_warehouse(self, data: WarehouseCreate) -> dict[str, Any]:
         """创建界面中的上级位置；方法名为兼容旧 API 保留。"""
 
@@ -831,6 +1341,7 @@ class Database:
                 dict(row) for row in connection.execute("SELECT * FROM warehouses ORDER BY name")
             ]
 
+    @log_operation("修改库存位置")
     def update_warehouse(self, warehouse_id: str, data: WarehouseCreate) -> dict[str, Any]:
         """修改上级位置名称和备注；内部名称继续兼容旧 API。"""
 
@@ -845,6 +1356,7 @@ class Database:
             raise DomainError("CONFLICT", "位置名称已存在") from error
         return next(item for item in self.list_warehouses() if item["id"] == warehouse_id)
 
+    @log_operation("删除库存位置")
     def delete_warehouse(self, warehouse_id: str) -> dict[str, Any]:
         """删除没有下级仓库的上级位置。"""
 
@@ -857,6 +1369,7 @@ class Database:
             connection.execute("DELETE FROM warehouses WHERE id=?", (warehouse_id,))
         return {"id": warehouse_id, "deleted": True}
 
+    @log_operation("创建仓库")
     def create_location(self, data: LocationCreate) -> dict[str, Any]:
         """在指定位置创建具体仓库；方法名为兼容旧 API 保留。"""
 
@@ -880,6 +1393,7 @@ class Database:
             raise DomainError("CONFLICT", "仓库名称重复，或上级位置不存在") from error
         return item
 
+    @log_operation("更改仓库颜色")
     def set_location_color(self, location_id: str, color: str) -> None:
         """保存具体仓库的显示颜色。"""
 
@@ -900,6 +1414,7 @@ class Database:
                 for row in connection.execute("SELECT * FROM locations ORDER BY warehouse_id,name")
             ]
 
+    @log_operation("修改仓库")
     def update_location(self, location_id: str, data: LocationCreate) -> dict[str, Any]:
         """修改具体仓库的所属位置、名称和备注。"""
 
@@ -915,6 +1430,7 @@ class Database:
             raise DomainError("CONFLICT", "同一位置内仓库名称不能重复") from error
         return next(item for item in self.list_locations() if item["id"] == location_id)
 
+    @log_operation("删除仓库")
     def delete_location(self, location_id: str) -> dict[str, Any]:
         """删除没有批次或流水引用的具体仓库。"""
 
@@ -961,6 +1477,7 @@ class Database:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    @log_operation("保存仓库推荐优先级")
     def save_storage_priorities(
         self, category: str | None, priorities: dict[str, int]
     ) -> dict[str, Any]:
@@ -1408,16 +1925,19 @@ class Database:
         values_by_part: dict[str, dict[str, str]] = {}
         for line in sorted(lines, key=lambda item: item.purchased_at or "", reverse=True):
             values = values_by_part.setdefault(line.lcsc_part_number, {})
+            purchased_at = clean(line.purchased_at)
             for field, value in (
                 ("manufacturer_part_number", clean(line.manufacturer_part_number)),
                 ("category", clean(line.category)),
                 ("brand", clean(line.brand)),
                 ("package", clean(line.package)),
                 ("product_url", clean(line.product_url)),
-                ("datasheet_url", clean(line.datasheet_url)),
+                ("datasheet_url", _datasheet_for_save(
+                    line.datasheet_url, line.product_url, line.manufacturer_part_number
+                )),
                 ("notes", clean(line.description)),
                 ("specification", _order_specification(line)),
-                ("purchase_date", line.purchased_at[:10] if line.purchased_at else None),
+                ("purchase_date", purchased_at[:10] if purchased_at else None),
                 ("purchase_price", f"{line.purchase_price:.15g}" if line.purchase_price is not None else None),
             ):
                 if value is not None:
@@ -1440,6 +1960,7 @@ class Database:
                 })
             ]
 
+    @log_operation("补充订单元件资料")
     def apply_order_supplement(self, changes: list[dict[str, Any]]) -> int:
         """写入用户确认的空白字段，保留预览后新增的元件资料。"""
 
@@ -1455,11 +1976,16 @@ class Database:
                 if item is None:
                     continue
                 fields = change["fields"]
-                updates = {
-                    field: fields[field] for field, _ in ORDER_SUPPLEMENT_FIELDS
-                    if field != "purchase_price" and field in fields and not clean(item[field])
-                }
-                purchase_price = fields.get("purchase_price")
+                updates = {}
+                for field, _ in ORDER_SUPPLEMENT_FIELDS:
+                    if field == "purchase_price" or clean(item[field]):
+                        continue
+                    value = clean(fields.get(field))
+                    if field == "datasheet_url":
+                        value = normalize_datasheet_url(value)
+                    if value is not None:
+                        updates[field] = value
+                purchase_price = clean(fields.get("purchase_price"))
                 price_added = purchase_price is not None and self._save_order_purchase_price(
                     connection, item["id"], purchase_price, replace=False
                 )
@@ -1471,9 +1997,11 @@ class Database:
                         f"UPDATE components SET {assignments}updated_at=? WHERE id=?",
                         (*updates.values(), timestamp, item["id"]),
                     )
+                    self._save_catalog_snapshot(connection, item["id"], "user")
                     updated += 1
         return updated
 
+    @log_operation("订单商品入库")
     def import_order_lines(
         self,
         lines: list[OrderImportLine],
@@ -1509,7 +2037,11 @@ class Database:
         with self.write() as connection:
             for line in lines:
                 import_key = f"{line.order_number}:{line.lcsc_part_number}"
-                purchase_date = line.purchased_at[:10] if line.purchased_at else None
+                purchased_at = clean(line.purchased_at)
+                purchase_date = purchased_at[:10] if purchased_at else None
+                datasheet_url = _datasheet_for_save(
+                    line.datasheet_url, line.product_url, line.manufacturer_part_number
+                )
                 selected_location = (location_overrides or {}).get(import_key, location_id)
                 if not selected_location:
                     raise DomainError("VALIDATION_ERROR", f"{line.name} 尚未选择仓库")
@@ -1544,7 +2076,7 @@ class Database:
                             clean(line.package),
                             clean(line.brand),
                             clean(line.product_url),
-                            clean(line.datasheet_url),
+                            datasheet_url,
                             clean(line.description),
                             _order_specification(line),
                             line.unit_price,
@@ -1564,7 +2096,7 @@ class Database:
                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             component_id,
-                            line.name,
+                            line.name.strip(),
                             "[]",
                             line.lcsc_part_number,
                             clean(line.manufacturer_part_number),
@@ -1576,7 +2108,7 @@ class Database:
                             line.unit_price,
                             purchase_date,
                             clean(line.product_url),
-                            clean(line.datasheet_url),
+                            datasheet_url,
                             clean(line.description) or f"由立创订单 {line.order_number} 离线导入",
                             int(line.jlc_matched),
                             timestamp,
@@ -1591,7 +2123,7 @@ class Database:
                         (component_id,),
                     )
                     parameter_rows = [
-                        (parameter.key, parameter.label.strip(), parameter.value.strip(), group.name)
+                        (parameter.key, parameter.label.strip(), parameter.value.strip(), group.name.strip())
                         for group in line.parameter_groups
                         for parameter in group.parameters
                         if parameter.key != "purchase_price"
@@ -1649,7 +2181,7 @@ class Database:
                     selected_location,
                     line.quantity,
                     "离线订单导入",
-                    f"立创订单 {line.order_number}",
+                    None,
                 )
                 connection.execute(
                     """INSERT INTO order_import_items(
@@ -1665,6 +2197,14 @@ class Database:
                 )
                 imported_count += 1
                 self._save_order_category_details(connection, component_id, line)
+                if line.jlc_matched:
+                    self._save_catalog_snapshot(connection, component_id, "marketplace", replace_user=True)
+                elif connection.execute(
+                    "SELECT 1 FROM user.catalog_components WHERE id=?", (component_id,)
+                ).fetchone():
+                    self._save_catalog_snapshot(connection, component_id, "user")
+                else:
+                    self._save_catalog_snapshot(connection, component_id, "marketplace")
         return {
             "transaction_group_id": group_id,
             "imported": imported_count,
@@ -1727,6 +2267,7 @@ class Database:
                 ),
             )
 
+    @log_operation("元件入库")
     def receive(
         self, data: ReceiveRequest, kind: str = "RECEIVE", *, platform: str | None = None
     ) -> dict[str, Any]:
@@ -1751,7 +2292,11 @@ class Database:
                 connection,
                 data.component_id,
                 batch_code=data.batch_code,
-                order_number=data.order_number,
+                order_number=(
+                    field.normalized_value
+                    if (field := parse_qr_payload(data.order_number or "").get("order_number"))
+                    else data.order_number
+                ),
                 metadata=data.batch_metadata,
             )
             connection.execute(
@@ -1824,6 +2369,7 @@ class Database:
             (location_id,),
         )
 
+    @log_operation("元件出库")
     def issue(
         self, data: IssueRequest, kind: str = "ISSUE", *, platform: str | None = None
     ) -> dict[str, Any]:
@@ -1856,6 +2402,7 @@ class Database:
                 self._save_issue_location(connection, data.location_id)
         return {"transaction_group_id": group_id, "affected_transactions": count}
 
+    @log_operation("移动库存仓库")
     def transfer(self, data: TransferRequest) -> dict[str, Any]:
         """在两个库位之间原子移动库存，并分别记录移出、移入流水。
 
@@ -1887,6 +2434,7 @@ class Database:
                 )
         return {"transaction_group_id": group_id, "affected_transactions": len(used) * 2}
 
+    @log_operation("批量移动库存仓库")
     def transfer_lots(self, quantities: dict[str, int], target_id: str) -> dict[str, Any]:
         """原子移动所选批次的当前余量，库存与预览不符时回滚整组。"""
 
@@ -1945,6 +2493,7 @@ class Database:
             target_id, quantity, "移库", notes,
         )
 
+    @log_operation("盘点调整库存")
     def adjust(self, data: AdjustRequest) -> dict[str, Any]:
         """把仓库库存调整到目标值，差额仍通过批次流水表达。
 
@@ -2023,13 +2572,423 @@ class Database:
         with self.read() as connection:
             rows = connection.execute(
                 f"""SELECT t.*,c.name component_name,{part_columns}
-                w.name warehouse_name,l.name location_name,l.color
+                w.name warehouse_name,l.name location_name,l.color,b.order_number,b.custom_code,
+                s.unit_price,s.purchase_date,
+                COALESCE(a.display_group_id,t.group_id) display_group_id
                 FROM inventory_transactions t JOIN components c ON c.id=t.component_id
                 JOIN locations l ON l.id=t.location_id JOIN warehouses w ON w.id=l.warehouse_id
+                JOIN stock_lots s ON s.id=t.lot_id LEFT JOIN inventory_batches b ON b.id=s.batch_id
+                LEFT JOIN transaction_group_associations a ON a.group_id=t.group_id
                 ORDER BY t.created_at DESC,t.rowid DESC"""
             ).fetchall()
         return [dict(row) for row in rows]
 
+    @log_operation("更改流水分组")
+    def regroup_transactions(
+        self, original_groups: list[list[str]], new_groups: list[list[str]]
+    ) -> None:
+        """改变显示分组关联，每个库存事务始终作为一个整体。"""
+
+        original_ids = [group_id for group in original_groups for group_id in group]
+        new_ids = [group_id for group in new_groups for group_id in group]
+        if (
+            not original_ids or len(set(original_ids)) != len(original_ids)
+            or sorted(original_ids) != sorted(new_ids) or any(not group for group in new_groups)
+        ):
+            raise DomainError("VALIDATION_ERROR", "流水分组无效")
+        with self.write() as connection:
+            rows = connection.execute(
+                """SELECT t.group_id,COALESCE(a.display_group_id,t.group_id) display_id
+                FROM inventory_transactions t
+                LEFT JOIN transaction_group_associations a ON a.group_id=t.group_id
+                GROUP BY t.group_id ORDER BY max(t.created_at) DESC,max(t.rowid) DESC"""
+            )
+            actual: dict[str, list[str]] = {}
+            display_ids: dict[str, str] = {}
+            for row in rows:
+                group_id, display_id = row
+                display_ids[group_id] = display_id
+                actual.setdefault(display_id, []).append(group_id)
+            if any(
+                group and actual.get(display_ids.get(group[0], "")) != group for group in original_groups
+            ):
+                raise DomainError("CONFLICT", "流水分组已变动，请刷新后重试")
+            connection.executemany(
+                """INSERT INTO transaction_group_associations(group_id,display_group_id,manual)
+                VALUES(?,?,1) ON CONFLICT(group_id) DO UPDATE SET
+                display_group_id=excluded.display_group_id,manual=1""",
+                [(group_id, group[0]) for group in new_groups for group_id in group],
+            )
+
+    @log_operation("修改库存流水")
+    def update_transaction(
+        self, transaction_id: str, expected_delta: int | float, quantity: int | float, notes: str,
+        *, order_number: str | None = None, expected_order_number: str | None = None,
+        details: TransactionDetails | None = None, expected_location_id: str | None = None,
+        component: ComponentCreate | None = None,
+        parameter_groups: list[JlcParameterGroup] | None = None,
+    ) -> None:
+        """在同一事务中更正流水、库存批次和元件资料。"""
+
+        try:
+            with self.write() as connection:
+                row = self._transaction_for_edit(connection, transaction_id)
+                previous = row["quantity_delta"]
+                if previous != expected_delta or (
+                    expected_location_id is not None and row["location_id"] != expected_location_id
+                ):
+                    raise DomainError("CONFLICT", "该流水的数量或仓库已变动，请刷新后重试")
+                if (order_number is not None or details is not None) and (
+                    row["order_number"] != expected_order_number
+                ):
+                    raise DomainError("CONFLICT", "订单号已变动，请刷新后重试")
+                if component is not None:
+                    self._update_component_fields(connection, row["component_id"], component, parameter_groups)
+                location = details.location_id if details is not None else row["location_id"]
+                self._require(connection, "locations", location, "仓库")
+                delta = quantity if previous > 0 else -quantity
+                changed_stock = delta != previous or location != row["location_id"]
+                if delta != previous and (not isinstance(quantity, int) or not 0 < quantity <= 2**63 - 1):
+                    raise DomainError("VALIDATION_ERROR", "请输入有效的正整数数量")
+                edited_ids = [transaction_id]
+                if changed_stock:
+                    if row["kind"] in {"REVERSAL", "BOM_PICK_ISSUE"} or (
+                        row["kind"] == "BOM_ISSUE" and delta != previous
+                    ):
+                        raise DomainError("CONFLICT", "更改会与关联的原流水或 BOM 取货记录冲突")
+                    edited_ids = self._edit_transaction_stock(connection, row, location, delta)
+                source = clean(details.source) if details is not None else row["source"]
+                connection.executemany(
+                    "UPDATE inventory_transactions SET source=?,notes=? WHERE id=?",
+                    [(source, clean(notes), entry_id) for entry_id in edited_ids],
+                )
+                if details is not None and row["kind"] in TRANSACTION_RECEIPT_KINDS:
+                    self._edit_receipt_details(connection, row, details, source, clean(notes))
+                elif order_number is not None:
+                    self._rename_transaction_order(connection, row["batch_id"], order_number)
+        except sqlite3.IntegrityError as error:
+            raise DomainError("CONFLICT", "元件编号、批次码或订单号与已有记录冲突") from error
+
+    @staticmethod
+    def _transaction_for_edit(connection: sqlite3.Connection, transaction_id: str) -> sqlite3.Row:
+        row: sqlite3.Row | None = connection.execute(
+            """SELECT t.rowid entry_index,t.*,s.remaining_quantity,s.batch_id,s.unit_price,
+            s.purchase_date,b.order_number,b.custom_code FROM inventory_transactions t
+            JOIN stock_lots s ON s.id=t.lot_id LEFT JOIN inventory_batches b ON b.id=s.batch_id
+            WHERE t.id=?""",
+            (transaction_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError("NOT_FOUND", "该流水已删除，请刷新")
+        return row
+
+    def _edit_transaction_stock(
+        self, connection: sqlite3.Connection, row: sqlite3.Row, location: str, delta: int | float
+    ) -> list[str]:
+        if row["kind"] in {"TRANSFER_IN", "TRANSFER_OUT"}:
+            rows = connection.execute(
+                "SELECT id,kind FROM inventory_transactions WHERE group_id=? ORDER BY rowid",
+                (row["group_id"],),
+            ).fetchall()
+            index = next(index for index, item in enumerate(rows) if item["id"] == row["id"])
+            pair_start = index - index % 2
+            pair = rows[pair_start:pair_start + 2]
+            if [item["kind"] for item in pair] != ["TRANSFER_OUT", "TRANSFER_IN"]:
+                raise DomainError("CONFLICT", "移库流水缺少对应的移入或移出记录")
+            outgoing, incoming = (self._transaction_for_edit(connection, item["id"]) for item in pair)
+            origin = location if row["kind"] == "TRANSFER_OUT" else outgoing["location_id"]
+            target = location if row["kind"] == "TRANSFER_IN" else incoming["location_id"]
+            if origin == target:
+                raise DomainError("CONFLICT", "移出和移入仓库不能相同")
+            if outgoing["quantity_delta"] != -incoming["quantity_delta"]:
+                raise DomainError("CONFLICT", "关联的移出和移入数量不一致")
+            self._edit_lot_quantity(connection, outgoing, origin, -abs(delta))
+            self._edit_lot_quantity(connection, incoming, target, abs(delta))
+            return [row["id"]]
+        return self._edit_lot_quantity(connection, row, location, delta)
+
+    def _edit_lot_quantity(
+        self, connection: sqlite3.Connection, row: sqlite3.Row, location: str, delta: int | float
+    ) -> list[str]:
+        previous = row["quantity_delta"]
+        lot_id = row["lot_id"]
+        moved = location != row["location_id"]
+        if connection.execute(
+            "SELECT 1 FROM inventory_transactions WHERE reversal_of=? LIMIT 1", (row["id"],)
+        ).fetchone():
+            raise DomainError("CONFLICT", "该流水已经冲销，请先处理关联流水")
+        if previous > 0:
+            if moved and connection.execute(
+                "SELECT 1 FROM inventory_transactions WHERE lot_id=? AND id<>? LIMIT 1",
+                (lot_id, row["id"]),
+            ).fetchone():
+                raise DomainError("CONFLICT", "该批次已有后续出入库流水，无法更改仓库")
+            remaining = row["remaining_quantity"] + delta - previous
+            if remaining < 0:
+                raise DomainError("INSUFFICIENT_STOCK", "库存不足：该批次已使用的数量大于修改后的数量")
+            connection.execute(
+                """UPDATE stock_lots SET location_id=?,initial_quantity=?,remaining_quantity=?
+                WHERE id=?""", (location, delta, remaining, lot_id)
+            )
+        elif moved:
+            return self._reassign_outgoing_lot(connection, row, location, -delta)
+        else:
+            remaining = row["remaining_quantity"] + delta - previous
+            if remaining < 0:
+                raise DomainError("INSUFFICIENT_STOCK", "原批次的剩余库存不足以修改数量")
+            connection.execute("UPDATE stock_lots SET remaining_quantity=? WHERE id=?", (remaining, lot_id))
+        connection.execute(
+            "UPDATE inventory_transactions SET quantity_delta=?,location_id=?,lot_id=? WHERE id=?",
+            (delta, location, lot_id, row["id"]),
+        )
+        self._restore_component_with_stock(connection, row["component_id"])
+        return [row["id"]]
+
+    @staticmethod
+    def _reassign_outgoing_lot(
+        connection: sqlite3.Connection, row: sqlite3.Row, location: str, quantity: int | float
+    ) -> list[str]:
+        paired_transfer = row["kind"] == "TRANSFER_OUT"
+        targets = connection.execute(
+            """SELECT s.id,s.remaining_quantity FROM stock_lots s WHERE s.component_id=?
+            AND s.location_id=? AND s.remaining_quantity>0 AND (s.batch_id IS ? OR ?)
+            AND (NOT ? OR s.remaining_quantity>=?)
+            AND EXISTS (SELECT 1 FROM inventory_transactions t WHERE t.lot_id=s.id
+                AND t.quantity_delta>0 AND (t.created_at<? OR
+                    (t.created_at=? AND t.rowid<?)))
+            ORDER BY s.received_at,s.id""",
+            # 只使用原操作发生时已经入库的批次。
+            (row["component_id"], location, row["batch_id"],
+             row["batch_id"] is None and not paired_transfer, paired_transfer, quantity,
+             row["created_at"], row["created_at"], row["entry_index"]),
+        ).fetchall()
+        if sum(target["remaining_quantity"] for target in targets) < quantity:
+            raise DomainError("INSUFFICIENT_STOCK", "目标仓库的可用批次库存不足")
+        connection.execute(
+            "UPDATE stock_lots SET remaining_quantity=remaining_quantity-? WHERE id=?",
+            (row["quantity_delta"], row["lot_id"]),
+        )
+        entries: list[str] = []
+        remaining = quantity
+        for target in targets:
+            used = min(remaining, target["remaining_quantity"])
+            connection.execute(
+                "UPDATE stock_lots SET remaining_quantity=remaining_quantity-? WHERE id=?",
+                (used, target["id"]),
+            )
+            if not entries:
+                entry_id = row["id"]
+                connection.execute(
+                    "UPDATE inventory_transactions SET quantity_delta=?,location_id=?,lot_id=? WHERE id=?",
+                    (-used, location, target["id"], entry_id),
+                )
+            else:
+                entry_id = str(uuid.uuid4())
+                connection.execute(
+                    """INSERT INTO inventory_transactions(
+                    id,group_id,kind,component_id,lot_id,location_id,quantity_delta,created_at,operation_platform)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (entry_id, row["group_id"], row["kind"], row["component_id"], target["id"],
+                     location, -used, row["created_at"], row["operation_platform"]),
+                )
+            entries.append(entry_id)
+            remaining -= used
+            if remaining <= EPSILON:
+                break
+        Database._restore_component_with_stock(connection, row["component_id"])
+        return entries
+
+    def _edit_receipt_details(
+        self, connection: sqlite3.Connection, row: sqlite3.Row,
+        details: TransactionDetails, source: str | None, notes: str | None,
+    ) -> None:
+        raw_order = details.order_number or ""
+        field = parse_qr_payload(raw_order).get("order_number")
+        order = (field.normalized_value if field else raw_order).strip().upper() or None
+        code = (details.batch_code or "").strip().upper() or None
+        if order and code:
+            raise DomainError("VALIDATION_ERROR", "立创订单号与自定义批次码只能填写一项")
+        if order and not re.fullmatch(r"[A-Z0-9-]+", order):
+            raise DomainError("VALIDATION_ERROR", "请输入有效的立创订单号")
+        if code and not CUSTOM_BATCH_CODE.fullmatch(code):
+            raise DomainError("VALIDATION_ERROR", "批次二维码必须为 CL 加十位数字")
+
+        batch_id = row["batch_id"]
+        if order and row["order_number"] and order != row["order_number"]:
+            self._rename_transaction_order(connection, batch_id, order)
+        elif code and row["custom_code"] and code != row["custom_code"]:
+            connection.execute(
+                "UPDATE inventory_batches SET custom_code=?,external_key=? WHERE id=?",
+                (code, f"CUSTOM:{code}", batch_id),
+            )
+        elif (order, code) != (row["order_number"], row["custom_code"]):
+            if connection.execute(
+                """SELECT 1 FROM order_import_items WHERE transaction_group_id=?
+                AND component_id=? AND order_number=?""",
+                (row["group_id"], row["component_id"], row["order_number"]),
+            ).fetchone():
+                raise DomainError("CONFLICT", "该入库来自立创订单导入，请保留立创订单号")
+            if batch_id and connection.execute(
+                "SELECT 1 FROM bom_pick_entries WHERE batch_id=? LIMIT 1", (batch_id,)
+            ).fetchone():
+                raise DomainError("CONFLICT", "该批次已关联 BOM 取货记录，无法更换批次类型")
+            batch_id = self._get_or_create_batch(
+                connection, row["component_id"], order_number=order, batch_code=code
+            )
+
+        date = clean(details.purchase_date)
+        connection.execute(
+            """WITH RECURSIVE related(id) AS (
+                SELECT ? UNION
+                SELECT incoming.lot_id FROM related r
+                JOIN inventory_transactions outgoing ON outgoing.lot_id=r.id AND outgoing.kind='TRANSFER_OUT'
+                JOIN inventory_transactions incoming ON incoming.rowid=(
+                    SELECT min(t.rowid) FROM inventory_transactions t
+                    WHERE t.group_id=outgoing.group_id AND t.rowid>outgoing.rowid
+                ) AND incoming.kind='TRANSFER_IN'
+            ) UPDATE stock_lots SET unit_price=?,purchase_date=?,batch_id=?
+            WHERE id IN (SELECT id FROM related)""",
+            (row["lot_id"], details.unit_price, date, batch_id),
+        )
+        connection.execute(
+            "UPDATE stock_lots SET source=?,notes=? WHERE id=?", (source, notes, row["lot_id"])
+        )
+        if row["batch_id"] is not None and row["batch_id"] != batch_id:
+            self._delete_empty_batch(connection, row["batch_id"])
+        purchase_changed = details.unit_price != row["unit_price"] or date != row["purchase_date"]
+        if purchase_changed and row["kind"] == "RECEIVE" and not connection.execute(
+            """SELECT 1 FROM inventory_transactions WHERE component_id=? AND kind='RECEIVE'
+            AND rowid>? LIMIT 1""", (row["component_id"], row["entry_index"])
+        ).fetchone():
+            connection.execute(
+                """UPDATE components SET price=?,purchase_date=?,updated_at=? WHERE id=?""",
+                (details.unit_price, date, utc_now(), row["component_id"]),
+            )
+
+    @staticmethod
+    def _delete_empty_batch(connection: sqlite3.Connection, batch_id: str) -> None:
+        connection.execute(
+            """DELETE FROM inventory_batches WHERE id=?
+            AND NOT EXISTS (SELECT 1 FROM stock_lots WHERE batch_id=?)
+            AND NOT EXISTS (SELECT 1 FROM bom_pick_entries WHERE batch_id=?)""",
+            (batch_id, batch_id, batch_id),
+        )
+
+    @staticmethod
+    def _rename_transaction_order(
+        connection: sqlite3.Connection, batch_id: str | None, order_number: str
+    ) -> None:
+        order = order_number.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9-]+", order):
+            raise DomainError("VALIDATION_ERROR", "请输入有效的立创订单号")
+        batch = connection.execute(
+            "SELECT * FROM inventory_batches WHERE id=? AND source_type='JLC'", (batch_id,)
+        ).fetchone()
+        if batch is None:
+            raise DomainError("VALIDATION_ERROR", "该流水没有关联立创订单")
+        previous = batch["order_number"]
+        part = batch["lcsc_part_number"]
+        if previous == order:
+            return
+        try:
+            connection.execute(
+                "UPDATE inventory_batches SET order_number=?,external_key=? WHERE id=?",
+                (order, f"JLC:{order}:{part}", batch_id),
+            )
+            connection.execute(
+                """UPDATE order_import_items SET order_number=?
+                WHERE order_number=? AND upper(lcsc_part_number)=? AND component_id=?""",
+                (order, previous, part, batch["component_id"]),
+            )
+        except sqlite3.IntegrityError as error:
+            raise DomainError("CONFLICT", "新订单号与已有立创批次冲突") from error
+        connection.execute(
+            "UPDATE stock_lots SET source=? WHERE batch_id=? AND source=?",
+            (f"立创订单 {order}", batch_id, f"立创订单 {previous}"),
+        )
+        connection.execute(
+            """UPDATE inventory_transactions SET source=?
+            WHERE source=? AND lot_id IN (SELECT id FROM stock_lots WHERE batch_id=?)""",
+            (f"立创订单 {order}", f"立创订单 {previous}", batch_id),
+        )
+
+    @log_operation("删除流水并回退库存")
+    def delete_transaction_group(
+        self, group_id: str, expected_rows: dict[str, int | float]
+    ) -> None:
+        """原子删除整个事务组，归还扣减库存并移除该组创建的无引用批次明细。"""
+
+        with self.write() as connection:
+            rows = connection.execute(
+                "SELECT * FROM inventory_transactions WHERE group_id=?", (group_id,)
+            ).fetchall()
+            if not rows:
+                raise DomainError("NOT_FOUND", "该事务组已删除，请刷新")
+            if {row["id"]: row["quantity_delta"] for row in rows} != expected_rows:
+                raise DomainError("CONFLICT", "该事务组已变动，请刷新后重试")
+            if connection.execute(
+                """SELECT 1 FROM inventory_transactions r
+                JOIN inventory_transactions t ON t.id=r.reversal_of
+                WHERE t.group_id=? LIMIT 1""",
+                (group_id,),
+            ).fetchone():
+                raise DomainError("CONFLICT", "仍有关联的冲销流水，请先处理冲销流水")
+
+            created_lots = {
+                row["lot_id"] for row in rows
+                if row["quantity_delta"] > 0 and row["reversal_of"] is None
+            }
+            if connection.execute(
+                """SELECT 1 FROM inventory_transactions other
+                JOIN inventory_transactions original ON original.lot_id=other.lot_id
+                WHERE original.group_id=? AND original.quantity_delta>0
+                AND original.reversal_of IS NULL AND other.group_id<>? LIMIT 1""",
+                (group_id, group_id),
+            ).fetchone():
+                raise DomainError("CONFLICT", "部分入库批次已有后续流水，请先处理关联流水")
+
+            changes: dict[str, int | float] = {}
+            for row in rows:
+                lot_id = row["lot_id"]
+                changes[lot_id] = changes.get(lot_id, 0) - row["quantity_delta"]
+            for lot_id, change in changes.items():
+                lot = connection.execute(
+                    "SELECT initial_quantity,remaining_quantity FROM stock_lots WHERE id=?",
+                    (lot_id,),
+                ).fetchone()
+                remaining = lot["remaining_quantity"] + change
+                if not 0 <= remaining <= lot["initial_quantity"]:
+                    raise DomainError("CONFLICT", "删除后的批次数量超出范围，请先处理关联流水")
+                if lot_id in created_lots and remaining != 0:
+                    raise DomainError("CONFLICT", "该入库批次还有其他库存，无法删除")
+                connection.execute(
+                    "UPDATE stock_lots SET remaining_quantity=? WHERE id=?", (remaining, lot_id)
+                )
+
+            connection.execute("DELETE FROM inventory_transactions WHERE group_id=?", (group_id,))
+            connection.execute(
+                "DELETE FROM transaction_group_associations WHERE group_id=?", (group_id,)
+            )
+            connection.execute("DELETE FROM order_import_items WHERE transaction_group_id=?", (group_id,))
+            for lot_id in created_lots:
+                batch_id = connection.execute(
+                    "SELECT batch_id FROM stock_lots WHERE id=?", (lot_id,)
+                ).fetchone()[0]
+                connection.execute("DELETE FROM stock_lots WHERE id=?", (lot_id,))
+                if batch_id is not None:
+                    self._delete_empty_batch(connection, batch_id)
+            for component_id in {row["component_id"] for row in rows}:
+                self._restore_component_with_stock(connection, component_id)
+
+    @staticmethod
+    def _restore_component_with_stock(connection: sqlite3.Connection, component_id: str) -> None:
+        connection.execute(
+            """UPDATE components SET archived_at=NULL,updated_at=? WHERE id=? AND archived_at IS NOT NULL
+            AND EXISTS (SELECT 1 FROM stock_lots WHERE component_id=? AND remaining_quantity>0)""",
+            (utc_now(), component_id, component_id),
+        )
+
+    @log_operation("冲销库存操作")
     def reverse_group(self, group_id: str, reason: str) -> dict[str, Any]:
         """用数值相反的新流水冲销整个事务组。
 
@@ -2090,6 +3049,7 @@ class Database:
                 )
         return {"transaction_group_id": reversal_group, "affected_transactions": len(rows)}
 
+    @log_operation("BOM 批量出库")
     def commit_bom(
         self, data: BomCommitRequest, *, platform: str | None = None
     ) -> dict[str, Any]:
@@ -2306,8 +3266,26 @@ class Database:
         *,
         platform: str | None = None,
     ) -> None:
-        """插入不可变流水；只有冲销记录允许填写 ``reversal_of``。"""
+        """插入库存流水；只有冲销记录允许填写 ``reversal_of``。"""
 
+        timestamp = utc_now()
+        previous = connection.execute(
+            """SELECT t.group_id,t.kind,t.source,
+            round((julianday(?) - julianday(t.created_at)) * 86400) elapsed,a.display_group_id,a.manual
+            FROM inventory_transactions t
+            LEFT JOIN transaction_group_associations a ON a.group_id=t.group_id
+            ORDER BY t.rowid DESC LIMIT 1""", (timestamp,)
+        ).fetchone()
+        if (
+            previous and previous["group_id"] != group_id and not previous["manual"]
+            and previous["elapsed"] is not None and 0 <= previous["elapsed"] <= TRANSACTION_MERGE_SECONDS
+            and _transaction_kind(kind, source) == _transaction_kind(previous["kind"], previous["source"])
+        ):
+            connection.execute(
+                """INSERT OR IGNORE INTO transaction_group_associations(group_id,display_group_id)
+                VALUES(?,?)""",
+                (group_id, previous["display_group_id"] or previous["group_id"]),
+            )
         connection.execute(
             """INSERT INTO inventory_transactions(id,group_id,kind,component_id,lot_id,
             location_id,quantity_delta,source,notes,reversal_of,created_at,operation_platform)
@@ -2323,11 +3301,12 @@ class Database:
                 clean(source),
                 clean(notes),
                 reversal_of,
-                utc_now(),
+                timestamp,
                 platform,
             ),
         )
 
+    @log_operation("创建数据库备份")
     def backup(self, directory: Path | None = None, *, automatic: bool = False) -> dict[str, str]:
         """使用 SQLite 在线备份 API 创建一致性快照和 SHA-256 文件。"""
 
@@ -2337,7 +3316,10 @@ class Database:
         destination = destination_dir / f"{prefix}-{datetime.now():%Y%m%d-%H%M%S-%f}.db"
         with TemporaryDirectory(dir=destination_dir) as temporary, self.read() as source:
             snapshot = Path(temporary) / destination.name
+            source.execute("BEGIN")
+            source.execute("SELECT count(*) FROM components").fetchone()
             self._write_snapshot(source, snapshot)
+            self._include_catalogs_in_backup(source, snapshot)
             with snapshot.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
             checksum = snapshot.with_suffix(".db.sha256")
@@ -2379,6 +3361,29 @@ class Database:
         finally:
             target.close()
 
+    @staticmethod
+    def _include_catalogs_in_backup(source: sqlite3.Connection, destination: Path) -> None:
+        with closing(sqlite3.connect(destination)) as target, target:
+            Database._create_catalog_backup_table(target)
+            for catalog in CATALOGS:
+                target.executemany(
+                    f"INSERT INTO {SNAPSHOT_TABLE}(kind,id,category,name,payload) VALUES(?,?,?,?,?)",
+                    (
+                        (catalog, *row) for row in source.execute(
+                            f"SELECT id,category,name,payload FROM {catalog}.catalog_components"
+                        )
+                    ),
+                )
+
+    @staticmethod
+    def _create_catalog_backup_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            f"""CREATE TABLE IF NOT EXISTS {SNAPSHOT_TABLE}(
+            kind TEXT NOT NULL,id TEXT NOT NULL,category TEXT,name TEXT NOT NULL,
+            payload TEXT NOT NULL,PRIMARY KEY(kind,id))"""
+        )
+
+    @log_operation("安排重启后恢复备份")
     def prepare_restore(self, source: Path) -> dict[str, str]:
         """校验备份并暂存，真正替换在下次启动、数据库打开前进行。"""
 
@@ -2404,11 +3409,14 @@ class Database:
             with TemporaryDirectory(dir=self.path.parent) as temporary:
                 snapshot = Path(temporary) / "restore.db"
                 self._write_snapshot(check, snapshot)
+                with closing(sqlite3.connect(snapshot)) as target:
+                    self._create_catalog_backup_table(target)
                 snapshot.replace(pending)
         finally:
             check.close()
         return {"pending_path": str(pending), "message": "已校验，将在重启后恢复"}
 
+    @log_operation("安排重启后清空数据")
     def prepare_reset(self) -> dict[str, str]:
         """暂存新空库，由下次启动统一替换当前库。"""
 
@@ -2460,6 +3468,7 @@ class Database:
             )
         return item
 
+    @log_operation("保存识别纠错样本")
     def save_correction(
         self,
         field_name: str,
@@ -2508,6 +3517,7 @@ class Database:
         return output
 
     @staticmethod
+    @log_operation("应用待恢复数据库")
     def apply_pending_restore(path: Path) -> bool:
         """在数据库尚未打开时原子应用已暂存的恢复文件。"""
 
@@ -2516,6 +3526,7 @@ class Database:
             return False
         previous = path.with_suffix(".before-restore.db")
         if path.exists():
+            main_usable = True
             connection = sqlite3.connect(path)
             try:
                 if connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
@@ -2525,11 +3536,16 @@ class Database:
                     sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB,
                 } or path.with_name(path.name + "-wal").exists():
                     raise
+                main_usable = False
             finally:
                 connection.close()
             with TemporaryDirectory(dir=path.parent) as temporary:
                 snapshot = Path(temporary) / previous.name
                 shutil.copy2(path, snapshot)
+                if main_usable and all(catalog_path(path, catalog).is_file() for catalog in CATALOGS):
+                    with closing(sqlite3.connect(path)) as source:
+                        Database._attach_catalogs(source, path)
+                        Database._include_catalogs_in_backup(source, snapshot)
                 snapshot.replace(previous)
         os.replace(pending, path)
         return True
@@ -2555,6 +3571,8 @@ CREATE TABLE IF NOT EXISTS stock_lots(id TEXT PRIMARY KEY,component_id TEXT NOT 
 CREATE INDEX IF NOT EXISTS idx_lots_fifo ON stock_lots(component_id,location_id,received_at);
 CREATE TABLE IF NOT EXISTS inventory_transactions(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,kind TEXT NOT NULL,component_id TEXT NOT NULL REFERENCES components(id),lot_id TEXT NOT NULL REFERENCES stock_lots(id),location_id TEXT NOT NULL REFERENCES locations(id),quantity_delta INTEGER NOT NULL CHECK(quantity_delta<>0),source TEXT,notes TEXT,reversal_of TEXT REFERENCES inventory_transactions(id),created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_transactions_component ON inventory_transactions(component_id,created_at);
+CREATE TABLE IF NOT EXISTS transaction_group_associations(
+ group_id TEXT PRIMARY KEY, display_group_id TEXT NOT NULL, manual INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scan_sessions(id TEXT PRIMARY KEY,kind TEXT NOT NULL,raw_text TEXT NOT NULL,confidence REAL,status TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS boms(id TEXT PRIMARY KEY,name TEXT NOT NULL,source_filename TEXT,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bom_lines(id TEXT PRIMARY KEY,bom_id TEXT NOT NULL REFERENCES boms(id),row_number INTEGER NOT NULL,raw_json TEXT NOT NULL,component_id TEXT REFERENCES components(id),quantity INTEGER NOT NULL);

@@ -131,6 +131,9 @@ def test_phone_issue_stream_survives_confirmation_and_closes(tmp_path: Path) -> 
     scanned = service.command(session_id, "scan1", 0, "SCAN_CODE", {"raw_text": "CL0000000101"}, "phone")
     assert scanned["snapshot"]["form"]["quantity"] == 1
     assert scanned["snapshot"]["form"]["location_id"] == ids["location"]
+    assert service.command(
+        session_id, "duplicate-scan", 1, "SCAN_CODE", {"raw_text": " cl0000000101 "}, "phone"
+    ) == scanned
     confirmed = service.command(
         session_id, "confirm1", 1, "UPDATE_AND_CONFIRM", {"quantity": 2}, "desktop"
     )

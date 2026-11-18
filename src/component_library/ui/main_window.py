@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import random
+import sqlite3
 import sys
 import time
 import uuid
@@ -87,14 +88,23 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTextEdit,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__
 from ..bom import ALIASES, bom_project_name, parse_bom, preview_bom
+from ..catalogs import Catalog, catalog_category_path
 from ..connection import ConnectionManager
-from ..database import ORDER_SUPPLEMENT_FIELDS, Database, DomainError
+from ..database import (
+    EDITABLE_TRANSACTION_QUANTITY,
+    ORDER_SUPPLEMENT_FIELDS,
+    TRANSACTION_RECEIPT_KINDS,
+    Database,
+    DomainError,
+)
 from ..debug_log import LOG_LEVEL_SETTING, LOG_LEVELS, DebugLogHandler
 from ..export import export_inventory_csv, export_inventory_xlsx, export_transactions
 from ..label_parser import CUSTOM_BATCH_PATTERN, parse_qr_payload
@@ -109,6 +119,7 @@ from ..models import (
     LocationCreate,
     OrderImportLine,
     ReceiveRequest,
+    TransactionDetails,
     WarehouseCreate,
 )
 from ..order_import import parse_order_files
@@ -146,6 +157,21 @@ def make_table(headers: list[str]) -> QTableWidget:
     table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
     table.setSortingEnabled(True)
     return table
+
+
+def show_filtered_suggestions(combo: QComboBox, show: bool) -> None:
+    """展开已由表单筛过的候选。初始焦点留在输入框，直到用户选中一项。"""
+
+    completer = combo.completer()
+    if completer is None or (popup := completer.popup()) is None:
+        return
+    if not show:
+        popup.hide()
+        return
+    completer.setCompletionMode(QCompleter.CompletionMode.UnfilteredPopupCompletion)
+    completer.setCompletionPrefix("")
+    completer.complete()
+    popup.setCurrentIndex(QModelIndex())
 
 
 def fill_table(table: QTableWidget, rows: list[list[Any]]) -> None:
@@ -269,6 +295,12 @@ class WheelSafeComboBox(QComboBox):
 
     def wheelEvent(self, event: Any) -> None:
         event.ignore()
+
+    def setEditable(self, editable: bool) -> None:
+        super().setEditable(editable)
+        if editable and (completer := self.completer()):
+            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
 
 
 class DateRangeFilter(QWidget):
@@ -534,7 +566,8 @@ class ComponentEditDialog(QDialog):
     """双击库存行时编辑元件主数据和类别参数。"""
 
     def __init__(
-        self, database: Database, component_id: str, parent: QWidget, *, read_only: bool = False
+        self, database: Database, component_id: str, parent: QWidget, *, read_only: bool = False,
+        catalog: Catalog | None = None, transaction: dict[str, Any] | None = None,
     ) -> None:
         """读取 ``component_id`` 的完整详情并构造可编辑表单。
 
@@ -544,11 +577,18 @@ class ComponentEditDialog(QDialog):
         super().__init__(parent)
         self.database = database
         self.component_id = component_id
-        self.detail = database.get_component(component_id)
+        self.catalog = catalog
+        self.transaction = transaction
+        self.detail = (
+            database.get_catalog_component(catalog, component_id)
+            if catalog else database.get_component(component_id)
+        )
         self.read_only = read_only
         self.parameter_fields: dict[str, tuple[str, QLineEdit]] = {}
         self.parameter_groups: dict[str, str] = {}
-        self.setWindowTitle("元件详情" if read_only else "修改元件")
+        self.setWindowTitle(
+            "修改库存流水" if transaction is not None else "元件详情" if read_only else "修改元件"
+        )
         available = self.screen().availableGeometry()
         self.resize(min(620, available.width()), min(720, max(200, available.height() - 80)))
         layout = QVBoxLayout(self)
@@ -559,6 +599,8 @@ class ComponentEditDialog(QDialog):
         scroll.setWidget(content)
         # 展开类别参数时只增加滚动内容高度，底部操作按钮不随表单滚动。
         layout.addWidget(scroll, 1)
+        if transaction is not None:
+            fields.addLayout(self._transaction_form(transaction))
         form = QFormLayout()
         self.name = QLineEdit(str(self.detail.get("name") or ""))
         self.aliases = QLineEdit(", ".join(self.detail.get("aliases") or []))
@@ -597,13 +639,14 @@ class ComponentEditDialog(QDialog):
         fields.addWidget(self.parameter_group)
         trailing = QFormLayout()
         for label, trailing_widget in (
-            ("单价", self.price),
-            ("购买日期", self.purchase_date),
             ("商品链接", self.product_url),
             ("数据手册", self.datasheet_url),
-            ("备注", self.notes),
+            ("元件备注", self.notes),
         ):
             trailing.addRow(label, trailing_widget)
+        if transaction is None:
+            trailing.insertRow(0, "购买日期", self.purchase_date)
+            trailing.insertRow(0, "单价", self.price)
         fields.addLayout(trailing)
         fields.addStretch()
         buttons = QDialogButtonBox(
@@ -620,11 +663,62 @@ class ComponentEditDialog(QDialog):
             or category_parameter_values(self.detail),
             [(key, label, group) for key, label, _value, group in entries] or None,
         )
+        self._initial_component_inputs = self._component_inputs()
+        self._initial_parameter_inputs = self._parameter_inputs()
         if read_only:
             for field in content.findChildren(QLineEdit):
                 field.setReadOnly(True)
             self.category.setEnabled(False)
             self.price.setReadOnly(True)
+
+    def _component_inputs(self) -> tuple[str, ...]:
+        return (
+            self.name.text(), self.aliases.text(), self.lcsc.text(), self.mpn.text(),
+            self.custom.text(), self.brand.text(), self.package.text(), self.category.currentText(),
+            self.price.text(), self.purchase_date.text(), self.product_url.text(),
+            self.datasheet_url.text(), self.notes.text(),
+        )
+
+    def _parameter_inputs(self) -> dict[str, str]:
+        return {key: field.text() for key, (_label, field) in self.parameter_fields.items()}
+
+    def _transaction_form(self, item: dict[str, Any]) -> QFormLayout:
+        form = QFormLayout()
+        self.transaction_location = WheelSafeComboBox()
+        warehouse_names = {warehouse["id"]: warehouse["name"] for warehouse in self.database.list_warehouses()}
+        for location in self.database.list_locations():
+            add_storage_option(
+                self.transaction_location, f"{warehouse_names[location['warehouse_id']]} / {location['name']}",
+                location["id"], location.get("color"),
+            )
+        self.transaction_location.setCurrentIndex(self.transaction_location.findData(item["location_id"]))
+        self.transaction_location.setEnabled(item["kind"] not in {"REVERSAL", "BOM_PICK_ISSUE"})
+        previous = abs(item["quantity_delta"])
+        self.transaction_quantity = QLineEdit(str(int(previous)) if int(previous) == previous else str(previous))
+        self.transaction_quantity.setObjectName("transaction_quantity")
+        self.transaction_quantity.setReadOnly(
+            item["kind"] not in EDITABLE_TRANSACTION_QUANTITY or int(previous) != previous
+        )
+        self.transaction_price = QLineEdit("" if item.get("unit_price") is None else str(item["unit_price"]))
+        self.transaction_date = QLineEdit(str(item.get("purchase_date") or ""))
+        self.transaction_code = QLineEdit(str(item.get("custom_code") or ""))
+        self.transaction_order = QLineEdit(str(item.get("order_number") or ""))
+        self.transaction_order.setPlaceholderText("订单号或立创袋贴二维码")
+        self.transaction_order.setToolTip("已有批次改号时，关联流水会使用更新后的订单号")
+        self.transaction_source = QLineEdit(str(item.get("source") or ""))
+        self.transaction_notes = QPlainTextEdit(str(item.get("notes") or ""))
+        receipt = item["kind"] in TRANSACTION_RECEIPT_KINDS
+        for field in (self.transaction_price, self.transaction_date, self.transaction_code):
+            field.setReadOnly(not receipt)
+        self.transaction_order.setReadOnly(not receipt and not item.get("order_number"))
+        for label, widget in (
+            ("流水数量", self.transaction_quantity), ("位置 / 仓库", self.transaction_location),
+            ("购买单价", self.transaction_price), ("购买日期", self.transaction_date),
+            ("自定义批次二维码", self.transaction_code), ("立创订单号", self.transaction_order),
+            ("流水来源", self.transaction_source), ("流水备注", self.transaction_notes),
+        ):
+            form.addRow(label, widget)
+        return form
 
     def _rebuild_parameters(
         self,
@@ -672,40 +766,74 @@ class ComponentEditDialog(QDialog):
 
         try:
             aliases = [value.strip() for value in self.aliases.text().split(",") if value.strip()]
-            self.database.update_component(
-                self.component_id,
-                ComponentCreate(
-                    name=self.name.text(),
-                    aliases=aliases,
-                    lcsc_part_number=self.lcsc.text() or None,
-                    manufacturer_part_number=self.mpn.text() or None,
-                    custom_part_number=self.custom.text() or None,
-                    brand=self.brand.text() or None,
-                    package=self.package.text() or None,
-                    category=self.category.currentText() or None,
-                    price=optional_price(self.price.text()),
-                    purchase_date=self.purchase_date.text() or None,
-                    product_url=self.product_url.text() or None,
-                    datasheet_url=self.datasheet_url.text() or None,
-                    notes=self.notes.text() or None,
-                ),
-            )
             grouped: dict[str, list[JlcParameter]] = {}
             for key, (label, field) in self.parameter_fields.items():
-                if field.text().strip():
+                value = field.text().strip()
+                if value and (key != "purchase_price" or optional_price(value) is not None):
                     grouped.setdefault(self.parameter_groups.get(key, "类别参数"), []).append(
-                        JlcParameter(key=key, label=label, value=field.text().strip())
+                        JlcParameter(key=key, label=label, value=value)
                     )
-            self.database.save_component_parameter_groups(
-                self.component_id,
-                [
-                    JlcParameterGroup(name=name, parameters=parameters)
-                    for name, parameters in grouped.items()
-                ],
+            data = ComponentCreate(
+                name=self.name.text(),
+                aliases=aliases,
+                lcsc_part_number=self.lcsc.text() or None,
+                manufacturer_part_number=self.mpn.text() or None,
+                custom_part_number=self.custom.text() or None,
+                brand=self.brand.text() or None,
+                package=self.package.text() or None,
+                category=self.category.currentText() or None,
+                specification=self.detail.get("specification"),
+                price=optional_price(self.price.text()),
+                purchase_date=self.purchase_date.text() or None,
+                product_url=self.product_url.text() or None,
+                datasheet_url=self.datasheet_url.text() or None,
+                notes=self.notes.text() or None,
             )
+            groups = [
+                JlcParameterGroup(name=name, parameters=parameters)
+                for name, parameters in grouped.items()
+            ]
+            if self.transaction is not None:
+                self._save_transaction(self.transaction, data, groups)
+            else:
+                if self.catalog == "marketplace" and QMessageBox.question(
+                    self, "保存到用户元件资料库",
+                    "是否将修改后的资料保存到用户元件资料库？已有用户副本会更新。",
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                self.database.update_component(
+                    self.component_id, data, parameter_groups=groups,
+                    force_user_copy=self.catalog == "marketplace",
+                )
             self.accept()
         except Exception as error:
             QMessageBox.critical(self, "保存失败", str(error))
+
+    def _save_transaction(
+        self, item: dict[str, Any], component: ComponentCreate, groups: list[JlcParameterGroup]
+    ) -> None:
+        previous = item["quantity_delta"]
+        quantity = abs(previous) if self.transaction_quantity.isReadOnly() else int(self.transaction_quantity.text())
+        old_order = item.get("order_number")
+        order = self.transaction_order.text().strip() or None
+        location = self.transaction_location.currentData()
+        if location is None:
+            raise ValueError("请选择仓库")
+        parameters_changed = self._parameter_inputs() != self._initial_parameter_inputs
+        component_changed = parameters_changed or self._component_inputs() != self._initial_component_inputs
+        self.database.update_transaction(
+            item["id"], previous, quantity, self.transaction_notes.toPlainText(),
+            details=TransactionDetails(
+                location_id=location, source=self.transaction_source.text() or None,
+                unit_price=optional_price(self.transaction_price.text()),
+                purchase_date=self.transaction_date.text() or None,
+                order_number=order, batch_code=self.transaction_code.text() or None,
+            ),
+            order_number=(order or "") if item["kind"] not in TRANSACTION_RECEIPT_KINDS and order != old_order else None,
+            expected_order_number=old_order, expected_location_id=item["location_id"],
+            component=component if component_changed else None,
+            parameter_groups=groups if parameters_changed else None,
+        )
 
 
 class OrderLineEditDialog(QDialog):
@@ -788,7 +916,7 @@ def optional_price(text: str) -> float | None:
         raise ValueError("单价必须为非负数字，未知时留空") from None
     if not isfinite(price) or price < 0:
         raise ValueError("单价必须为非负数字，未知时留空")
-    return price
+    return price or None
 
 
 class StorageEditDialog(QDialog):
@@ -919,6 +1047,12 @@ class BasePage(QWidget):
     def show_error(self, message: str) -> None:
         """显示业务或运行时错误。"""
 
+        error = sys.exc_info()[1]
+        logger = logging.getLogger(__name__)
+        if error is not None and not isinstance(error, (DomainError, ValueError)):
+            logger.error("操作失败：%s", message, exc_info=True)
+        else:
+            logger.warning("操作未完成：%s", message)
         QMessageBox.critical(self, "操作失败", message)
 
     def show_info(self, message: str) -> None:
@@ -1084,7 +1218,7 @@ class InventoryPage(BasePage):
         for component in components:
             lots = lots_by_component.get(component["id"], [])
             visible_lots[component["id"]] = [
-                lot for lot in lots or [{}]
+                lot for lot in lots
                 if date_matches(
                     lot.get(date_field)
                     if lot and date_field in {"purchase_date", "received_at"}
@@ -1334,6 +1468,9 @@ class InventoryPage(BasePage):
     def edit_component(self, row: int, column: int) -> None:
         """双击可编辑格时原位输入；派生库存和系统时间保持只读。"""
 
+        if column == 8:
+            self.open_full_component_editor(row)
+            return
         field_by_column = {
             0: "name",
             1: "aliases",
@@ -1456,7 +1593,7 @@ class InventoryPage(BasePage):
             self.table.selectRow(row)
         menu = QMenu(self)
         details = menu.addAction("查看详细信息…")
-        edit = menu.addAction("完整编辑…")
+        edit = menu.addAction("编辑")
         transfer = menu.addAction("变更仓库…")
         self._add_supplement_actions(menu.addMenu("补充资料"), row)
         delete = menu.addAction("删除元件")
@@ -1721,8 +1858,9 @@ class InventoryPage(BasePage):
                 if value is not None:
                     values[key] = value
             values["jlc_matched"] = True
-            self.database.update_component(component_id, ComponentCreate.model_validate(values))
-            self.database.save_component_parameter_groups(component_id, result.parameter_groups)
+            self.database.update_component(
+                component_id, ComponentCreate.model_validate(values), parameter_groups=result.parameter_groups
+            )
             applied += 1
         return applied
 
@@ -1736,9 +1874,12 @@ class BatchCodeScanDialog(QDialog):
         parent: QWidget,
         connection: ConnectionManager | None = None,
         sessions: SessionService | None = None,
+        *,
+        order_number: bool = False,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("扫描自定义批次二维码")
+        self.order_number_mode = order_number
+        self.setWindowTitle("扫描立创订单二维码" if order_number else "扫描自定义批次二维码")
         self.resize(720, 560)
         self.recognition = recognition
         self.connection = connection
@@ -1823,7 +1964,10 @@ class BatchCodeScanDialog(QDialog):
         self.session.setCamera(self.camera)
         self.session.setVideoSink(self.sink)
         self.sink.videoFrameChanged.connect(self._frame)
-        self.status.setText("请将 CL 加十位数字的二维码放入画面中央")
+        self.status.setText(
+            "请将立创袋贴二维码放入画面中央" if self.order_number_mode
+            else "请将 CL 加十位数字的二维码放入画面中央"
+        )
         self.camera.start()
 
     def _start_remote_camera(self, device_id: str) -> None:
@@ -1831,11 +1975,12 @@ class BatchCodeScanDialog(QDialog):
         if self.sessions is None:
             self.status.setText("移动会话服务未启用")
             return
-        self.status.setText("已请求安卓设备扫码，请在手机上对准 CL 批次二维码")
+        self.status.setText("已请求安卓设备扫码，请在手机上对准二维码")
         try:
             session = self.sessions.create(
                 "ISSUE",
-                {"camera_only": True, "target_device_id": device_id, "quantity": 1},
+                {"camera_only": True, "target_device_id": device_id, "quantity": 1,
+                 **({"scan_order_number": True} if self.order_number_mode else {})},
                 "desktop",
             )
         except DomainError as error:
@@ -1851,6 +1996,11 @@ class BatchCodeScanDialog(QDialog):
         session_id = self.remote_session_id
         try:
             current = self.sessions.get(session_id)
+            if self.order_number_mode and (order := current["snapshot"].get("scanned_order_number")):
+                self.code = str(order)
+                self.stop_camera()
+                self.accept()
+                return
             batch = current["snapshot"].get("batch")
             if batch:
                 code = str(batch.get("custom_code") or "")
@@ -1931,6 +2081,14 @@ class BatchCodeScanDialog(QDialog):
         self.worker = None
 
     def _decoded(self, raw_text: str | None) -> None:
+        if self.order_number_mode:
+            if field := parse_qr_payload(raw_text or "").get("order_number"):
+                self.code = field.normalized_value.upper()
+                self.stop_camera()
+                self.accept()
+            elif raw_text:
+                self.status.setText("该二维码没有立创订单号，请扫描立创袋贴")
+            return
         text = raw_text.strip().upper() if raw_text else ""
         if not text:
             return
@@ -2029,6 +2187,9 @@ class ReceivePage(BasePage):
         self.price = WheelSafeDoubleSpinBox()
         self.price.setRange(0, 100_000_000)
         self.price.setDecimals(6)
+        self.price.setSpecialValueText(" ")
+        if editor := self.price.lineEdit():
+            editor.setPlaceholderText("未定价")
         self.purchase_date = QLineEdit()
         self.purchase_date.setPlaceholderText("可选，格式 YYYY-MM-DD")
         self.product_url = QLineEdit()
@@ -2056,7 +2217,15 @@ class ReceivePage(BasePage):
         scan_batch.clicked.connect(self.scan_batch_code)
         batch_code_layout.addWidget(scan_batch)
         self.order_number = QLineEdit()
-        self.order_number.setPlaceholderText("扫描立创袋贴后自动填写")
+        self.order_number.setPlaceholderText("输入订单号或粘贴立创袋贴二维码")
+        self.order_number.textEdited.connect(self._read_order_barcode)
+        order_row = QWidget()
+        order_layout = QHBoxLayout(order_row)
+        order_layout.setContentsMargins(0, 0, 0, 0)
+        order_layout.addWidget(self.order_number)
+        scan_order = QPushButton("摄像头扫码")
+        scan_order.clicked.connect(self.scan_order_number)
+        order_layout.addWidget(scan_order)
         self.notes = QLineEdit()
         for label, main_widget in (
             ("元件名称", self.name),
@@ -2077,7 +2246,7 @@ class ReceivePage(BasePage):
             ("位置 / 仓库", storage_row),
             ("数量", self.quantity),
             ("自定义批次二维码", batch_code_row),
-            ("立创订单号", self.order_number),
+            ("立创订单号", order_row),
             ("备注", self.notes),
         ):
             form.addRow(label, detail_widget)
@@ -2129,8 +2298,7 @@ class ReceivePage(BasePage):
         combo.setCurrentIndex(-1)
         combo.setEditText(text)
         combo.blockSignals(False)
-        if matches:
-            combo.showPopup()
+        show_filtered_suggestions(combo, bool(matches))
 
     def reload(self) -> None:
         """刷新同行显示的位置和仓库下拉框，并保留当前选择。"""
@@ -2188,10 +2356,10 @@ class ReceivePage(BasePage):
             labels = [
                 f"{lot['warehouse_name']}/{lot['location_name']}({lot['quantity']})" for lot in stock
             ]
-            stock_text = "；".join(labels) or "无库存"
+            suffix = "（user）" if item.get("user_catalog") else ""
             self.name.addItem(
-                f"{item['name']} · {item.get('brand') or '无品牌'} · "
-                f"{item.get('package') or '无封装'} · {stock_text}",
+                f"{item['name']}{suffix} · {item.get('brand') or '无品牌'} · "
+                f"{item.get('package') or '无封装'}",
                 item["id"],
             )
             if stock:
@@ -2209,8 +2377,7 @@ class ReceivePage(BasePage):
         self.name.setCurrentIndex(-1)
         self.name.setEditText(text)
         self.name.blockSignals(False)
-        if matches:
-            self.name.showPopup()
+        show_filtered_suggestions(self.name, bool(matches))
 
     def _load_selected_component(self, index: int) -> None:
         """点击名称下拉项后完成匹配，并自动填写元件资料。"""
@@ -2236,7 +2403,7 @@ class ReceivePage(BasePage):
         self.brand.setCurrentText(str(item.get("brand") or ""))
         self.package.setCurrentText(str(item.get("package") or ""))
         self.category.setCurrentText(str(item.get("category") or ""))
-        self.price.setValue(float(item.get("price") or 0))
+        self.price.setValue(0)
         self.purchase_date.clear()
         self.product_url.setText(str(item.get("product_url") or ""))
         self.datasheet_url.setText(str(item.get("datasheet_url") or ""))
@@ -2284,8 +2451,7 @@ class ReceivePage(BasePage):
         self.category.setEditText(text)
         self.category.blockSignals(False)
         self.parameter_group.hide()
-        if matches:
-            self.category.showPopup()
+        show_filtered_suggestions(self.category, bool(matches))
 
     def _category_selected(self, index: int) -> None:
         """点击类别下拉项后自动显示对应参数组。"""
@@ -2372,15 +2538,22 @@ class ReceivePage(BasePage):
     def _component_form(self) -> ComponentCreate:
         """把主数据控件转换为经 Pydantic 校验的元件写入模型。"""
 
+        previous = (
+            self.database.get_component(self._selected_component_id)
+            if self._selected_component_id and not self._creating_new else {}
+        )
         return ComponentCreate(
             name=self.name.currentText(),
+            aliases=previous.get("aliases") or [],
             lcsc_part_number=self.lcsc.text() or None,
             manufacturer_part_number=self.mpn.text() or None,
+            custom_part_number=previous.get("custom_part_number"),
             brand=self.brand.currentText() or None,
             package=self.package.currentText() or None,
             category=self.category.currentText() or None,
-            price=self.price.value(),
-            purchase_date=self.purchase_date.text().strip() or None,
+            specification=previous.get("specification"),
+            price=self.price.value() or previous.get("price"),
+            purchase_date=self.purchase_date.text().strip() or previous.get("purchase_date"),
             product_url=self.product_url.text() or None,
             datasheet_url=self.datasheet_url.text() or None,
             notes=self.component_notes.text() or None,
@@ -2406,6 +2579,18 @@ class ReceivePage(BasePage):
         QTimer.singleShot(0, dialog.start_camera)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.code:
             self.batch_code.setText(dialog.code)
+
+    def _read_order_barcode(self, raw: str) -> None:
+        if field := parse_qr_payload(raw).get("order_number"):
+            self.order_number.setText(field.normalized_value)
+
+    def scan_order_number(self) -> None:
+        dialog = BatchCodeScanDialog(
+            self.recognition, self, self.connection, self.sessions, order_number=True
+        )
+        QTimer.singleShot(0, dialog.start_camera)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.code:
+            self.order_number.setText(dialog.code)
 
     def apply_jlc_draft(self, draft: JlcProductDraft) -> None:
         """将立创商品草稿与当前入库表单进行逐字段合并。
@@ -2625,7 +2810,7 @@ class ReceivePage(BasePage):
                         "location_id": self.location.currentData(),
                         "quantity": self.quantity.value(),
                         "source": "扫码入库",
-                        "unit_price": self.price.value(),
+                        "unit_price": self.price.value() or None,
                         "purchase_date": self.purchase_date.text().strip() or None,
                         "batch_code": self.batch_code.text().strip() or None,
                         "order_number": self.order_number.text().strip() or None,
@@ -2647,7 +2832,7 @@ class ReceivePage(BasePage):
                 raise ValueError("请选择元件和仓库")
             ### 保存动态参数并执行库存入库 ###
             self.database.save_component_parameter_groups(
-                component_id, self._parameter_group_models()
+                component_id, self._parameter_group_models(), marketplace=self._jlc_draft_active
             )
             self.database.receive(
                 ReceiveRequest(
@@ -2655,7 +2840,7 @@ class ReceivePage(BasePage):
                     location_id=str(self.location.currentData()),
                     quantity=self.quantity.value(),
                     source="手工入库",
-                    unit_price=self.price.value(),
+                    unit_price=self.price.value() or None,
                     purchase_date=self.purchase_date.text().strip() or None,
                     batch_code=self.batch_code.text().strip() or None,
                     order_number=self.order_number.text().strip() or None,
@@ -3342,6 +3527,7 @@ class IssuePage(BasePage):
         self.remote_timer.setInterval(500)
         self.remote_timer.timeout.connect(self._poll_remote_camera)
         self.selected_batch: dict[str, Any] | None = None
+        self._manual_component_id: str | None = None
         self.camera: QCamera | None = None
         self.session: QMediaCaptureSession | None = None
         self.sink: QVideoSink | None = None
@@ -3398,6 +3584,9 @@ class IssuePage(BasePage):
         self.scan_quantity = WheelSafeSpinBox()
         self.scan_quantity.setRange(1, 1)
         self.scan_quantity.setEnabled(False)
+        self.scan_max = QPushButton("MAX")
+        self.scan_max.setEnabled(False)
+        self.scan_max.clicked.connect(lambda: self.scan_quantity.setValue(self.scan_quantity.maximum()))
         self.scan_notes = QLineEdit()
         self.scan_notes.setPlaceholderText("可选，填写用途或异常说明")
         self.scan_confirm = QPushButton("确认扫码出库")
@@ -3409,7 +3598,10 @@ class IssuePage(BasePage):
         result_form.addRow("批次", self.scan_batch_info)
         result_form.addRow("库存分布", self.scan_stock_info)
         result_form.addRow("出库仓库", self.scan_location)
-        result_form.addRow("出库数量", self.scan_quantity)
+        scan_quantity_row = QHBoxLayout()
+        scan_quantity_row.addWidget(self.scan_quantity, 1)
+        scan_quantity_row.addWidget(self.scan_max)
+        result_form.addRow("出库数量", scan_quantity_row)
         result_form.addRow("用途 / 异常备注", self.scan_notes)
         result_form.addRow(self.scan_confirm)
         self.scan_result.hide()
@@ -3430,13 +3622,19 @@ class IssuePage(BasePage):
         )
         self.quantity = WheelSafeSpinBox()
         self.quantity.setRange(1, 1_000_000_000)
+        self.quantity_max = QPushButton("MAX")
+        self.quantity_max.clicked.connect(lambda: self.quantity.setValue(self.quantity.maximum()))
+        self.location.currentIndexChanged.connect(self._manual_issue_quantity_limit)
         self.notes = QLineEdit()
         button = QPushButton("确认出库")
         button.clicked.connect(self.submit)
         form.addRow("搜索元件", self.search)
         form.addRow(self.component_label, self.component)
         form.addRow("有库存的仓库", self.location)
-        form.addRow("数量", self.quantity)
+        quantity_row = QHBoxLayout()
+        quantity_row.addWidget(self.quantity, 1)
+        quantity_row.addWidget(self.quantity_max)
+        form.addRow("数量", quantity_row)
         form.addRow("用途 / 备注", self.notes)
         form.addRow(button)
         layout.addLayout(form)
@@ -3522,6 +3720,9 @@ class IssuePage(BasePage):
 
         self.stop_camera()
         self.selected_batch = None
+        self.scan_quantity.setEnabled(False)
+        self.scan_max.setEnabled(False)
+        self.scan_confirm.setEnabled(False)
         self.scan_result.show()
         self.scan_preview.setText("已请求安卓设备打开摄像头，请在手机上对准二维码")
         self.scan_status.setText("等待安卓设备扫码……")
@@ -3863,6 +4064,7 @@ class IssuePage(BasePage):
         """切换仓库时按该仓库的批次余量限制数量。"""
 
         if not self.selected_batch:
+            self.scan_max.setEnabled(False)
             return
         location_id = self.scan_location.currentData()
         available = int(self.selected_batch["remaining_quantity"])
@@ -3875,8 +4077,9 @@ class IssuePage(BasePage):
                 ),
                 0,
             )
-        self.scan_quantity.setRange(1, max(1, available))
+        self.scan_quantity.setRange(1, min(2**31 - 1, max(1, available)))
         self.scan_quantity.setEnabled(available > 0)
+        self.scan_max.setEnabled(available > 0)
         self.scan_confirm.setEnabled(available > 0)
 
     def _remember_scan_location(self, _index: int) -> None:
@@ -3926,7 +4129,7 @@ class IssuePage(BasePage):
                 item["id"],
             )
         index = self.component.findData(selected)
-        self.component.setCurrentIndex(index if index >= 0 else 0)
+        self.component.setCurrentIndex(index)
         self.component.blockSignals(False)
         show_matches = bool(query and self.component.count())
         self.component.setVisible(show_matches)
@@ -3937,11 +4140,16 @@ class IssuePage(BasePage):
         """只展示所选元件实际有库存的仓库，并自动选择 FIFO 建议。"""
 
         component_id = self.component.currentData()
+        if component_id != self._manual_component_id:
+            self._manual_component_id = component_id
+            self.quantity.setValue(1)
         stock = [
             item
             for item in self.database.list_stock()
             if item["component_id"] == component_id and int(item["quantity"]) > 0
         ]
+        selected = self.location.currentData()
+        self.location.blockSignals(True)
         self.location.clear()
         total = sum(int(item["quantity"]) for item in stock)
         # 留空表示自动跨仓库 FIFO，避免默认值看起来像一个真实仓库。
@@ -3954,8 +4162,22 @@ class IssuePage(BasePage):
                 item["location_id"],
                 item.get("color"),
             )
-        preferred = self.location.findData(self.database.last_issue_location())
+        preferred = self.location.findData(selected or self.database.last_issue_location())
         self.location.setCurrentIndex(max(0, preferred))
+        self.location.blockSignals(False)
+        self._manual_issue_quantity_limit()
+
+    def _manual_issue_quantity_limit(self) -> None:
+        component_id = self.component.currentData()
+        location_id = self.location.currentData()
+        available = sum(
+            int(item["quantity"]) for item in self.database.list_stock()
+            if item["component_id"] == component_id
+            and (location_id is None or item["location_id"] == location_id)
+        )
+        self.quantity.setRange(1, min(2**31 - 1, max(1, available)))
+        self.quantity.setEnabled(available > 0)
+        self.quantity_max.setEnabled(available > 0)
 
     def submit(self) -> None:
         """提交手工出库并显示库存不足等业务错误。"""
@@ -4002,6 +4224,7 @@ class IssuePage(BasePage):
         self.scan_quantity.setRange(1, 1)
         self.scan_quantity.setValue(1)
         self.scan_quantity.setEnabled(False)
+        self.scan_max.setEnabled(False)
         self.scan_notes.clear()
         self.scan_confirm.setEnabled(False)
         self.scan_status.setText(message)
@@ -4329,9 +4552,7 @@ class LocationsPage(BasePage):
         elif selected == change_color and storage_cell:
             self.change_storage_color(storage_cell)
         elif selected == action:
-            category, accepted = QInputDialog.getText(self, "类别优先级", "元件类别名称：")
-            if accepted and category.strip():
-                self.open_priority_dialog(category.strip())
+            self._choose_priority_category()
         elif selected == delete_storage and storage_cell:
             self.delete_location(
                 str(storage_cell.data(Qt.ItemDataRole.UserRole)), storage_cell.text()
@@ -4361,6 +4582,35 @@ class LocationsPage(BasePage):
         """打开整体或类别仓库优先级配置。"""
 
         StoragePriorityDialog(self.database, category, self).exec()
+
+    def _choose_priority_category(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("类别优先级")
+        form = QFormLayout(dialog)
+        selector = WheelSafeComboBox()
+        selector.setEditable(True)
+        selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        selector.addItems(list(dict.fromkeys((*CATEGORY_NAMES, *self.database.list_component_categories()))))
+        selector.setProperty("all_values", [selector.itemText(index) for index in range(selector.count())])
+        selector.setCurrentIndex(-1)
+        form.addRow("元件类别", selector)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        confirm = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        confirm.setEnabled(False)
+        selector.activated.connect(lambda _index: confirm.setEnabled(True))
+        if editor := selector.lineEdit():
+            def suggest(text: str) -> None:
+                confirm.setEnabled(False)
+                ReceivePage._filter_metadata_combo(selector, text)
+
+            editor.textEdited.connect(suggest)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.open_priority_dialog(selector.currentText())
 
 
 class BomFieldMappingDialog(QDialog):
@@ -4754,12 +5004,7 @@ class BomPage(BasePage):
         self._fill_candidate_selector(selector, matches, None, text)
         if editor:
             editor.setCursorPosition(cursor)
-        if completer := selector.completer():
-            if matches and needle:
-                completer.setCompletionPrefix("")
-                completer.complete()
-            elif popup := completer.popup():
-                popup.hide()
+        show_filtered_suggestions(selector, bool(matches and needle))
         self._refresh_bom_ready()
 
     def _row_enabled_changed(self, row: int, checked: bool) -> None:
@@ -5401,10 +5646,10 @@ class ScanPage(BasePage):
 
 
 class TransactionsPage(BasePage):
-    """库存流水查看页面。"""
+    """查看、更正和删除库存流水。"""
 
     def __init__(self, database: Database) -> None:
-        """构建只读库存流水表并立即加载当前记录。"""
+        """构建库存流水表并立即加载当前记录。"""
 
         super().__init__(database)
         layout = QVBoxLayout(self)
@@ -5435,14 +5680,19 @@ class TransactionsPage(BasePage):
         layout.addLayout(controls)
         layout.addWidget(self.date_range, alignment=Qt.AlignmentFlag.AlignLeft)
         self.filtered_rows: list[dict[str, Any]] = []
+        self.transaction_groups: dict[str, list[dict[str, Any]]] = {}
+        self.display_groups: dict[str, list[str]] = {}
         self.table = make_table(
-            ["展开", "时间", "类型", "元件 / 明细", "数量", "位置 / 仓库", "来源", "备注"]
+            ["展开", "时间", "类型", "元件 / 明细", "数量", "位置 / 仓库", "来源", "备注", "立创订单号"]
         )
         self.table.setSortingEnabled(False)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setWordWrap(False)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.open_context_menu)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for column, width in enumerate((45, 170, 120, 220, 65, 170, 115, 190)):
+        for column, width in enumerate((45, 170, 120, 220, 65, 170, 115, 190, 150)):
             self.table.setColumnWidth(column, width)
         layout.addWidget(self.table)
         self.refresh()
@@ -5451,8 +5701,7 @@ class TransactionsPage(BasePage):
     def _transaction_source(item: dict[str, Any]) -> str:
         source = str(item.get("source") or "")
         if source == "离线订单导入" or (
-            item["kind"] == "RECEIVE" and item.get("notes") == "离线订单导入"
-            and source.startswith("立创订单 ")
+            item["kind"] == "RECEIVE" and source == f"立创订单 {item.get('order_number')}"
         ):
             return "离线订单导入"
         kind = item["kind"]
@@ -5465,7 +5714,10 @@ class TransactionsPage(BasePage):
         platform = item.get("operation_platform")
         if not platform and source in {"手工入库", "手工出库"}:
             platform = "PC"
-        if platform and operation:
+        if platform and operation and (
+            not source or source in {f"扫码{operation}", f"手工{operation}", operation}
+            or kind in {"BOM_ISSUE", "BOM_PICK_ISSUE"}
+        ):
             if source in {f"扫码{operation}", f"手工{operation}"}:
                 operation = source
             return f"{platform}{operation}"
@@ -5473,12 +5725,10 @@ class TransactionsPage(BasePage):
 
     @staticmethod
     def _transaction_notes(item: dict[str, Any]) -> str:
-        if item.get("notes") == "离线订单导入" and str(item.get("source") or "").startswith("立创订单 "):
-            return str(item["source"])
         return str(item.get("notes") or "")
 
     def refresh(self) -> None:
-        """按事务组显示一次业务操作，详情按需展开且保持不可变流水。"""
+        """按事务组显示一次业务操作，详情按需展开。"""
 
         self.search_timer.stop()
         transactions = self.database.list_transactions(include_part_numbers=True)
@@ -5504,8 +5754,15 @@ class TransactionsPage(BasePage):
         bounds = self.date_range.bounds()
         terms = self.query.text().casefold().split()
         self.filtered_rows = []
+        self.transaction_groups.clear()
+        self.display_groups.clear()
         grouped: dict[str, list[dict[str, Any]]] = {}
         for item in transactions:
+            operation_id = str(item["group_id"])
+            display_id = str(item["display_group_id"])
+            if operation_id not in self.transaction_groups:
+                self.display_groups.setdefault(display_id, []).append(operation_id)
+            self.transaction_groups.setdefault(operation_id, []).append(item)
             if (kind and item["kind"] != kind) or (location_id and item["location_id"] != location_id):
                 continue
             if not date_matches(item["created_at"], bounds):
@@ -5515,7 +5772,7 @@ class TransactionsPage(BasePage):
                     *(str(item.get(field) or "") for field in (
                         "component_name", "lcsc_part_number", "manufacturer_part_number",
                         "custom_part_number", "warehouse_name", "location_name", "source",
-                        "notes", "kind", "group_id", "id", "lot_id",
+                        "notes", "order_number", "kind", "group_id", "id", "lot_id",
                     )),
                     self._transaction_source(item),
                     self._transaction_notes(item),
@@ -5523,12 +5780,13 @@ class TransactionsPage(BasePage):
                 if not all(term in search_text for term in terms):
                     continue
             self.filtered_rows.append(item)
-            grouped.setdefault(str(item["group_id"]), []).append(item)
+            grouped.setdefault(display_id, []).append(item)
         self.table.clearContents()
         self.table.setRowCount(0)
-        for group_id, items in grouped.items():
+        for index, (group_id, items) in enumerate(grouped.items(), start=1):
             summary_row = self.table.rowCount()
             self.table.insertRow(summary_row)
+            self.table.setVerticalHeaderItem(summary_row, QTableWidgetItem(str(index)))
             kinds = list(dict.fromkeys(str(item["kind"]) for item in items))
             sources = list(dict.fromkeys(
                 source for item in items if (source := self._transaction_source(item))
@@ -5574,6 +5832,7 @@ class TransactionsPage(BasePage):
                 next(iter(locations)) if len(locations) == 1 else f"{len(locations)} 个仓库",
                 "；".join(sources),
                 "；".join(notes),
+                "；".join(dict.fromkeys(str(order) for item in items if (order := item.get("order_number")))),
             ]
             for column, value in enumerate(summary[1:], start=1):
                 cell = QTableWidgetItem()
@@ -5582,6 +5841,8 @@ class TransactionsPage(BasePage):
                 else:
                     cell.setText(str(value))
                 cell.setBackground(QColor("#dceadf"))
+                if column == 1:
+                    cell.setData(Qt.ItemDataRole.UserRole, (group_id, None))
                 if column == 5:
                     if len(locations) == 1:
                         cell.setIcon(storage_icon(next(iter(locations.values()))))
@@ -5594,6 +5855,7 @@ class TransactionsPage(BasePage):
             for item in items if len(items) > 1 else []:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
+                self.table.setVerticalHeaderItem(row, QTableWidgetItem(""))
                 values = (
                     "",
                     item["created_at"],
@@ -5603,6 +5865,7 @@ class TransactionsPage(BasePage):
                     f"{item['warehouse_name']} / {item['location_name']}",
                     self._transaction_source(item),
                     self._transaction_notes(item),
+                    str(item.get("order_number") or ""),
                 )
                 for column, value in enumerate(values):
                     cell = QTableWidgetItem()
@@ -5611,6 +5874,8 @@ class TransactionsPage(BasePage):
                     else:
                         cell.setText(str(value))
                     cell.setBackground(QColor("#f7fbf8"))
+                    if column == 1:
+                        cell.setData(Qt.ItemDataRole.UserRole, (group_id, item["id"], item["group_id"]))
                     if column == 5:
                         cell.setIcon(storage_icon(item.get("color")))
                     self.table.setItem(row, column, cell)
@@ -5622,6 +5887,146 @@ class TransactionsPage(BasePage):
                         button, start, end, expanded
                     )
                 )
+
+    def open_context_menu(self, position: Any) -> None:
+        row = self.table.rowAt(position.y())
+        cell = self.table.item(row, 1) if row >= 0 else None
+        if cell is None:
+            return
+        data = cell.data(Qt.ItemDataRole.UserRole)
+        group_id, transaction_id = data[:2]
+        operation_ids = [data[2]] if transaction_id is not None else self.display_groups[group_id]
+        items = [item for operation_id in operation_ids for item in self.transaction_groups[operation_id]]
+        if not self.table.selectionModel().isRowSelected(row, QModelIndex()):
+            self.table.selectRow(row)
+        menu = QMenu(self)
+        edit_actions = {}
+        if transaction_id is not None or len(items) == 1:
+            item = next(item for item in items if transaction_id is None or item["id"] == transaction_id)
+            edit_actions[menu.addAction("修改流水…")] = item
+        else:
+            edit_menu = menu.addMenu("修改流水")
+            for item in items:
+                action = edit_menu.addAction(
+                    f"{item['component_name']} · {item['location_name']} · {item['quantity_delta']:+g}"
+                )
+                edit_actions[action] = item
+        delete_actions = {}
+        if len(operation_ids) == 1:
+            delete = menu.addAction("删除流水…" if len(items) == 1 else "删除整组流水…")
+            delete_actions[delete] = operation_ids[0]
+        else:
+            delete_menu = menu.addMenu("删除流水")
+            for operation_id in operation_ids:
+                item = self.transaction_groups[operation_id][0]
+                action = delete_menu.addAction(f"{item['created_at']} · {item['component_name']}")
+                delete_actions[action] = operation_id
+        merge_actions = self._add_group_actions(menu, group_id)
+        selected = menu.exec(self.table.viewport().mapToGlobal(position))
+        if selected in edit_actions:
+            self.edit_transaction(edit_actions[selected])
+        elif selected in delete_actions:
+            operation_id = delete_actions[selected]
+            self.delete_transaction_group(operation_id, self.transaction_groups[operation_id])
+        elif selected in merge_actions:
+            originals, replacements = merge_actions[selected]
+            try:
+                self.database.regroup_transactions(originals, replacements)
+            except DomainError as error:
+                self.show_error(str(error))
+            self.refresh()
+
+    def _add_group_actions(
+        self, menu: QMenu, display_id: str
+    ) -> dict[QAction, tuple[list[list[str]], list[list[str]]]]:
+        actions: dict[QAction, tuple[list[list[str]], list[list[str]]]] = {}
+        selected_headers = set()
+        selected_details: dict[str, set[str]] = {}
+        for index in self.table.selectionModel().selectedRows(1):
+            data = index.data(Qt.ItemDataRole.UserRole)
+            if len(data) == 2:
+                selected_headers.add(data[0])
+            else:
+                selected_details.setdefault(data[0], set()).add(data[2])
+        display_ids = list(self.display_groups)
+        if len(selected_headers) > 1:
+            positions = [index for index, key in enumerate(display_ids) if key in selected_headers]
+            if positions[-1] - positions[0] + 1 == len(positions):
+                groups = [self.display_groups[display_ids[index]] for index in positions]
+                actions[menu.addAction("合并所选连续流水组")] = (
+                    groups, [[operation for group in groups for operation in group]]
+                )
+        if selected_details:
+            originals = [self.display_groups[key] for key in selected_details]
+            remaining = [
+                run for key, selected in selected_details.items()
+                for run in self._split_display_group(self.display_groups[key], selected)
+            ]
+            detached = [operation for key in selected_details for operation in self.display_groups[key]
+                        if operation in selected_details[key]]
+            if any(len(group) > 1 for group in originals):
+                actions[menu.addAction("弹出所选流水")] = (originals, [*remaining, *([op] for op in detached)])
+        else:
+            keys = selected_headers or {display_id}
+            originals = [self.display_groups[key] for key in display_ids if key in keys]
+            remaining = []
+            detached = [operation for group in originals for operation in group]
+            if any(len(group) > 1 for group in originals):
+                actions[menu.addAction("拆分所选流水组")] = (originals, [[op] for op in detached])
+        order = {operation: index for index, operation in enumerate(self.transaction_groups)}
+        if detached:
+            targets = [key for key in display_ids if self.display_groups[key] not in originals]
+            if targets:
+                join_menu = menu.addMenu("将所选流水加入分组")
+                for key in targets:
+                    group = self.display_groups[key]
+                    item = self.transaction_groups[group[0]][0]
+                    action = join_menu.addAction(
+                        f"{item['created_at']} · {item['component_name']}（{len(group)} 笔）"
+                    )
+                    actions[action] = (
+                        [*originals, group],
+                        [*remaining, sorted([*detached, *group], key=order.__getitem__)],
+                    )
+        return actions
+
+    @staticmethod
+    def _split_display_group(group: list[str], selected: set[str]) -> list[list[str]]:
+        runs: list[list[str]] = []
+        current: list[str] = []
+        for operation in group:
+            if operation not in selected:
+                current.append(operation)
+            elif current:
+                runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        return runs
+
+    def edit_transaction(self, item: dict[str, Any]) -> None:
+        dialog = ComponentEditDialog(
+            self.database, item["component_id"], self, transaction=item
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+            self.changed.emit()
+
+    def delete_transaction_group(self, group_id: str, items: list[dict[str, Any]]) -> None:
+        if QMessageBox.question(
+            self, "删除库存流水",
+            f"将删除此次操作的全部 {len(items)} 条流水并回退相应库存。确定删除？",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.database.delete_transaction_group(
+                group_id, {item["id"]: item["quantity_delta"] for item in items}
+            )
+        except Exception as error:
+            self.show_error(str(error))
+            return
+        self.refresh()
+        self.changed.emit()
 
     def export_filtered(self) -> None:
         """导出当前筛选结果，保留折叠事务组中的匹配明细。"""
@@ -5897,6 +6302,28 @@ class SettingsPage(BasePage):
         backup_layout.addStretch()
         self.tabs.addTab(backup_tab, "备份与恢复")
 
+        normalization_tab = QWidget()
+        normalization_layout = QVBoxLayout(normalization_tab)
+        normalization_tip = QLabel(
+            "清理旧版元件的规格书链接后缀，以及名称、编号、别名、备注和类别参数等资料的首尾空白。"
+            "新保存的资料会自动处理。"
+        )
+        normalization_tip.setWordWrap(True)
+        normalize_button = QPushButton("规格化旧版元件资料")
+        normalize_button.clicked.connect(self.normalize_component_data)
+        normalization_layout.addWidget(normalization_tip)
+        normalization_layout.addWidget(normalize_button)
+        normalization_layout.addStretch()
+        self.tabs.addTab(normalization_tab, "数据规格化")
+
+        catalogs_tab = QWidget()
+        catalogs_layout = QVBoxLayout(catalogs_tab)
+        catalog_tabs = QTabWidget()
+        self.catalog_tables: dict[Catalog, QTreeWidget] = {}
+        self._add_catalog_tab(catalog_tabs, "marketplace", "立创商城元件")
+        self._add_catalog_tab(catalog_tabs, "user", "用户元件")
+        catalogs_layout.addWidget(catalog_tabs)
+
         matching_tab = QWidget()
         matching_layout = QVBoxLayout(matching_tab)
         self.jlc_updates = QCheckBox("启用从立创商城更新")
@@ -5934,7 +6361,11 @@ class SettingsPage(BasePage):
         self.debug_toggle.setChecked(bool(debug_enabled))
         debug_note = QLabel(
             "调试模式在源码运行时默认开启，在打包版本首次运行时默认关闭。开启后，"
-            "窗口左下角显示线程、摄像头与识别帧等运行信息。"
+            "窗口左下角显示线程、摄像头与识别帧等运行信息，并显示下方日志。"
+            "\n最近十分钟保留全部等级，更早的保留 Info、Warning、Error。"
+            "日志等级按钮只筛选显示；导出包含当前保留的全部日志。"
+            "\nDebug 记录排错细节，Info 记录操作结果，Warning 表示需要处理的异常情况，"
+            "Error 记录执行失败及异常堆栈。"
         )
         debug_note.setWordWrap(True)
 
@@ -5943,8 +6374,8 @@ class SettingsPage(BasePage):
         self.debug_output.setMaximumBlockCount(300)
         self.debug_output.setPlaceholderText("启用调试后在此显示日志事件")
         debug_buttons = QHBoxLayout()
-        selected_level = str(settings.value(LOG_LEVEL_SETTING, "INFO"))
-        self.debug_level = selected_level if selected_level in LOG_LEVELS else "INFO"
+        selected_level = str(settings.value(LOG_LEVEL_SETTING, "DEBUG"))
+        self.debug_level = selected_level if selected_level in LOG_LEVELS else "DEBUG"
         self.debug_level_button = QPushButton(f"日志等级 {self.debug_level}")
         level_menu = QMenu(self.debug_level_button)
         level_actions = QActionGroup(level_menu)
@@ -5963,9 +6394,12 @@ class SettingsPage(BasePage):
             lambda: QApplication.clipboard().setText(self.debug_output.toPlainText())
         )
         debug_buttons.addWidget(copy_debug)
+        export_logs = QPushButton("导出全部日志…")
+        export_logs.clicked.connect(self._export_debug_logs)
+        debug_buttons.addWidget(export_logs)
         debug_buttons.addStretch()
         if self.log_handler is not None:
-            self.log_handler.setLevel(LOG_LEVELS[self.debug_level])
+            self.log_handler.display_level = LOG_LEVELS[self.debug_level]
             self.log_handler.log_runtime_once(self._debug_runtime_text(self.log_handler.baseFilename))
             self.log_handler.events.appended.connect(
                 self._append_debug_event, Qt.ConnectionType.QueuedConnection
@@ -5973,7 +6407,12 @@ class SettingsPage(BasePage):
 
         def update_debug_mode(enabled: bool) -> None:
             settings.setValue("debug_mode", enabled)
+            self.debug_output.setVisible(enabled)
+            self.debug_level_button.setEnabled(enabled)
+            copy_debug.setEnabled(enabled)
+            export_logs.setEnabled(enabled)
             self.debug_mode_changed.emit(enabled)
+            logging.getLogger(__name__).info("调试日志显示已%s", "开启" if enabled else "关闭")
             if enabled:
                 self._load_debug_history()
 
@@ -5984,6 +6423,13 @@ class SettingsPage(BasePage):
         debug_layout.addWidget(QLabel("日志事件"))
         debug_layout.addWidget(self.debug_output, 1)
         self.tabs.addTab(debug_tab, "调试")
+        self.debug_output.setVisible(self.debug_toggle.isChecked())
+        for control in (self.debug_level_button, copy_debug, export_logs):
+            control.setEnabled(self.debug_toggle.isChecked())
+        self.debug_history_timer = QTimer(self)
+        self.debug_history_timer.setInterval(30_000)
+        self.debug_history_timer.timeout.connect(self._expire_debug_history)
+        self.debug_history_timer.start()
         if self.debug_toggle.isChecked():
             self._load_debug_history()
 
@@ -5997,6 +6443,8 @@ class SettingsPage(BasePage):
         description.setWordWrap(True)
         about_form.addRow("简介", description)
         self.tabs.addTab(about_tab, "关于")
+        self.tabs.addTab(catalogs_tab, "元件资料库")
+        self._refresh_catalog_tables()
 
     def _debug_runtime_text(self, log_path: str) -> str:
         """构建一次运行环境快照。"""
@@ -6015,7 +6463,7 @@ class SettingsPage(BasePage):
         self.debug_level_button.setText(f"日志等级 {level}")
         self.preferences.setValue(LOG_LEVEL_SETTING, level)
         if self.log_handler is not None:
-            self.log_handler.setLevel(LOG_LEVELS[level])
+            self.log_handler.display_level = LOG_LEVELS[level]
         if self.debug_toggle.isChecked():
             self._load_debug_history()
 
@@ -6026,7 +6474,7 @@ class SettingsPage(BasePage):
             return
         try:
             self._last_log_sequence, history = self.log_handler.snapshot()
-        except OSError as error:
+        except (OSError, sqlite3.Error) as error:
             history = self.log_handler.format(
                 logging.LogRecord("日志", logging.WARNING, "", 0, "日志暂不可读: %s", (error,), None)
             )
@@ -6042,6 +6490,29 @@ class SettingsPage(BasePage):
             if level >= LOG_LEVELS[self.debug_level]:
                 self.debug_output.appendPlainText(event)
 
+    def _expire_debug_history(self) -> None:
+        if self.debug_toggle.isChecked() and self.debug_level == "DEBUG":
+            scrollbar = self.debug_output.verticalScrollBar()
+            position = scrollbar.value()
+            follows_end = position == scrollbar.maximum()
+            self._load_debug_history()
+            if not follows_end:
+                scrollbar.setValue(position)
+
+    def _export_debug_logs(self) -> None:
+        if self.log_handler is None:
+            self.show_error("日志服务尚未启用")
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "导出全部日志", "component-library-logs.log", "日志文件 (*.log)"
+        )
+        if filename:
+            try:
+                self.log_handler.export(Path(filename))
+                self.show_info(f"日志已导出到 {filename}")
+            except Exception as error:
+                self.show_error(f"导出日志失败：{error}")
+
     def backup(self) -> None:
         """让用户选择目录并创建数据库快照。"""
 
@@ -6052,6 +6523,118 @@ class SettingsPage(BasePage):
                 self.show_info(f"备份已创建：\n{result['path']}")
             except Exception as error:
                 self.show_error(str(error))
+
+    def normalize_component_data(self) -> None:
+        try:
+            count = self.database.normalize_component_data()
+        except Exception as error:
+            self.show_error(str(error))
+            return
+        if count:
+            self.changed.emit()
+        self.show_info(f"已规格化 {count} 条元件资料。" if count else "没有需要规格化的元件资料。")
+
+    def _add_catalog_tab(self, tabs: QTabWidget, catalog: Catalog, title: str) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["立创大类 / 子类 / 元件"])
+        self.catalog_tables[catalog] = tree
+        layout.addWidget(tree)
+        controls = QHBoxLayout()
+        view = QPushButton("查看")
+        edit = QPushButton("编辑")
+        view.setEnabled(False)
+        edit.setEnabled(False)
+
+        def open_entry(read_only: bool, item: QTreeWidgetItem | None = None) -> None:
+            entry = item if item is not None else tree.currentItem()
+            if entry is None or not (component_id := entry.data(0, Qt.ItemDataRole.UserRole)):
+                return
+            try:
+                dialog = ComponentEditDialog(
+                    self.database, str(component_id), self, catalog=catalog, read_only=read_only
+                )
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    self.refresh()
+                    self.changed.emit()
+            except DomainError as error:
+                self.show_error(error.message)
+
+        def update_actions() -> None:
+            selected = tree.currentItem()
+            enabled = selected is not None and bool(selected.data(0, Qt.ItemDataRole.UserRole))
+            view.setEnabled(enabled)
+            edit.setEnabled(enabled)
+
+        tree.currentItemChanged.connect(update_actions)
+        tree.itemDoubleClicked.connect(lambda item, _column: open_entry(True, item))
+        view.clicked.connect(lambda: open_entry(True))
+        edit.clicked.connect(lambda: open_entry(False))
+        controls.addWidget(view)
+        controls.addWidget(edit)
+        import_button = QPushButton("导入资料库…")
+        export_button = QPushButton("导出资料库…")
+        import_button.clicked.connect(lambda: self._transfer_catalog(catalog, title, export=False))
+        export_button.clicked.connect(lambda: self._transfer_catalog(catalog, title, export=True))
+        controls.addWidget(import_button)
+        controls.addWidget(export_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+        tabs.addTab(tab, title)
+
+    def _refresh_catalog_tables(self) -> None:
+        for catalog, table in self.catalog_tables.items():
+            expanded: set[tuple[str, ...]] = set()
+            for index in range(table.topLevelItemCount()):
+                top = table.topLevelItem(index)
+                if top is None:
+                    continue
+                if top.isExpanded():
+                    expanded.add((top.text(0),))
+                for child_index in range(top.childCount()):
+                    subcategory_item = top.child(child_index)
+                    if subcategory_item is not None and subcategory_item.isExpanded():
+                        expanded.add((top.text(0), subcategory_item.text(0)))
+            table.clear()
+            parents: dict[str, QTreeWidgetItem] = {}
+            groups: dict[tuple[str, str], QTreeWidgetItem] = {}
+            for entry in self.database.list_catalog(catalog):
+                category, child = catalog_category_path(entry["category"])
+                path = (category, child)
+                if category not in parents:
+                    parents[category] = QTreeWidgetItem(table, [category])
+                    parents[category].setExpanded((category,) in expanded)
+                if path not in groups:
+                    groups[path] = QTreeWidgetItem(parents[category], [child])
+                    groups[path].setExpanded(path in expanded)
+                leaf = QTreeWidgetItem(groups[path], [entry["name"]])
+                leaf.setData(0, Qt.ItemDataRole.UserRole, entry["id"])
+            table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+    def _transfer_catalog(self, catalog: Catalog, title: str, *, export: bool) -> None:
+        if export:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, f"导出{title}", f"{title}.db", "SQLite (*.db)"
+            )
+        else:
+            filename, _ = QFileDialog.getOpenFileName(self, f"导入{title}", "", "SQLite (*.db)")
+        if not filename:
+            return
+        path = Path(filename)
+        try:
+            if export:
+                if not path.suffix:
+                    path = path.with_suffix(".db")
+                count = self.database.export_catalog(catalog, path)
+            else:
+                count = self.database.import_catalog(catalog, path)
+                self._refresh_catalog_tables()
+                self.changed.emit()
+        except Exception as error:
+            self.show_error(str(error))
+            return
+        self.show_info(f"已{'导出' if export else '导入'} {count} 条元件资料。")
 
     def restore(self) -> None:
         """校验备份并暂存到下次启动。"""
@@ -6157,7 +6740,7 @@ class SettingsPage(BasePage):
         self.match_status.clear()
         self.stop_jlc_background()
         if available and self.auto_match.isChecked():
-            self.match_timer.start(random.randint(1_000, 60_000))
+            self.match_timer.start(random.randint(25_000, 35_000))
 
     def stop_jlc_background(self) -> None:
         self.match_timer.stop()
@@ -6168,8 +6751,13 @@ class SettingsPage(BasePage):
     def _match_tick(self) -> None:
         if not (self.jlc_updates.isChecked() and self.auto_match.isChecked()):
             return
-        self.match_timer.start(60_000)
-        if self._match_browser is not None or not random.getrandbits(1):
+        self.match_timer.start(random.randint(25_000, 35_000))
+        should_visit = random.random() < 0.30
+        logging.getLogger(__name__).debug(
+            "后台匹配抽签；下一次间隔=%d 毫秒；本次访问=%s；已有读取任务=%s",
+            self.match_timer.interval(), should_visit, self._match_browser is not None,
+        )
+        if self._match_browser is not None or not should_visit:
             return
         try:
             target = self.database.next_unmatched_jlc_component(self._match_cursor)
@@ -6180,13 +6768,15 @@ class SettingsPage(BasePage):
             self.match_status.setText("没有待匹配的立创元件")
             return
         self._match_cursor = target["id"]
-        part_number = target["lcsc_part_number"].upper()
+        part_number = (target["lcsc_part_number"] or "").strip().upper()
         browser = JlcBackgroundBrowser(part_number, target["product_url"] or "", self.window())
         self._match_browser = browser
         browser.succeeded.connect(self._background_product_read)
         browser.failed.connect(self._background_product_failed)
         self._increment_match_stat("attempts")
-        self.match_status.setText(f"正在匹配 {part_number}")
+        label = part_number or target["name"]
+        self.match_status.setText(f"正在匹配 {label}")
+        logging.getLogger(__name__).info("开始补充立创元件资料；元件=%s", label)
         browser.start()
 
     @Slot(object)
@@ -6202,7 +6792,9 @@ class SettingsPage(BasePage):
             return
         if matched:
             self._increment_match_stat("successes")
+            self._refresh_catalog_tables()
             self.match_status.setText(f"已匹配 {draft.lcsc_part_number}")
+            logging.getLogger(__name__).info("立创元件资料匹配完成；立创编号=%s", draft.lcsc_part_number)
             self.background_match_changed.emit()
         else:
             self.match_status.setText("元件资料已变化，已跳过本次结果")
@@ -6222,7 +6814,14 @@ class SettingsPage(BasePage):
     def _update_match_stats(self) -> None:
         attempts = self.preferences.value("matching/browser_attempts", 0, type=int)
         successes = self.preferences.value("matching/browser_successes", 0, type=int)
-        self.match_stats.setText(f"商城自动匹配次数 {attempts}　成功次数 {successes}")
+        remaining, eligible = self.database.jlc_match_counts()
+        self.match_stats.setText(
+            f"剩余未匹配 {remaining}　可匹配 {eligible}\n商城自动匹配次数 {attempts}　成功次数 {successes}"
+        )
+
+    def refresh(self) -> None:
+        self._update_match_stats()
+        self._refresh_catalog_tables()
 
 
 class MainWindow(QMainWindow):

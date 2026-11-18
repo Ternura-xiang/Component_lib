@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from dataclasses import dataclass
 from importlib import resources
@@ -16,6 +17,9 @@ from typing import Any
 
 from .label_parser import merge_fields, parse_label_text, parse_ocr_lines, parse_qr_payload
 from .models import LabelDraft, OcrLine
+from .operation_log import log_operation
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -70,6 +74,7 @@ class RecognitionEngine:
             return {"available": False, "model_version": self.model_version, "error": str(error)}
         return {"available": True, "model_version": self.model_version, "backend": "onnxruntime"}
 
+    @log_operation("识别标签图片")
     def analyze(self, image_bytes: bytes) -> LabelDraft:
         """识别一张袋贴图片并生成需要人工确认的结构化草稿。
 
@@ -87,6 +92,7 @@ class RecognitionEngine:
         encoded = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
         if image is None:
+            logger.warning("标签图片无法解码，请重新拍摄或选择有效图片")
             return LabelDraft(warnings=["图片无法解码"])
         image = self._resize(image, 1600)
         quality = self._quality(image)
@@ -113,6 +119,13 @@ class RecognitionEngine:
         if barcode_payload and not barcode_fields:
             warnings.append("检测到条码，但内容不是已知袋贴格式")
         annotated = self._annotated_png(recognized_image, lines)
+        logger.info("标签识别得到 %d 个字段，%d 项需要核对", len(fields), len(warnings))
+        for warning in warnings:
+            logger.warning("标签识别提示：%s", warning)
+        logger.debug(
+            "标签识别细节；预处理=%s；文字行数=%d；图像质量=%s；模型=%s",
+            branch, len(lines), quality, self.model_version,
+        )
         return LabelDraft(
             fields=fields,
             ocr_lines=lines,
@@ -158,7 +171,12 @@ class RecognitionEngine:
         if center.size:
             prepared.append(PreparedImage("camera-center", center))
         prepared.extend(self._prepare_variants(image))
-        return self._decode_barcodes(prepared, qr_only=True)
+        payload = self._decode_barcodes(prepared, qr_only=True)
+        logger.debug(
+            "摄像头帧解码结束；分辨率=%dx%d；候选图像=%d；识别到条码=%s",
+            width, height, len(prepared), payload is not None,
+        )
+        return payload
 
     @staticmethod
     def _resize(image: Any, maximum: int) -> Any:
@@ -341,6 +359,7 @@ class RecognitionEngine:
                     raw = engine(current)
                     lines = self._coerce_rapidocr(raw)
                 except Exception:
+                    logger.debug("OCR 预处理分支识别失败；分支=%s；旋转=%d", branch.name, turns * 90, exc_info=True)
                     lines = []
                 score = sum(line.confidence for line in lines) + min(len(lines), 20) * 0.05
                 if score > best_score:

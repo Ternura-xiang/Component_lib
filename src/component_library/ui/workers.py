@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -35,8 +37,20 @@ class Worker(QRunnable):
         """执行任务；不得从工作线程直接操作 QWidget。"""
 
         try:
+            started = time.perf_counter()
+            logging.getLogger(__name__).debug(
+                "后台任务开始；入口=%s",
+                getattr(self.function, "__qualname__", type(self.function).__name__),
+            )
             self.signals.succeeded.emit(self.function())
+            logging.getLogger(__name__).debug(
+                "后台任务完成；耗时=%d 毫秒", round((time.perf_counter() - started) * 1000)
+            )
         except Exception as error:  # 界面边界必须把任意库异常变成可见错误。
+            if isinstance(error, ValueError) or hasattr(error, "code"):
+                logging.getLogger(__name__).warning("后台任务未完成：%s", error)
+            else:
+                logging.getLogger(__name__).exception("后台任务失败：%s", error)
             self.signals.failed.emit(str(error))
         finally:
             self.signals.finished.emit()

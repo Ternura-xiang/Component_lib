@@ -2,10 +2,12 @@
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from component_library.database import Database, DomainError
+from component_library.datasheet import jlc_datasheet_url
 from component_library.jlc_product import (
     find_jlc_product_link,
     is_blocked_jlc_navigation,
@@ -13,6 +15,7 @@ from component_library.jlc_product import (
     parse_jlc_product_page,
 )
 from component_library.models import ComponentCreate
+from component_library.ui.jlc_browser import JlcBackgroundBrowser
 
 PRODUCT_HTML = """
 <html><head>
@@ -52,7 +55,7 @@ def test_parse_rendered_product_page_without_network() -> None:
     assert draft.brand == "FOJAN 丰甲"
     assert draft.package == "0402"
     assert draft.category == "贴片电阻"
-    assert draft.datasheet_url and draft.datasheet_url.endswith("C270654.pdf")
+    assert draft.datasheet_url == "https://item.szlcsc.com/datasheet/FRC0402F91R0TS/123456.html"
     groups = {group.name: group for group in draft.parameter_groups}
     assert [item.label for item in groups["基础参数"].parameters] == [
         "商品封装",
@@ -65,6 +68,56 @@ def test_parse_rendered_product_page_without_network() -> None:
     assert "页面库存" not in labels
     assert "替代型号" not in labels
     assert "推荐商品" not in labels
+
+
+def test_datasheet_url_uses_product_id_and_encodes_model() -> None:
+    assert jlc_datasheet_url(
+        " https://item.szlcsc.com/461952.html?fromZone=search ", " PBHV8215Z,115 "
+    ) == "https://item.szlcsc.com/datasheet/PBHV8215Z%2C115/461952.html"
+    assert jlc_datasheet_url("https://item.szlcsc.com/product/C270654.html", "型号") is None
+    assert jlc_datasheet_url("https://example.com/461952.html", "型号") is None
+    assert jlc_datasheet_url("https://item.szlcsc.com/mro/5748338.html?fromZone=search", "LRS-75-36") == (
+        "https://item.szlcsc.com/datasheet/LRS-75-36/5748338.html"
+    )
+
+
+def test_link_only_background_match_and_saved_identity(tmp_path: Path) -> None:
+    url = "https://item.szlcsc.com/123456.html?fromZone=search"
+    database = Database(tmp_path / "inventory.db")
+    database.create_component(ComponentCreate(name="没有匹配来源", custom_part_number="manual"))
+    item = database.create_component(ComponentCreate(name="链接元件", product_url=url))
+    assert database.jlc_match_counts() == (2, 1)
+    assert database.next_unmatched_jlc_component("")["id"] == item["id"]
+    drafts = []
+    browser = SimpleNamespace(
+        _done=False, _stop_scheduled=False, _navigation=SimpleNamespace(isActive=lambda: False),
+        _product_key="123456", part_number="", cancel=lambda: None,
+        succeeded=SimpleNamespace(emit=drafts.append), _fail=pytest.fail,
+    )
+    JlcBackgroundBrowser._parse(browser, url, PRODUCT_HTML)
+    assert len(drafts) == 1
+    assert database.apply_jlc_product_match(item["id"], drafts[0])
+    assert database.get_component(item["id"])["lcsc_part_number"] == "C270654"
+    assert database.jlc_match_counts() == (1, 0)
+    assert database.next_unmatched_jlc_component("") is None
+
+
+def test_parse_mro_product_page() -> None:
+    html = """
+    <meta property="og:product:brand" content="MW(明纬)">
+    <h1>MW(明纬)LRS-75-36 2.1A36V 工业电源</h1>
+    <dl><div><dt>商品型号</dt><dd>LRS-75-36</dd></div>
+    <div><dt>商品编号</dt><dd>C5138095</dd></div></dl>
+    <h2>商品参数</h2><div>参数完善中</div>
+    <h2>相关推荐</h2><dl><dt>封装</dt><dd>其他元件封装</dd></dl>
+    """
+    draft = parse_jlc_product_page(
+        "https://item.szlcsc.com/mro/5748338.html", html, require_page_number=True
+    )
+    assert (draft.name, draft.lcsc_part_number, draft.brand) == ("LRS-75-36", "C5138095", "MW(明纬)")
+    assert draft.category == "工业品"
+    assert draft.package is None
+    assert not draft.parameter_groups
 
 
 def test_online_product_matches_exact_component_and_preserves_existing_fields(tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .database import Database, DomainError, utc_now
+from .operation_log import log_operation
 
 MIN_INTERVAL_SECONDS = 30
 DAILY_LIMIT = 20
@@ -39,6 +40,7 @@ class PublicWebEnricher:
 
         self.database = database
 
+    @log_operation("读取公开商品资料")
     def preview(self, raw_url: str) -> dict[str, Any]:
         """读取一个用户明确指定的公开产品页并提取元数据。
 

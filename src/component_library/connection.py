@@ -6,6 +6,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import secrets
 import socket
 import threading
@@ -17,6 +18,7 @@ from typing import Any, cast
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 
 from .database import Database, DomainError, utc_now
+from .operation_log import log_operation
 
 # DNS-SD 的服务类型标签（不含开头下划线）最多 15 字节。
 # `component-library` 超出限制，因此协议统一使用较短的 componentlib。
@@ -196,6 +198,7 @@ class ConnectionManager:
         image.save(output, format="PNG")
         return output.getvalue()
 
+    @log_operation("配对移动设备")
     def pair(self, code: str, name: str, device_type: str, client_version: str) -> dict[str, Any]:
         """消费一次性配对码并返回只展示一次的设备令牌。"""
 
@@ -279,6 +282,7 @@ class ConnectionManager:
                 (version, utc_now(), device_id),
             )
 
+    @log_operation("移除配对设备")
     def delete(self, device_id: str) -> None:
         """永久删除配对设备及其令牌；删除后手机必须重新配对。"""
 
@@ -294,6 +298,7 @@ class ConnectionManager:
 
         addresses = self.addresses()
         if not addresses:
+            logging.getLogger(__name__).warning("没有可用的局域网地址，手机自动发现暂未启动")
             return
         from zeroconf import ServiceInfo, Zeroconf
 
@@ -307,7 +312,9 @@ class ConnectionManager:
             server=f"{self.service_name}.",
         )
         self._zeroconf.register_service(self._service_info)
+        logging.getLogger(__name__).info("手机局域网自动发现已启动")
 
+    @log_operation("停止局域网设备发现")
     def stop_discovery(self) -> None:
         if self._zeroconf and self._service_info:
             self._zeroconf.unregister_service(self._service_info)

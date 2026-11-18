@@ -9,7 +9,7 @@ from threading import Thread
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QDate, QObject, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QObject, QPoint, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -38,6 +38,7 @@ from component_library.jlc_product import parse_jlc_product_page
 from component_library.models import (
     BomInputRow,
     ComponentCreate,
+    IssueRequest,
     JlcParameter,
     JlcParameterGroup,
     LocationCreate,
@@ -60,6 +61,35 @@ from component_library.ui.main_window import (
     WheelSafeComboBox,
     default_debug_mode,
 )
+
+
+def stock_component(database: Database, component_id: str) -> None:
+    warehouse = database.create_warehouse(WarehouseCreate(name="测试位置"))
+    location = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="测试仓库"))
+    database.receive(ReceiveRequest(component_id=component_id, location_id=location["id"], quantity=1))
+
+
+def test_inventory_removes_depleted_components_and_reappears_on_receive(
+    qtbot: Any, tmp_path: Path
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="元件"))
+    page = InventoryPage(database)
+    qtbot.addWidget(page)
+    assert page.table.rowCount() == 0
+    stock_component(database, component["id"])
+    page.refresh()
+    assert page.table.rowCount() == 1
+    location_id = database.list_locations()[0]["id"]
+    operation = database.issue(
+        IssueRequest(component_id=component["id"], location_id=location_id, quantity=1)
+    )
+    page.refresh()
+    assert page.table.rowCount() == 0
+    assert database.get_catalog_component("user", component["id"])["name"] == "元件"
+    database.reverse_group(operation["transaction_group_id"], "撤销出库")
+    page.refresh()
+    assert page.table.rowCount() == 1
 
 
 def test_main_window_builds(qtbot: Any, tmp_path: Path) -> None:
@@ -126,10 +156,13 @@ def test_leaving_receive_scan_stops_camera(
     assert stopped == [True]
 
 
-def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
+def test_receive_actions_and_settings_tabs(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """入库页只保留商城选择和扫描入口，设置包含备份与关于。"""
 
-    window = MainWindow(Database(tmp_path / "inventory.db"), RecognitionEngine(), "token")
+    database = Database(tmp_path / "inventory.db")
+    window = MainWindow(database, RecognitionEngine(), "token")
     qtbot.addWidget(window)
     button_texts = {button.text() for button in window.receive_page.findChildren(QPushButton)}
     assert "从立创商城选择" in button_texts
@@ -137,12 +170,22 @@ def test_receive_actions_and_settings_tabs(qtbot: Any, tmp_path: Path) -> None:
     assert "扫描 / 图片识别入库" in button_texts
     assert not any("匿名临时浏览器" in text for text in button_texts)
     assert not any("剪贴板" in text for text in button_texts)
+    settings_tabs = window.settings_page.tabs
     assert [
-        window.settings_page.tabs.tabText(index)
-        for index in range(window.settings_page.tabs.count())
-    ] == ["连接信息", "备份与恢复", "资料匹配", "调试", "关于"]
+        settings_tabs.tabText(index) for index in range(settings_tabs.count())
+    ] == ["连接信息", "备份与恢复", "数据规格化", "资料匹配", "调试", "关于", "元件资料库"]
+    normalize = settings_tabs.widget(2).findChild(QPushButton)
+    messages: list[str] = []
+    monkeypatch.setattr(window.settings_page, "show_info", messages.append)
+    component = database.create_component(ComponentCreate(name="芯片"))
+    with database.write() as connection:
+        connection.execute("UPDATE components SET name=' 芯片 ' WHERE id=?", (component["id"],))
+    with qtbot.waitSignal(window.settings_page.changed):
+        normalize.click()
+    assert database.get_component(component["id"])["name"] == "芯片"
+    assert messages == ["已规格化 1 条元件资料。"]
     about_labels = {
-        label.text() for label in window.settings_page.tabs.widget(4).findChildren(QLabel)
+        label.text() for label in settings_tabs.widget(5).findChildren(QLabel)
     }
     assert "Ternura_xiang" in about_labels
     assert __version__ in about_labels
@@ -289,6 +332,8 @@ def test_issue_search_generates_stock_locations(qtbot: Any, tmp_path: Path) -> N
     issue_page.search.setText("SOD-323")
     assert not issue_page.component.isHidden()
     assert not issue_page.component_label.isHidden()
+    assert issue_page.component.currentData() is None
+    issue_page.component.setCurrentIndex(0)
     assert issue_page.component.currentData() == component["id"]
     assert issue_page.location.currentText() == ""
     assert issue_page.location.itemText(1) == "主柜 / B04（20）"
@@ -309,6 +354,10 @@ def test_manual_issue_clears_parameters_after_success(
     issue = window.issue_page
     monkeypatch.setattr(issue, "show_info", lambda _message: None)
     issue.search.setText("手工出库元件")
+    issue.component.setCurrentIndex(0)
+    assert issue.quantity.value() == 1
+    issue.quantity_max.click()
+    assert issue.quantity.value() == 5
     issue.quantity.setValue(2)
     issue.notes.setText("测试用途")
     issue.submit()
@@ -494,7 +543,8 @@ def test_receive_name_matching_and_category_group(qtbot: Any, tmp_path: Path) ->
     receive._name_edited("测试")
     receive.name.setEditText("测试")
     assert receive.name.count() == 1
-    assert "主柜/B04(5)" in receive.name.itemText(0)
+    assert receive.name.itemText(0) == "测试二极管（user） · 品牌A · SOD-323"
+    assert receive.name.currentIndex() == -1
     assert receive.position.currentData() == position["id"]
     assert receive.location.currentData() == location["id"]
     receive.name.setCurrentIndex(0)
@@ -591,9 +641,12 @@ def test_inventory_context_delete_path_uses_safe_delete(
     qtbot: Any, tmp_path: Path, monkeypatch: Any
 ) -> None:
     database = Database(tmp_path / "inventory.db")
-    database.create_component(ComponentCreate(name="可删除元件"))
+    component = database.create_component(ComponentCreate(name="可删除元件"))
+    stock_component(database, component["id"])
     window = MainWindow(database, RecognitionEngine(), "token")
     qtbot.addWidget(window)
+    # 列表刷新前库存刚好归零，原行仍可按既有安全删除入口归档。
+    database.issue(IssueRequest(component_id=component["id"], quantity=1))
     monkeypatch.setattr(
         QMessageBox,
         "question",
@@ -968,7 +1021,8 @@ def test_transactions_merge_group_and_expand_details(
     )
     assert "展开" not in table.item(grouped_summary, 3).text()
     assert table.item(grouped_summary, 6).text() == "离线订单导入"
-    assert "SO26111000002" in table.item(grouped_summary, 7).text()
+    assert table.item(grouped_summary, 7).text() == ""
+    assert table.item(grouped_summary, 8).text() == "SO26111000002"
     toggle = table.cellWidget(grouped_summary, 0)
     assert isinstance(toggle, QToolButton)
     assert table.isRowHidden(grouped_summary + 1)
@@ -991,6 +1045,109 @@ def test_transactions_merge_group_and_expand_details(
     with destination.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert [(row["立创编号"], row["数量变动"]) for row in rows] == [("C9000002", "2")]
+
+    class DeleteMenu(QMenu):
+        def exec(self, *_: Any) -> Any:
+            return next(action for action in self.actions() if action.text() == "删除整组流水…")
+
+    monkeypatch.setattr(main_window_module, "QMenu", DeleteMenu)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Yes)
+    page.open_context_menu(QPoint(70, table.rowViewportPosition(0) + 2))
+    assert [item["component_name"] for item in database.list_transactions()] == ["元件一"]
+    assert [item["quantity"] for item in database.list_stock()] == [1]
+    assert not database.imported_order_keys()
+
+
+def test_transaction_context_menu_edits_quantity(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="芯片"))
+    warehouse = database.create_warehouse(WarehouseCreate(name="主位置"))
+    location = database.create_location(LocationCreate(warehouse_id=warehouse["id"], name="A01"))
+    database.receive(
+        ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=5)
+    )
+    page = main_window_module.TransactionsPage(database)
+    qtbot.addWidget(page)
+
+    def confirm(dialog: ComponentEditDialog) -> int:
+        dialog.transaction_quantity.setText("7")
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save).click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec", confirm)
+    class EditMenu(QMenu):
+        def exec(self, *_: Any) -> Any:
+            return self.actions()[0]
+
+    monkeypatch.setattr(main_window_module, "QMenu", EditMenu)
+    with qtbot.waitSignal(page.changed):
+        page.open_context_menu(QPoint(70, 2))
+    assert page.table.item(0, 4).text() == "7"
+    assert database.list_stock()[0]["quantity"] == 7
+
+
+def test_component_parameter_editor_refreshes_inventory_and_keeps_catalog_original(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(name="LED", category="LED", jlc_matched=True))
+    database.save_component_parameter_groups(component["id"], [
+        JlcParameterGroup(name="电气参数", parameters=[
+            JlcParameter(key="forward_voltage", label="正向压降", value="1.2V"),
+        ]),
+    ], marketplace=True)
+    stock_component(database, component["id"])
+    window = MainWindow(database, RecognitionEngine(), "token")
+    qtbot.addWidget(window)
+    page = window.inventory_page
+
+    def confirm(dialog: ComponentEditDialog) -> int:
+        dialog.parameter_fields["forward_voltage"][1].setText("2.4V")
+        dialog.save()
+        return dialog.result()
+
+    monkeypatch.setattr(ComponentEditDialog, "exec", confirm)
+    with qtbot.waitSignal(page.changed):
+        page.edit_component(0, 8)
+    assert page.table.item(0, 8).text() == "正向压降: 2.4V"
+    assert database.list_components()[0]["user_catalog"] == 1
+    export = tmp_path / "marketplace.db"
+    database.export_catalog("marketplace", export)
+    imported = Database(tmp_path / "imported.db")
+    imported.import_catalog("marketplace", export)
+    assert imported.get_component(component["id"])["specification"] == "正向压降: 1.2V"
+
+
+def test_catalog_hierarchy_and_marketplace_edit_confirmation(
+    qtbot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "inventory.db")
+    component = database.create_component(ComponentCreate(
+        name="商城名称", category="贴片电阻", jlc_matched=True,
+    ))
+    settings = SettingsPage(database, "token")
+    qtbot.addWidget(settings)
+    tree = settings.catalog_tables["marketplace"]
+    top = tree.topLevelItem(0)
+    assert top.text(0) == "电阻"
+    child = top.child(0)
+    assert child.text(0) == "贴片电阻"
+    assert child.child(0).text(0) == "商城名称"
+
+    component_id = component["id"]
+    dialog = ComponentEditDialog(database, component_id, settings, catalog="marketplace")
+    qtbot.addWidget(dialog)
+    dialog.name.setText("用户名称")
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.No)
+    dialog.save()
+    assert database.list_catalog("user") == []
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Yes)
+    dialog.save()
+    assert database.get_catalog_component("marketplace", component_id)["name"] == "商城名称"
+    assert database.get_catalog_component("user", component_id)["name"] == "用户名称"
+    assert database.get_component(component_id)["name"] == "用户名称"
 
 
 def test_inventory_facets_and_purchase_dates_filter_batches(qtbot: Any, tmp_path: Path) -> None:
@@ -1136,7 +1293,7 @@ def test_debug_log_appends_and_follows_only_at_end(
         page = SettingsPage(Database(tmp_path / "inventory.db"), "token", log_handler=handler)
         qtbot.addWidget(page)
         page.resize(700, 420)
-        page.tabs.setCurrentIndex(3)
+        page.tabs.setCurrentIndex(4)
         page.show()
         scrollbar = page.debug_output.verticalScrollBar()
         qtbot.waitUntil(lambda: scrollbar.maximum() > 5)
@@ -1174,9 +1331,10 @@ def test_debug_log_appends_and_follows_only_at_end(
         logger.error("错误首行\n错误续行")
         qtbot.waitUntil(lambda: "[ERROR][test.debug] 错误续行" in page.debug_output.toPlainText())
         assert "重新启用后的事件" not in page.debug_output.toPlainText()
-        assert "低于最低等级" not in path.read_text(encoding="utf-8")
+        assert "低于最低等级" in path.read_text(encoding="utf-8")
         assert preferences.value("debug/log_level") == "WARNING"
         next(action for action in menu.actions() if action.text() == "DEBUG").trigger()
+        assert "低于最低等级" in page.debug_output.toPlainText()
         logger.debug("调试级事件")
         qtbot.waitUntil(lambda: "[DEBUG][test.debug] 调试级事件" in page.debug_output.toPlainText())
     finally:
@@ -1195,6 +1353,7 @@ def test_maintenance_settings_match_backup_and_require_exact_reset_confirmation(
             JlcParameter(key="purchase_price", label="购入单价", value="0.125"),
         ]),
     ])
+    stock_component(database, item["id"])
     window = MainWindow(database, RecognitionEngine(), "token")
     qtbot.addWidget(window)
     page = window.settings_page
@@ -1224,21 +1383,24 @@ def test_maintenance_settings_match_backup_and_require_exact_reset_confirmation(
     assert inventory_page.table.item(0, price_column).data(Qt.ItemDataRole.DisplayRole) == 0.125
     assert not page.match_timer.isActive()
     page.auto_match.setChecked(True)
-    assert 1_000 <= page.match_timer.interval() <= 60_000
+    assert 25_000 <= page.match_timer.interval() <= 35_000
     assert page.match_status.text() == ""
-    monkeypatch.setattr(main_window_module.random, "getrandbits", lambda _bits: 0)
+    times = iter([25_000, 35_000, 28_000, 30_000])
+    monkeypatch.setattr(main_window_module.random, "randint", lambda _start, _end: next(times, 30_000))
+    monkeypatch.setattr(main_window_module.random, "random", lambda: 0.30)
     page._match_tick()
     assert database.get_component(item["id"])["jlc_matched"] == 0
-    assert page.match_timer.interval() == 60_000
-    monkeypatch.setattr(main_window_module.random, "getrandbits", lambda _bits: 1)
+    assert page.match_timer.interval() == 25_000
+    monkeypatch.setattr(main_window_module.random, "random", lambda: 0.29)
     page._match_tick()
+    assert page.match_timer.interval() == 35_000
     assert len(browsers) == 1 and browsers[0].part_number == "C270654"
     page._match_tick()
     assert len(browsers) == 1
     browsers[0].succeeded.emit(parse_jlc_product_page("https://item.szlcsc.com/12345.html", PRODUCT_HTML))
     assert database.get_component(item["id"])["jlc_matched"] == 1
     page._match_tick()
-    assert page.match_stats.text() == "商城自动匹配次数 1　成功次数 1"
+    assert page.match_stats.text() == "剩余未匹配 0　可匹配 0\n商城自动匹配次数 1　成功次数 1"
     assert preferences.value("matching/browser_attempts", type=int) == 1
     assert preferences.value("matching/browser_successes", type=int) == 1
 
@@ -1308,6 +1470,7 @@ def test_inline_cell_editing_saves_on_finish(qtbot: Any, tmp_path: Path) -> None
     component = database.create_component(ComponentCreate(name="旧名称"))
     position = database.create_warehouse(WarehouseCreate(name="主位置"))
     location = database.create_location(LocationCreate(warehouse_id=position["id"], name="旧仓库"))
+    database.receive(ReceiveRequest(component_id=component["id"], location_id=location["id"], quantity=1))
     window = MainWindow(database, RecognitionEngine(), "token")
     qtbot.addWidget(window)
 
@@ -1359,6 +1522,7 @@ def test_inline_cell_editing_cancel_restores_original(qtbot: Any, tmp_path: Path
 
     database = Database(tmp_path / "inventory.db")
     component = database.create_component(ComponentCreate(name="原名称"))
+    stock_component(database, component["id"])
     window = MainWindow(database, RecognitionEngine(), "token")
     qtbot.addWidget(window)
     inventory = window.inventory_page
@@ -1376,6 +1540,7 @@ def test_inline_cell_focus_loss_closes_editor(qtbot: Any, tmp_path: Path) -> Non
 
     database = Database(tmp_path / "inventory.db")
     component = database.create_component(ComponentCreate(name="失焦前"))
+    stock_component(database, component["id"])
     window = MainWindow(database, RecognitionEngine(), "token")
     qtbot.addWidget(window)
     inventory = window.inventory_page

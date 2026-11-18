@@ -175,6 +175,8 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         val current = mutableState.value.current ?: return
         if (current.getString("session_id") != snapshot.getString("session_id") ||
             current.getInt("revision") > snapshot.getInt("revision")) return
+        if (current.getInt("revision") == snapshot.getInt("revision") &&
+            current.toString() == snapshot.toString()) return
         mutableState.value = mutableState.value.copy(current = snapshot, connected = true)
     }
 
@@ -412,6 +414,7 @@ fun MobileApp(model: MobileViewModel = viewModel()) {
                                 modifier = Modifier.fillMaxWidth(),
                                 continuous = true,
                                 enabled = state.connected && !state.busy,
+                                allowRepeatAfterRemoval = false,
                             )
                         }
                     },
@@ -571,7 +574,9 @@ private fun InventorySession(
         snapshot.optJSONObject("draft")?.toString().orEmpty()
     var componentId by remember(formKey) { mutableStateOf(form.text("component_id")) }
     var locationId by remember(formKey, form.text("location_id")) { mutableStateOf(form.text("location_id")) }
-    var quantity by remember(formKey) { mutableStateOf(form.optInt("quantity", 1).toString()) }
+    var quantity by remember(formKey) {
+        mutableStateOf(if (receive) form.optInt("quantity", 1).toString() else "1")
+    }
     var notes by remember(formKey) { mutableStateOf(form.text("notes")) }
     val batch = snapshot.optJSONObject("batch")
     val stock = batch?.optJSONArray("locations").objects().filter { it.optInt("remaining_quantity") > 0 }
@@ -593,14 +598,19 @@ private fun InventorySession(
         mutableStateOf(componentFields.mapValues { component.text(it.key) })
     }
     var receiveValues by remember(formKey) {
-        mutableStateOf(receiveFields.mapValues { form.text(it.key) })
+        mutableStateOf(receiveFields.mapValues {
+            form.text(it.key).takeUnless { value -> it.key == "unit_price" && value.toDoubleOrNull() == 0.0 }
+                .orEmpty()
+        })
     }
     if (receive) {
         Text("元件信息", style = MaterialTheme.typography.titleMedium)
         val candidates = snapshot.optJSONArray("component_candidates").objects()
         if (candidates.isNotEmpty()) {
             InventoryChoice("匹配元件", componentId,
-                listOf("" to "新建元件") + candidates.map { it.text("id") to it.text("name") },
+                listOf("" to "新建元件") + candidates.map {
+                    it.text("id") to (it.text("name") + if (it.optInt("user_catalog") == 1) "（user）" else "")
+                },
                 !busy) { componentId = it }
         }
         for ((field, label) in componentFields) {
@@ -625,6 +635,9 @@ private fun InventorySession(
                 enabled = !busy && batch != null, singleLine = true, modifier = Modifier.weight(1f),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             )
+            Button(enabled = !busy && available > 0, onClick = { quantity = available.toString() }) {
+                Text("MAX")
+            }
             Button(
                 enabled = !busy && count in 1..available,
                 onClick = { onConfirm(update("扫码出库")) },

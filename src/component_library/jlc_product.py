@@ -16,17 +16,22 @@ from urllib.parse import urljoin, urlparse, urlsplit
 from bs4 import BeautifulSoup, Tag
 
 from .database import DomainError
+from .datasheet import jlc_datasheet_url
 from .models import JlcParameter, JlcParameterGroup, JlcProductDraft
+from .operation_log import log_operation
 
 LCSC_NUMBER = re.compile(r"(?<![A-Z0-9])C\d{4,10}(?!\d)", re.IGNORECASE)
 DETAIL_PATHS = (
     re.compile(r"^/\d+\.html$"),
+    re.compile(r"^/mro/\d+\.html$"),
     re.compile(r"^/product/C\d{4,10}\.html$", re.IGNORECASE),
 )
-OFFICIAL_HOSTS = {"szlcsc.com", "www.szlcsc.com", "so.szlcsc.com", "item.szlcsc.com"}
+OFFICIAL_HOSTS = {
+    "szlcsc.com", "www.szlcsc.com", "so.szlcsc.com", "item.szlcsc.com", "mro.szlcsc.com"
+}
 BLOCKED_PATH_WORDS = ("login", "passport", "account", "member", "cart", "checkout", "order")
 PARAMETER_SECTION_TITLE = "商品参数"
-PARAMETER_SECTION_BOUNDARIES = {"替代料", "买了又买"}
+PARAMETER_SECTION_BOUNDARIES = {"替代料", "买了又买", "商品详情", "商品介绍", "相关推荐"}
 PARAMETER_HEADER_LABELS = {"属性", "参数", "参数名称", "商品属性"}
 PARAMETER_HEADER_VALUES = {"参数值", "值", "属性值"}
 ACCESS_MESSAGE = re.compile(
@@ -356,20 +361,7 @@ def _without_parameters(groups: list[JlcParameterGroup], *labels: str) -> list[J
     return output
 
 
-def _datasheet_url(soup: BeautifulSoup, base_url: str) -> str | None:
-    """解析首个 HTTPS 数据手册链接；相对地址以商品页 URL 为基准补全。"""
-
-    for anchor in soup.find_all("a", href=True):
-        href = urljoin(base_url, str(anchor["href"]))
-        text = anchor.get_text(" ", strip=True).casefold()
-        path = urlparse(href).path.casefold()
-        if path.endswith(".pdf") or "数据手册" in text or "datasheet" in text:
-            parsed = urlparse(href)
-            if parsed.scheme == "https" and parsed.hostname:
-                return href
-    return None
-
-
+@log_operation("解析商城商品资料")
 def parse_jlc_product_page(
     url: str, html: str, *, require_page_number: bool = False
 ) -> JlcProductDraft:
@@ -422,11 +414,14 @@ def parse_jlc_product_page(
     brand = (
         _brand(product)
         or _page_label_value(soup, "品牌名称", "品牌", "制造商")
+        or _meta(soup, "og:product:brand")
         or _find_parameter(groups, "品牌", "制造商")
     )
-    package = _page_label_value(soup, "商品封装", "封装", "封装规格") or _find_parameter(
-        groups, "商品封装", "封装", "封装规格"
-    )
+    mro = urlparse(url).path.startswith("/mro/")
+    package = _page_label_value(soup, "商品封装")
+    if not mro:
+        package = package or _page_label_value(soup, "封装", "封装规格")
+    package = package or _find_parameter(groups, "商品封装", "封装", "封装规格")
     # 商城参数表中的“商品目录”是最准确的元件类别。提升为主字段后从动态参数中
     # 删除，避免入库表单同时出现“元件类别”和重复的“商品目录”输入框。
     category = _find_parameter(groups, "商品目录") or _meta(soup, "product:category")
@@ -434,7 +429,14 @@ def parse_jlc_product_page(
     if not category:
         breadcrumb = soup.select("[itemprop='itemListElement'] [itemprop='name']")
         category = _clean(breadcrumb[-1].get_text(" ", strip=True)) if breadcrumb else None
-    description = _clean(product.get("description")) or _meta(soup, "description")
+    if mro and not category:
+        category = "工业品"
+    heading = soup.find("h1") if mro else None
+    description = (
+        _clean(product.get("description"))
+        or (_clean(heading.get_text(" ", strip=True)) if heading else None)
+        or _meta(soup, "description")
+    )
     raw_name = mpn or _clean(product.get("name")) or lcsc
     ### 记录需要用户确认的缺失信息 ###
     warnings: list[str] = []
@@ -451,7 +453,7 @@ def parse_jlc_product_page(
         category=category,
         description=description,
         product_url=url,
-        datasheet_url=_datasheet_url(soup, url),
+        datasheet_url=jlc_datasheet_url(url, mpn),
         parameter_groups=groups,
         warnings=warnings,
     )

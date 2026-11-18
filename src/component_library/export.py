@@ -14,6 +14,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .database import Database
+from .operation_log import log_operation
 
 DETAIL_COLUMNS = (
     ("component_name", "元件"),
@@ -49,6 +50,7 @@ TRANSACTION_COLUMNS = (
     ("location_name", "仓库"),
     ("source", "来源"),
     ("operation_platform", "操作端"),
+    ("order_number", "立创订单号"),
     ("notes", "备注"),
     ("group_id", "事务组"),
     ("id", "流水编号"),
@@ -92,6 +94,7 @@ def _append_rows(sheet: Worksheet, headers: Iterable[str], rows: Iterable[Iterab
         sheet.append(list(row))
 
 
+@log_operation("导出库存 CSV")
 def export_inventory_csv(
     database: Database, destination: Path, component_ids: Collection[str] | None = None,
     *, lot_ids: Collection[str] | None = None,
@@ -110,6 +113,7 @@ def export_inventory_csv(
     return destination
 
 
+@log_operation("导出库存 Excel")
 def export_inventory_xlsx(
     database: Database, destination: Path, component_ids: Collection[str] | None = None,
     *, lot_ids: Collection[str] | None = None,
@@ -181,6 +185,7 @@ def export_inventory_xlsx(
     return destination
 
 
+@log_operation("导出库存流水")
 def export_transactions(rows: Iterable[dict[str, Any]], destination: Path) -> Path:
     """以 CSV 或 Excel 保存筛选后的原始流水，一条库存变动占一行。"""
 

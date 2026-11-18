@@ -169,6 +169,7 @@ fun BarcodeScannerScreen(
     onCode: (String) -> Unit, onCancel: (() -> Unit)?,
     modifier: Modifier = Modifier.fillMaxSize(), continuous: Boolean = false, enabled: Boolean = true,
     validateCode: ((String) -> String?)? = null,
+    allowRepeatAfterRemoval: Boolean = true,
 ) {
     val submitCode by rememberUpdatedState(onCode)
     val scanEnabled by rememberUpdatedState(enabled)
@@ -314,7 +315,7 @@ fun BarcodeScannerScreen(
                                         rejection == null
                                     }
                                 }
-                            if (codes.isEmpty() && ++clearFrames >= 5) lastCode = null
+                            if (allowRepeatAfterRemoval && codes.isEmpty() && ++clearFrames >= 5) lastCode = null
                             if (codes.isNotEmpty()) clearFrames = 0
                             if (value != null && scanEnabled && (
                                     if (continuous) value != lastCode else delivered.compareAndSet(false, true)

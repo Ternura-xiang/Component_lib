@@ -58,6 +58,7 @@ def test_parse_saved_order_without_session_query(tmp_path: Path) -> None:
     assert line.description == "LED贴片数码管"
     assert line.manufacturer_part_number == "GS2821CR-G"
     assert line.product_url == "https://item.szlcsc.com/29373045.html"
+    assert line.datasheet_url == "https://item.szlcsc.com/datasheet/GS2821CR-G/29373045.html"
 
 
 def test_statement_merges_by_order_and_part_and_saves_purchase_price(

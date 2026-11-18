@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from math import ceil
 from time import monotonic
 from typing import Any
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..database import DomainError
+from ..datasheet import jlc_product_key
 from ..jlc_product import (
     find_jlc_product_link,
     is_blocked_jlc_navigation,
@@ -42,6 +45,7 @@ from ..models import (
 )
 
 JLC_HOME = "https://www.szlcsc.com/"
+logger = logging.getLogger(__name__)
 
 
 class SafeJlcPage(QWebEnginePage):
@@ -221,7 +225,7 @@ class JlcBrowserDialog(QDialog):
 
 
 class JlcBatchBrowserDialog(QDialog):
-    """按用户操作逐页读取商品，限速并在访问受限时结束队列。"""
+    """按用户操作逐页读取商品，在访问受限时结束队列。"""
 
     _next_request_at = 0.0
     _minimum_interval = 30
@@ -276,9 +280,6 @@ class JlcBatchBrowserDialog(QDialog):
         layout.addLayout(controls)
         self.view.loadProgress.connect(self._show_progress)
         self.view.loadFinished.connect(self._loaded)
-        self.cooldown = QTimer(self)
-        self.cooldown.setInterval(1000)
-        self.cooldown.timeout.connect(self._update_next_button)
 
     def start(self) -> None:
         """从第一项开始遍历；空任务直接完成。"""
@@ -286,11 +287,7 @@ class JlcBatchBrowserDialog(QDialog):
         if not self.targets:
             self.accept()
             return
-        if monotonic() >= type(self)._next_request_at:
-            self._load_next()
-        else:
-            self.cooldown.start()
-            self._update_next_button()
+        self._load_next()
 
     def _show_progress(self, progress: int) -> None:
         if self._loading and 0 <= self._index < len(self.targets):
@@ -300,9 +297,8 @@ class JlcBatchBrowserDialog(QDialog):
             )
 
     def _load_next(self) -> None:
-        if self._closed or self._stopping or self._loading or monotonic() < type(self)._next_request_at:
+        if self._closed or self._stopping or self._loading:
             return
-        self.cooldown.stop()
         self._index += 1
         if self._index >= len(self.targets):
             self.status.setText(
@@ -314,7 +310,6 @@ class JlcBatchBrowserDialog(QDialog):
         if not is_jlc_product_url(url):
             self._stop_with_warning("商品链接无效")
             return
-        type(self)._next_request_at = monotonic() + self._minimum_interval
         self._loading = True
         self.next_button.setEnabled(False)
         self.review_button.setEnabled(False)
@@ -359,17 +354,19 @@ class JlcBatchBrowserDialog(QDialog):
                 self._stop_with_warning(next(iter(self.errors.values()), "没有可确认的商品资料"))
             return
         self.review_button.setEnabled(bool(self.drafts))
-        self.cooldown.start()
-        self._update_next_button()
+        self.next_button.setEnabled(True)
+        self.status.setText(
+            f"已读取 {len(self.drafts)} 项，失败 {len(self.errors)} 项。点击读取下一项继续。"
+        )
 
     def _navigation_blocked(self, _url: str) -> None:
         if self._loading:
             self._stop_with_warning("商城要求登录、验证或跳转至受限页面")
 
     def _stop_with_warning(self, reason: str) -> None:
+        logger.warning("商城资料读取已停止：%s", reason)
         self._stopping = True
         self._loading = False
-        self.cooldown.stop()
         if 0 <= self._index < len(self.targets):
             key, name, _url = self.targets[self._index]
             self.errors[key] = f"{name}：{reason}"
@@ -386,21 +383,8 @@ class JlcBatchBrowserDialog(QDialog):
         self.reject()
         QMessageBox.warning(parent, "已停止商城补充", reason)
 
-    def _update_next_button(self) -> None:
-        if self._closed or self._stopping or self._loading:
-            return
-        remaining = max(0, ceil(type(self)._next_request_at - monotonic()))
-        self.next_button.setEnabled(remaining == 0)
-        summary = f"已读取 {len(self.drafts)} 项，失败 {len(self.errors)} 项"
-        if remaining:
-            self.status.setText(f"{summary}。{remaining} 秒后可读取下一项。")
-        else:
-            self.cooldown.stop()
-            self.status.setText(f"{summary}。点击读取下一项继续。")
-
     def done(self, result: int) -> None:
         self._closed = True
-        self.cooldown.stop()
         self.view.stop()
         self.profile.cookieStore().deleteAllCookies()
         self.profile.clearHttpCache()
@@ -415,15 +399,17 @@ class JlcBackgroundBrowser(QObject):
 
     def __init__(self, part_number: str, product_url: str, owner: QWidget) -> None:
         super().__init__(owner)
-        self.part_number = part_number
+        number = part_number.strip().upper()
+        self.part_number = number if re.fullmatch(r"C[0-9]{4,10}", number) else ""
         self.owner = owner
         self._done = False
         self._stop_scheduled = False
         self._window: QDialog | None = None
         self._render_retry = False
-        self._search_url = f"https://so.szlcsc.com/global.html?k={part_number}"
-        self._detail_requested = is_jlc_product_url(product_url)
-        self._destination = product_url if self._detail_requested else self._search_url
+        self._search_url = f"https://so.szlcsc.com/global.html?k={self.part_number}"
+        self._detail_requested = is_jlc_product_url(product_url.strip())
+        self._destination = product_url.strip() if self._detail_requested else self._search_url
+        self._product_key = jlc_product_key(product_url)
         self.profile = QWebEngineProfile(self)
         self.profile.downloadRequested.connect(JlcBrowserDialog._cancel_download)
         self.page = SafeJlcPage(self.profile, self)
@@ -488,8 +474,15 @@ class JlcBackgroundBrowser(QObject):
         try:
             if is_jlc_product_url(url):
                 draft = parse_jlc_product_page(url, html, require_page_number=True)
-                if draft.lcsc_part_number != self.part_number:
+                if self.part_number and draft.lcsc_part_number != self.part_number:
                     self._fail("商品页编号与库存元件不一致")
+                    return
+                if (
+                    self._product_key
+                    and self._product_key != jlc_product_key(url)
+                    and self._product_key != draft.lcsc_part_number
+                ):
+                    self._fail("商品页链接与库存保存的商品不一致")
                     return
                 if not (draft.manufacturer_part_number or draft.parameter_groups):
                     raise DomainError("JLC_EMPTY_PAGE", "商品页未提供可确认的型号或参数")
@@ -498,6 +491,9 @@ class JlcBackgroundBrowser(QObject):
                 return
             if self._detail_requested or QUrl(url).host() != "so.szlcsc.com":
                 self._stop_for_access("商城跳转至非商品页面")
+                return
+            if not self.part_number:
+                self._fail("没有商品链接或立创编号可用于匹配")
                 return
             link = find_jlc_product_link(url, html, self.part_number)
             if link:
@@ -555,6 +551,8 @@ class JlcBackgroundBrowser(QObject):
 
     def _fail(self, message: str, *, restricted: bool = False) -> None:
         if not self._done:
+            logger.warning("后台商城匹配未完成：%s", message)
+            logger.debug("后台匹配结束；立创编号=%s；访问受限=%s", self.part_number, restricted)
             self.cancel()
             self.failed.emit(message, restricted)
 

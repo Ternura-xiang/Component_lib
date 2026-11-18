@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,11 @@ from typing import Any
 
 from .bom import score_component
 from .database import Database, DomainError, utc_now
+from .label_parser import parse_qr_payload
 from .models import BomInputRow, ComponentCreate, IssueRequest, JlcParameterGroup, ReceiveRequest
+from .operation_log import log_operation
+
+logger = logging.getLogger(__name__)
 
 API_CAPABILITIES = {
     "api_version": "1.1",
@@ -55,6 +60,7 @@ class SessionService:
                     busy[device] = by_id[session_id]["snapshot"]["kind"]
         return busy
 
+    @log_operation("关闭移动摄像头会话")
     def close_inventory(self, session_id: str) -> None:
         with self._lock:
             current = self.get(session_id)
@@ -62,6 +68,7 @@ class SessionService:
                 self.command(session_id, str(uuid.uuid4()), current["revision"],
                              "CANCEL", {}, "desktop")
 
+    @log_operation("创建移动操作会话")
     def create(self, kind: str, payload: dict[str, Any], actor: str = "desktop") -> dict[str, Any]:
         """创建操作会话；BOM 取货会同时保存需求项，但不扣减库存。"""
 
@@ -260,16 +267,26 @@ class SessionService:
         with self._lock:
             cached = self._cached_command(session_id, command_id)
             if cached is not None:
+                logger.debug("移动会话复用已处理的命令；会话=%s；命令=%s", session_id, command)
                 return cached
             current = self.get(session_id)
             if int(current["revision"]) != expected_revision:
+                logger.warning("移动操作资料已被另一端更新，请刷新后重试")
                 raise DomainError("REVISION_CONFLICT", "会话已被另一端更新，请刷新后重试")
             kind = str(current["snapshot"]["kind"])
+            logger.debug(
+                "处理移动命令；会话=%s；类型=%s；命令=%s；版本=%d；操作者=%s",
+                session_id, kind, command, expected_revision, actor,
+            )
             if kind == "BOM_PICK":
                 response = self._pick_command(session_id, command, payload, actor)
             else:
                 response = self._inventory_command(session_id, kind, command, payload, actor)
             self._record_command(session_id, command_id, response)
+            logger.debug(
+                "移动命令处理完成；会话=%s；新版本=%s；状态=%s",
+                session_id, response["revision"], response["state"],
+            )
             return response
 
     def apply_recognition(self, session_id: str, draft: dict[str, Any]) -> dict[str, Any]:
@@ -285,6 +302,10 @@ class SessionService:
             if current["snapshot"]["kind"] != "RECEIVE":
                 raise DomainError("VALIDATION_ERROR", "只有入库会话可以接收标签图片")
             snapshot = current["snapshot"]
+            previous_draft = snapshot.get("draft") or {}
+            raw = draft.get("raw_barcode")
+            if current["state"] == "DRAFT" and raw and raw == previous_draft.get("raw_barcode"):
+                return current
             previous = snapshot.get("form", {})
             snapshot["form"] = {
                 key: previous[key]
@@ -369,7 +390,19 @@ class SessionService:
             form["location_id"] = location
             return self._save_snapshot(session_id, "DRAFT", snapshot, None)
         if command == "SCAN_CODE" and kind == "ISSUE":
-            batch = self.database.resolve_batch_code(str(payload.get("raw_text") or ""))
+            raw = str(payload.get("raw_text") or "")
+            if form.get("camera_only") and form.get("scan_order_number"):
+                field = parse_qr_payload(raw).get("order_number")
+                if field is None:
+                    raise DomainError("VALIDATION_ERROR", "该二维码没有立创订单号")
+                order = field.normalized_value.upper()
+                if snapshot.get("scanned_order_number") == order:
+                    return current
+                snapshot["scanned_order_number"] = order
+                return self._save_snapshot(session_id, "DRAFT", snapshot, None)
+            batch = self.database.resolve_batch_code(raw)
+            if current["state"] == "DRAFT" and form.get("batch_id") == batch["id"]:
+                return current
             snapshot["batch"] = batch
             snapshot["component"] = self.database.get_component(batch["component_id"])
             preferred = self.database.last_issue_location()
@@ -401,7 +434,10 @@ class SessionService:
             elif "parameter_groups" in form:
                 self.database.update_component(component_id, ComponentCreate.model_validate(form["component"]))
             if "parameter_groups" in form:
-                self.database.save_component_parameter_groups(component_id, groups)
+                self.database.save_component_parameter_groups(
+                    component_id, groups,
+                    marketplace=bool((form.get("component") or {}).get("jlc_matched")),
+                )
             result = self.database.receive(
                 ReceiveRequest.model_validate({**form, "component_id": component_id}),
                 platform=platform,
@@ -654,6 +690,7 @@ class SessionService:
                     )
         return sorted(candidates, key=lambda value: -int(value["score"]))[:5]
 
+    @log_operation("提交 BOM 取货出库")
     def _commit_pick(self, session_id: str, actor: str) -> dict[str, Any]:
         """原子提交取货任务；库存变化导致失败时持久标记为阻塞。"""
 

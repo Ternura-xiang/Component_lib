@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlsplit
+
+from .datasheet import normalize_datasheet_url
 
 LCSC = re.compile(r"(?<![A-Z0-9])C\d{4,10}(?!\d)", re.IGNORECASE)
 PRICE = re.compile(r"(?:￥|¥|价格\s*[:：]?)\s*(\d+(?:\.\d{1,6})?)")
@@ -30,10 +33,14 @@ def parse_copied_product(text: str) -> dict[str, Any]:
         result["package"] = match.group(0).upper().replace(" ", "-")
     urls = [match.group(0).rstrip(".,;，；") for match in URL.finditer(text)]
     for url in urls:
-        lowered = url.casefold()
-        if lowered.endswith(".pdf") or "/pdf/" in lowered:
-            result.setdefault("datasheet_url", url)
-        elif "szlcsc.com" in lowered:
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        path = parsed.path.casefold()
+        if path.endswith(".pdf") or "/pdf/" in path or path.startswith("/datasheet/"):
+            result.setdefault("datasheet_url", normalize_datasheet_url(url))
+        elif parsed.hostname in {"item.szlcsc.com", "www.szlcsc.com", "szlcsc.com"}:
             result.setdefault("product_url", url)
     lines = [line.strip() for line in text.splitlines() if 2 <= len(line.strip()) <= 120]
     if lines:

@@ -20,7 +20,9 @@ from bs4 import BeautifulSoup, Tag
 from pydantic import ValidationError
 
 from .database import DomainError
+from .datasheet import jlc_datasheet_url
 from .models import MosfetDetails, OrderImportLine, ResistorDetails
+from .operation_log import log_operation
 
 MAX_FILES = 500
 MAX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
@@ -138,6 +140,7 @@ def _category_details(
     return None, None
 
 
+@log_operation("读取订单网页")
 def parse_saved_orders(
     path: Path,
     progress: Callable[[str], None] | None = None,
@@ -211,11 +214,13 @@ def parse_saved_orders(
             # 类别已有独立字段，商品描述不再重复显示斜杠前的类别名称。
             description = title_parts[1] if len(title_parts) > 1 else title
             model_parts = [part.strip() for part in items[1].split(" / ", 1)]
-            model = _optional_order_text(model_parts[0]) or lcsc
+            mpn = _optional_order_text(model_parts[0])
+            model = mpn or lcsc
             resistor, mosfet = _category_details(category, description)
             link = next(
                 (anchor.get("href") for anchor in product.find_all("a") if anchor.get("href")), None
             )
+            product_url = _clean_url(str(link) if link else None)
             if len(output) >= MAX_ORDER_FILE_ITEMS:
                 raise DomainError(
                     "VALIDATION_ERROR",
@@ -235,12 +240,13 @@ def parse_saved_orders(
                     name=model,
                     description=description,
                     category=category,
-                    manufacturer_part_number=_optional_order_text(model_parts[0]),
+                    manufacturer_part_number=mpn,
                     package=_optional_order_text(model_parts[1]) if len(model_parts) > 1 else None,
                     brand=_optional_order_text(items[2]),
                     unit_price=float(price.group(1)) if price else None,
                     quantity=int(quantity.group(1)),
-                    product_url=_clean_url(str(link) if link else None),
+                    product_url=product_url,
+                    datasheet_url=jlc_datasheet_url(product_url, mpn),
                     resistor=resistor,
                     mosfet=mosfet,
                 )
@@ -389,6 +395,7 @@ def _parse_statement(
     return {key: line for key, line in lines.items() if key[0] not in cancelled}, cancelled
 
 
+@log_operation("解析并合并订单文件")
 def parse_order_files(
     paths: list[Path],
     progress: Callable[[str], None] | None = None,

@@ -10,7 +10,7 @@ import logging
 import socket
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -21,11 +21,12 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -191,10 +192,34 @@ def create_api(context: ApiContext) -> FastAPI:
     ### 创建应用并注册统一错误处理 ###
     app = FastAPI(title="Component Library Local API", version=__version__)
 
+    @app.middleware("http")
+    async def log_request(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            route = getattr(request.scope.get("route"), "path", "未匹配接口")
+            logger.exception("接口处理失败：%s %s", request.method, route)
+            raise
+        route = getattr(request.scope.get("route"), "path", "未匹配接口")
+        elapsed = round((time.perf_counter() - started) * 1000)
+        if response.status_code >= 500:
+            logger.error("接口服务异常：%s %s，状态码 %d", request.method, route, response.status_code)
+        elif response.status_code >= 400:
+            logger.warning("接口请求未完成：%s %s，状态码 %d", request.method, route, response.status_code)
+        logger.debug(
+            "接口处理结束：%s %s；状态码=%d；耗时=%d 毫秒",
+            request.method, route, response.status_code, elapsed,
+        )
+        return response
+
     @app.exception_handler(DomainError)
     async def domain_error_handler(_request: Any, error: DomainError) -> JSONResponse:
         """把稳定的领域错误码映射为 HTTP 状态码和统一 JSON 错误结构。"""
 
+        logger.warning("请求未完成：%s（%s）", error.message, error.code)
         status = (
             404
             if error.code == "NOT_FOUND"
@@ -342,7 +367,7 @@ def create_api(context: ApiContext) -> FastAPI:
         started_at = time.perf_counter()
         draft_model = await anyio.to_thread.run_sync(context.recognition.analyze, image_bytes)
         logger.info(
-            "Android image OCR completed: session=%s bytes=%d duration_ms=%d",
+            "手机标签图片识别完成；会话=%s；图片大小=%d 字节；耗时=%d 毫秒",
             session_id,
             len(image_bytes),
             round((time.perf_counter() - started_at) * 1000),
@@ -364,6 +389,7 @@ def create_api(context: ApiContext) -> FastAPI:
             context.connection.authenticate(token) if context.connection else None
         )
         if not actor:
+            logger.warning("移动会话实时连接被拒绝：设备认证失败")
             await websocket.close(code=4401)
             return
         try:
@@ -372,6 +398,8 @@ def create_api(context: ApiContext) -> FastAPI:
             await websocket.close(code=4404)
             return
         await websocket.accept()
+        logger.info("移动操作实时连接已建立")
+        logger.debug("实时连接会话=%s；操作者=%s", session_id, actor)
         revision = -1
         last_sent = 0.0
         try:
@@ -386,7 +414,10 @@ def create_api(context: ApiContext) -> FastAPI:
                     if (await websocket.receive())["type"] == "websocket.disconnect":
                         return
         except (WebSocketDisconnect, OSError, RuntimeError):
+            logger.debug("移动实时连接结束；会话=%s", session_id, exc_info=True)
             return
+        finally:
+            logger.info("移动操作实时连接已关闭")
 
     @app.get("/api/v1/components", dependencies=[Depends(auth)])
     async def components(q: str = Query(default="")) -> list[dict[str, Any]]:
@@ -810,7 +841,15 @@ class ApiServer(threading.Thread):
     def run(self) -> None:
         """运行阻塞式 Uvicorn 循环。"""
 
-        self._server.run(sockets=[self._socket])
+        logger.debug("API 服务线程开始")
+        try:
+            self._server.run(sockets=[self._socket])
+        except Exception:
+            logger.exception("API 服务线程异常退出")
+            raise
+        finally:
+            self._socket.close()
+            logger.debug("API 服务线程已停止")
 
     def stop(self) -> None:
         """请求 API 完成当前请求后退出。"""

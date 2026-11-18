@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from pathlib import Path
+from types import TracebackType
 
-from PySide6.QtCore import QLockFile, QSettings
+from PySide6.QtCore import (
+    QLockFile,
+    QMessageLogContext,
+    QSettings,
+    QtMsgType,
+    qInstallMessageHandler,
+)
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .api import ApiContext, ApiServer, create_api
 from .connection import ConnectionManager
 from .database import Database
-from .debug_log import LOG_LEVEL_SETTING, LOG_LEVELS, DebugLogHandler
+from .debug_log import LOG_LEVEL_SETTING, LOG_LEVELS, DebugLogHandler, DependencyLogFilter
 from .paths import data_directory, load_or_create_token
 from .recognition import RecognitionEngine
 from .sessions import SessionService
@@ -26,10 +34,43 @@ def configure_logging(directory: Path) -> DebugLogHandler:
     path = directory / "logs"
     path.mkdir(parents=True, exist_ok=True)
     preferences = QSettings("local.component-library.app", "元件库")
-    level = LOG_LEVELS.get(str(preferences.value(LOG_LEVEL_SETTING, "INFO")), logging.INFO)
+    level = LOG_LEVELS.get(str(preferences.value(LOG_LEVEL_SETTING, "DEBUG")), logging.DEBUG)
     handler = DebugLogHandler(path / "component-library.log", level)
+    handler.addFilter(DependencyLogFilter())
     logging.basicConfig(level=logging.DEBUG, handlers=[handler], force=True)
     return handler
+
+
+def install_exception_logging() -> None:
+    """接收 Qt 回调、Python 主线程及独立线程的未处理异常。"""
+
+    def main_exception(
+        kind: type[BaseException], error: BaseException, traceback: TracebackType | None
+    ) -> None:
+        logging.getLogger(__name__).error("程序遇到未处理异常", exc_info=(kind, error, traceback))
+        sys.__excepthook__(kind, error, traceback)
+
+    def thread_exception(args: threading.ExceptHookArgs) -> None:
+        logging.getLogger(__name__).error(
+            "后台线程异常退出；线程=%s", args.thread.name if args.thread else "未知",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback) if args.exc_value is not None else None,
+        )
+
+    def qt_message(kind: QtMsgType, context: QMessageLogContext, message: str) -> None:
+        level = {
+            QtMsgType.QtDebugMsg: logging.DEBUG,
+            QtMsgType.QtInfoMsg: logging.DEBUG,
+            QtMsgType.QtWarningMsg: logging.WARNING,
+            QtMsgType.QtCriticalMsg: logging.ERROR,
+            QtMsgType.QtFatalMsg: logging.ERROR,
+        }[kind]
+        logging.getLogger("component_library.qt").log(
+            level, "界面或设备运行信息：%s；来源=%s", message, context.category or "Qt"
+        )
+
+    sys.excepthook = main_exception
+    threading.excepthook = thread_exception
+    qInstallMessageHandler(qt_message)
 
 
 def main() -> int:
@@ -46,11 +87,15 @@ def main() -> int:
         application.setWindowIcon(QIcon(str(icon_path)))
     directory = data_directory()
     log_handler = configure_logging(directory)
+    install_exception_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("元件库正在启动；日志目录=%s", directory / "logs")
 
     # QLockFile 在进程异常退出后可以自动判断陈旧锁，比单纯创建 PID 文件可靠。
     lock = QLockFile(str(directory / "application.lock"))
     lock.setStaleLockTime(10_000)
     if not lock.tryLock(100):
+        logger.warning("启动取消：元件库已有运行实例")
         QMessageBox.warning(None, "元件库", "元件库已经在运行。")
         return 1
 
@@ -66,6 +111,7 @@ def main() -> int:
     try:
         api_server = ApiServer(api)
     except OSError as error:
+        logger.error("本机 API 启动失败，端口 17635 无法监听：%s", error, exc_info=True)
         QMessageBox.critical(
             None,
             "元件库无法启动",
@@ -75,6 +121,7 @@ def main() -> int:
         lock.unlock()
         return 1
     api_server.start()
+    logger.info("本机 API 服务已启动，桌面操作接口已就绪")
 
     lan_server: ApiServer | None = None
     try:
@@ -86,7 +133,9 @@ def main() -> int:
             ssl_keyfile=str(connection.key_path),
         )
         lan_server.start()
+        logger.info("手机 HTTPS 连接服务已启动，端口 %d", connection.port)
     except OSError as error:
+        logger.warning("手机连接服务未启动，端口 %d 无法监听：%s", connection.port, error)
         QMessageBox.warning(
             None,
             "局域网连接未启动",
@@ -105,7 +154,9 @@ def main() -> int:
 
     window = MainWindow(database, recognition, token, connection, sessions, log_handler=log_handler)
     window.show()
+    logger.info("元件库已就绪")
     exit_code = application.exec()
+    logger.info("正在关闭元件库，停止设备连接和 API 服务")
     api_server.stop()
     api_server.join(timeout=5)
     if lan_server is not None:
@@ -113,6 +164,8 @@ def main() -> int:
         lan_server.join(timeout=5)
     connection.stop_discovery()
     lock.unlock()
+    logger.info("元件库已关闭，退出码 %d", exit_code)
+    log_handler.close()
     return exit_code
 
 

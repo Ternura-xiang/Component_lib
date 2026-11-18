@@ -8,12 +8,19 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 ORDER_IMPORT_BATCH_SIZE = 1_000
 
 
-class ComponentCreate(BaseModel):
+class PurchasePriceModel(BaseModel):
+    @field_validator("price", "unit_price", "purchase_price", check_fields=False)
+    @classmethod
+    def unset_zero_price(cls, price: float | None) -> float | None:
+        return price or None
+
+
+class ComponentCreate(PurchasePriceModel):
     """创建元件所需字段；只有名称是必填项。"""
 
     name: str = Field(min_length=1, description="用户可识别的元件名称")
@@ -50,7 +57,7 @@ class LocationCreate(BaseModel):
     notes: str | None = None
 
 
-class ReceiveRequest(BaseModel):
+class ReceiveRequest(PurchasePriceModel):
     """批次入库请求。"""
 
     component_id: str
@@ -79,6 +86,17 @@ class IssueRequest(BaseModel):
     batch_id: str | None = Field(default=None, description="指定后仅从该批次扣减")
     source: str | None = None
     notes: str | None = None
+
+
+class TransactionDetails(PurchasePriceModel):
+    """可修正的流水仓库、来源和入库批次信息。"""
+
+    location_id: str
+    source: str | None = None
+    unit_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    purchase_date: str | None = None
+    order_number: str | None = None
+    batch_code: str | None = None
 
 
 class TransferRequest(BaseModel):
@@ -275,7 +293,7 @@ class MosfetDetails(BaseModel):
     current_a: float | None = Field(default=None, ge=0)
 
 
-class OrderImportLine(BaseModel):
+class OrderImportLine(PurchasePriceModel):
     """从订单网页或物料明细对账单提取的一条待确认商品记录。"""
 
     order_number: str = Field(min_length=1)
