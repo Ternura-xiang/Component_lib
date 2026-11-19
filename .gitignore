@@ -98,3 +98,8 @@ desktop/tools/ocr_training/evaluation*.jsonl
 /uv.exe
 /uvw.exe
 /uvx.exe
+
+# hardware
+/hardware/test/
+/hardware/.pio/
+/hardware/AGENTS.md
